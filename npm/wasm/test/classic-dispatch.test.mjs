@@ -43,3 +43,46 @@ test("the classic dispatch runs on Rust programs and keeps old source files", { 
     assert.throws(() => ts.createTypeChecker({}), /not part of this compiler/);
     assert.throws(() => ts.bindSourceFile(undefined, {}), /not part of this compiler/);
 });
+
+test("programs read libraries from the host and expose classic resolutions", { skip }, async () => {
+    const { default: ts } = await import("../classic.js");
+    const lib = "/Home/Lib";
+    const text = new Map([
+        [`${lib}/lib.es2025.full.d.ts`, '/// <reference no-default-lib="true"/>\n/// <reference lib="es5" />\ninterface Marker {}'],
+        [`${lib}/lib.es5.d.ts`, '/// <reference no-default-lib="true"/>\ninterface Array<T> { length: number } interface Boolean {} interface Function {} interface IArguments {} interface Number {} interface Object {} interface RegExp {} interface String {} interface CallableFunction {} interface NewableFunction {}'],
+        ["/src/A.ts", 'import { value } from "./b"; import missing from "./missing"; export const marker: Marker = {}; export { value };'],
+        ["/src/b.ts", "export const value = 1;"],
+    ]);
+    const host = {
+        getCompilationSettings: () => ({}),
+        getScriptFileNames: () => ["/src/A.ts"],
+        getScriptVersion: () => "1",
+        getScriptSnapshot: path => text.has(path) ? ts.ScriptSnapshot.fromString(text.get(path)) : undefined,
+        getCurrentDirectory: () => "/",
+        getDefaultLibFileName: options => `${lib}/${ts.getDefaultLibFileName(options)}`,
+        useCaseSensitiveFileNames: () => false,
+        readFile: path => text.get(path),
+        fileExists: path => text.has(path),
+    };
+    const service = ts.createLanguageService(host);
+    try {
+        assert.deepEqual(service.getSemanticDiagnostics("/src/A.ts").map(diagnostic => diagnostic.code), [2307]);
+        const program = service.getProgram();
+        const libraries = program.getSourceFiles().filter(file => program.isSourceFileDefaultLibrary(file));
+        // Classic `compareDefaultLibFiles` puts es5 before the target's library.
+        assert.deepEqual(libraries.map(file => [file.fileName, file.path, file.hasNoDefaultLib]), [
+            [`${lib}/lib.es5.d.ts`, "/home/lib/lib.es5.d.ts", false],
+            [`${lib}/lib.es2025.full.d.ts`, "/home/lib/lib.es2025.full.d.ts", false],
+        ]);
+        assert.deepEqual(Array.from(program.resolvedLibReferences), [["lib.es5.d.ts", { resolution: { resolvedModule: undefined }, actual: `${lib}/lib.es5.d.ts` }]]);
+        const file = program.getSourceFile("/src/A.ts");
+        const seen = [];
+        program.forEachResolvedModule((resolution, name, _mode, path) => seen.push([path, name, resolution.resolvedModule?.resolvedFileName]));
+        assert.deepEqual(seen, [["/src/a.ts", "./b", "/src/b.ts"], ["/src/a.ts", "./missing", undefined]]);
+        const resolution = program.getResolvedModuleFromModuleSpecifier(file.statements[0].moduleSpecifier);
+        assert.equal(resolution.resolvedModule.resolvedFileName, "/src/b.ts");
+        assert.equal(program.getResolvedModuleFromModuleSpecifier(file.statements[0].moduleSpecifier, file), resolution, "one resolution object per name");
+        assert.equal(program.getAutomaticTypeDirectiveResolutions().size(), 0);
+        assert.deepEqual(program.getAutomaticTypeDirectiveNames(), []);
+    } finally { service.dispose(); }
+});

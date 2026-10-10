@@ -3,7 +3,9 @@ import { createServiceChannel } from "./service-channel.js";
 import { createProgramGraph } from "./classic-program.js";
 import { sourceFileLease } from "./classic-source-files.js";
 import { compilerOptionsToJson } from "./classic-compiler-options.js";
-import { fixedExternalModuleIndicator, getEmitScriptTarget, sourceFileOptionsChanged } from "./classic-registry.js";
+import { getDirectoryPath } from "./classic-paths.js";
+import { ScriptTarget } from "./classic-enums.js";
+import { fixedExternalModuleIndicator, getEmitScriptTarget, sourceFileOptionsChanged, withRequestedPath } from "./classic-registry.js";
 
 /**
  * TypeScript 6.0.3 `createProgram` over a classic `CompilerHost`, built by the Rust compiler.
@@ -48,9 +50,10 @@ export function createProgram(rootNamesOrOptions, options, host, oldProgram, con
                 setExternalModuleIndicator: fixedExternalModuleIndicator(request.jsx, request.force),
                 jsDocParsingMode: host.jsDocParsingMode,
             };
-            const file = host.getSourceFileByPath
+            // A document the host parses now keeps the program's path for the file.
+            const file = withRequestedPath(request.fileName, request.path, () => host.getSourceFileByPath
                 ? host.getSourceFileByPath(request.fileName, request.path, sourceFileOptions, undefined, shouldCreateNewSourceFile)
-                : host.getSourceFile(request.fileName, sourceFileOptions, undefined, shouldCreateNewSourceFile);
+                : host.getSourceFile(request.fileName, sourceFileOptions, undefined, shouldCreateNewSourceFile));
             if (!file) return undefined;
             const lease = sourceFileLease(file, channel.instance);
             if (lease === undefined) throw new TypeError("the compiler host returned a source file this compiler does not own");
@@ -67,7 +70,12 @@ export function createProgram(rootNamesOrOptions, options, host, oldProgram, con
     });
     let handle;
     try {
-        channel.call({ action: "configureProgram", rootNames, options: compilerOptionsToJson(options) });
+        // Classic `defaultLibraryPath`: the host supplies library files like any other file.
+        const defaultLibraryPath = host.getDefaultLibLocation ? host.getDefaultLibLocation() : getDirectoryPath(host.getDefaultLibFileName(options));
+        const settings = compilerOptionsToJson(options);
+        // Classic 6.0.3 computes an unset target as LatestStandard, ES2025; the port's is ES2026.
+        if (options.target === undefined) settings.target = compilerOptionsToJson({ target: ScriptTarget.ES2025 }).target;
+        channel.call({ action: "configureProgram", rootNames, options: settings, defaultLibraryPath });
         handle = channel.call({ action: "getProgram" });
     } catch (error) {
         channel.dispose();

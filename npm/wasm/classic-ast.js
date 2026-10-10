@@ -7,6 +7,7 @@ const nativeNodes = new WeakMap();
 const kindNames = {
     EndOfFile: "EndOfFileToken", JSDoc: "JSDocComment", JSDocAnyType: "JSDocAllType",
     JSTypeAliasDeclaration: "TypeAliasDeclaration", JSImportDeclaration: "ImportDeclaration",
+    JSDocUnknownTag: "JSDocTag",
 };
 const kinds = new Map();
 const childFields = new Map();

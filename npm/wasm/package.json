@@ -42,6 +42,7 @@
         "classic-ast.js",
         "classic-node-fields.js",
         "native-ast.js",
+        "classic-resolutions.js",
         "classic-program.js",
         "classic-checker.js",
         "classic-options.js",

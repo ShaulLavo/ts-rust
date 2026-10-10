@@ -103,6 +103,7 @@ impl Graphs {
                     .collect::<Vec<_>>()
             )),
             "getSourceFile" => Self::source_file(&owner, &request["fileName"]),
+            "getResolutions" => Ok(crate::classic_resolutions::resolutions(program)),
             "getSyntacticDiagnostics"
             | "getSemanticDiagnostics"
             | "getSuggestionDiagnostics"

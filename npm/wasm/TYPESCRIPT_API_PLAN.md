@@ -149,6 +149,46 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Program members and host libraries (unit 3, first batch)
+
+Injected upstream run after this batch: **2,506 of 7,853** (fourslash 1,525, services 981),
+no case lost against the 2,453 baseline by name (runs `r1` to `r4` in
+`/work/tmp/tsrust-ls-probes/u3/`, `r4-passes.txt`, WASM sha256 prefix 7768ee814edb3f70).
+The 538 server-project services units now pass the harness's program-structure check against a
+classic program and stop at `getAmbientModules` (unit 4).
+
+- Library files come from the host, as classic: `createProgram` passes classic
+  `defaultLibraryPath` (`getDefaultLibLocation()` or the directory of
+  `getDefaultLibFileName(options)`), and the compiler host supplies its files through the
+  document registry like any other file. Bundled libraries serve only hosts without it (the
+  private host bridge).
+- A file the host parses during a build keeps the program's canonical path (the registry parse
+  runs under `withRequestedPath`), so `isSourceFileDefaultLibrary` and path lookups hold on
+  case-insensitive hosts.
+- `resolvedModules`, `resolvedTypeReferenceDirectiveNames`, `resolvedLibReferences`,
+  `getAutomaticTypeDirectiveResolutions`, `getAutomaticTypeDirectiveNames`, `getResolvedModule`,
+  `getResolvedModuleFromModuleSpecifier`, `getResolvedTypeReferenceDirective`,
+  `forEachResolvedModule` and `forEachResolvedTypeReferenceDirective` read Rust's resolutions
+  once per program (`getResolutions`) into classic `ModeAwareCache`s (`classic-resolutions.js`, a
+  port of `createModeAwareCache`); a resolution shared by several names is one object.
+- `SourceFile.hasNoDefaultLib` is false, as TypeScript 6.0.3's parser sets it; checker symbols
+  have classic `name` (`symbolName`); the checker answers a missing node as classic's
+  `getParseTreeNode` does for the symbol, signature and optional-parameter queries; the decoder
+  maps the native unknown JSDoc tag to classic `JSDocTag`.
+
+Deviations:
+
+- An unset `target` builds with classic 6.0.3's computed default, ES2025 (LatestStandard); the
+  port's own default is ES2026. Classic's other defaults follow from the target as in the port.
+- The default library is the port's name for the target in the host's library directory; a
+  host whose `getDefaultLibFileName` names another file gets the port's name.
+- Resolutions carry no `failedLookupLocations`, `affectingLocations` or
+  `resolutionDiagnostics`: the port does not keep them. Library resolution order puts `lib`
+  entries first and the rest in program file order, where classic records discovery order.
+  Automatic type directives follow `types` order, then name.
+- Server units now hold about 5.4 GiB RSS at their peak in the roster (2.8 before): libraries are
+  bound per program rather than read from the prebuilt blobs.
+
 ## Upstream baseline and next work (units 3 and 4)
 
 First complete injected run of the unchanged upstream suites against the candidate
@@ -306,8 +346,8 @@ Remaining units, in order. Each ends with its narrow checks and then the injecte
    - [ ] Public `createLanguageService` and `createDocumentRegistry` exports with the module
      ready at load in every supported runtime (unit 6 decides browser loading).
 3. Classic `Program` members the dispatch reads (`getSourceFileByPath`, `getMissingFilePaths`,
-   resolved modules and references, `structureIsReused`, emit). Started: the members above;
-   the baseline table orders the rest.
+   resolved modules and references, `structureIsReused`, emit). Done for the dispatch's
+   resolution members and host libraries (above); `structureIsReused` and emit remain.
 4. `TypeChecker` members and symbol/type internals each service family reads, by family.
 5. `getEmitOutput` through Rust emit, including custom transformers; cancellation tokens;
    host module and type-reference resolution; project references.

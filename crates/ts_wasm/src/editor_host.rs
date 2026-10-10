@@ -28,17 +28,24 @@ pub struct EditorHost {
     inner: Rc<dyn CompilerHost>,
     target: i32,
     documents: bool,
+    default_library_path: Option<String>,
     acquired: RefCell<HashMap<String, ParsedLease>>,
     metadata: RefCell<HashMap<String, SourceMetadata>>,
     metadata_error: RefCell<Option<String>>,
 }
 
 impl EditorHost {
-    pub fn new(inner: Rc<dyn CompilerHost>, target: i32, documents: bool) -> Self {
+    pub fn new(
+        inner: Rc<dyn CompilerHost>,
+        target: i32,
+        documents: bool,
+        default_library_path: Option<String>,
+    ) -> Self {
         Self {
             inner,
             target,
             documents,
+            default_library_path,
             acquired: RefCell::new(HashMap::new()),
             metadata: RefCell::new(HashMap::new()),
             metadata_error: RefCell::new(None),
@@ -131,7 +138,9 @@ impl CompilerHost for EditorHost {
     }
 
     fn default_library_path(&self) -> String {
-        self.inner.default_library_path()
+        self.default_library_path
+            .clone()
+            .unwrap_or_else(|| self.inner.default_library_path())
     }
 
     fn get_current_directory(&self) -> String {

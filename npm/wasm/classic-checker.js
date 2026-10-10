@@ -1,5 +1,5 @@
 import { nodeHandle, nodeLease } from "./classic-ast.js";
-import { TypeFlags, ObjectFlags, SymbolFlags, nativeTypeFlags, nativeObjectFlags, nativeSymbolFlags } from "./classic-enums.js";
+import { SyntaxKind, TypeFlags, ObjectFlags, SymbolFlags, nativeTypeFlags, nativeObjectFlags, nativeSymbolFlags } from "./classic-enums.js";
 
 function translateBits(flags, source, destination) {
     let result = 0;
@@ -8,6 +8,19 @@ function translateBits(flags, source, destination) {
         if ((flags & bit) !== 0) result |= destination[name] ?? 0;
     }
     return result;
+}
+
+/** Classic `symbolName`. */
+function symbolName(symbol) {
+    const name = symbol.valueDeclaration?.name;
+    if (name?.kind === SyntaxKind.PrivateIdentifier && isClassElementWithName(symbol.valueDeclaration)) return name.escapedText;
+    const escaped = symbol.escapedName;
+    return escaped.length >= 3 && escaped.startsWith("___") ? escaped.slice(1) : escaped;
+}
+
+function isClassElementWithName(node) {
+    return node.kind === SyntaxKind.PropertyDeclaration || node.kind === SyntaxKind.MethodDeclaration
+        || node.kind === SyntaxKind.GetAccessor || node.kind === SyntaxKind.SetAccessor;
 }
 
 /** Intern compiler objects within the checker that owns their Rust arenas. */
@@ -93,7 +106,8 @@ export function createTypeChecker(lease, resolveNode) {
             return data;
         }, object => ({
             getFlags: () => object.flags,
-            getName: () => object.escapedName.startsWith("___") ? object.escapedName.slice(1) : object.escapedName,
+            get name() { return symbolName(object); },
+            getName: () => symbolName(object),
             getEscapedName: () => object.escapedName,
             getDeclarations: () => object.declarations,
         }), origin, true);
@@ -142,8 +156,12 @@ export function createTypeChecker(lease, resolveNode) {
     for (const method of ["getAnyType", "getStringType", "getNumberType", "getBooleanType", "getVoidType", "getUndefinedType", "getNullType", "getNeverType", "getUnknownType", "getBigIntType", "getESSymbolType"]) {
         checker[method] = () => query(method);
     }
-    for (const method of ["getTypeAtLocation", "getTypeFromTypeNode", "getSymbolAtLocation", "getShorthandAssignmentValueSymbol", "getSignatureFromDeclaration", "isOptionalParameter"]) {
+    for (const method of ["getTypeAtLocation", "getTypeFromTypeNode"]) {
         checker[method] = node => query(method, { location: location(node) });
+    }
+    // Classic `getParseTreeNode` of a missing node is undefined, and these answer it.
+    for (const [method, missing] of [["getSymbolAtLocation", undefined], ["getShorthandAssignmentValueSymbol", undefined], ["getSignatureFromDeclaration", undefined], ["isOptionalParameter", false]]) {
+        checker[method] = node => node === undefined ? missing : query(method, { location: location(node) });
     }
     for (const method of ["getDeclaredTypeOfSymbol", "getTypeOfSymbol", "getAliasedSymbol", "getImmediateAliasedSymbol", "getMergedSymbol", "getRootSymbols", "getExportsOfModule", "getFullyQualifiedName"]) {
         checker[method] = object => query(method, { symbol: handle(object, "symbol"), origin: objectHandles.get(object)?.origin });

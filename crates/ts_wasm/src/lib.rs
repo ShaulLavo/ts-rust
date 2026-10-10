@@ -36,6 +36,8 @@ mod classic_graph;
 #[cfg(target_family = "wasm")]
 mod classic_metadata;
 #[cfg(target_family = "wasm")]
+mod classic_resolutions;
+#[cfg(target_family = "wasm")]
 mod classic_sources;
 #[cfg(target_family = "wasm")]
 mod classic_strings;

@@ -32,6 +32,8 @@ export function materializeSourceFile(instance, response) {
     if (!file) {
         file = decodeSourceFile(response.data, { languageVersion: target, version: response.version }, lease);
         file.parseDiagnostics = (response.parseDiagnostics ?? []).map(diagnostic => withFile(diagnostic, file));
+        // TypeScript 6.0.3 ignores `no-default-lib` references; its parser sets this false.
+        file.hasNoDefaultLib = false;
         lease.file = new WeakRef(file);
     }
     return file;

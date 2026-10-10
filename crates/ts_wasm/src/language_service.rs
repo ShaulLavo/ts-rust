@@ -149,6 +149,9 @@ pub fn ensure_runtime() {
 struct ProgramConfig {
     root_names: Vec<String>,
     options: Value,
+    /// Classic `defaultLibraryPath`: the directory of the host's default library,
+    /// whose files the compiler host supplies like any other file.
+    default_library_path: Option<String>,
 }
 
 pub struct Service {
@@ -384,6 +387,9 @@ fn command(service: &mut Service, request: &Value) -> Result<String, ServiceErro
             service.program_config = Some(ProgramConfig {
                 root_names: root_names.into_iter().map(go_string_from_utf8).collect(),
                 options: request["options"].clone(),
+                default_library_path: request["defaultLibraryPath"]
+                    .as_str()
+                    .map(|path| go_string_from_utf8(path.to_owned())),
             });
             Ok("null".into())
         }
@@ -467,6 +473,7 @@ fn build_language(
         host,
         config.compiler_options().target.0,
         documents,
+        program_config.and_then(|config| config.default_library_path.clone()),
     ));
     let program = ls_program::new_program(
         ProgramOptions {

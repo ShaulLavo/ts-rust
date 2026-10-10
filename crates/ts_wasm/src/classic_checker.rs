@@ -308,6 +308,7 @@ impl ClassicChecker {
             "getUnknownType" => checker.get_unknown_type(),
             "getBigIntType" => checker.get_big_int_type(),
             "getESSymbolType" => checker.get_es_symbol_type(),
+            "getErrorType" => checker.get_error_type(),
             _ => return Err(format!("unknown checker operation: {method}")),
         };
         Ok(self.type_ref(t))

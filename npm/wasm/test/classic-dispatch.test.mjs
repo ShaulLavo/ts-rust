@@ -123,3 +123,29 @@ test("checker members answer as TypeScript 6.0.3 does", { skip }, async () => {
         assert.equal(checker.getIndexInfoOfType(checker.getTypeAtLocation(file.statements[5].name), ts.IndexKind.String), infos[0]);
     } finally { service.dispose(); }
 });
+
+test("an unsupported root is not missing, and synthesized nodes answer through their originals", { skip }, async () => {
+    const { default: ts } = await import("../classic.js");
+    const text = new Map([["/a.ts", "export const x = 0;"], ["/a.js", "exports.x = 0;"]]);
+    const host = {
+        getCompilationSettings: () => ({ noLib: true }), getScriptFileNames: () => ["/a.ts", "/a.js"], getScriptVersion: () => "1",
+        getScriptSnapshot: path => text.has(path) ? ts.ScriptSnapshot.fromString(text.get(path)) : undefined,
+        getCurrentDirectory: () => "/", getDefaultLibFileName: () => "/lib.d.ts", useCaseSensitiveFileNames: () => true,
+        readFile: path => text.get(path), fileExists: path => text.has(path),
+    };
+    const service = ts.createLanguageService(host);
+    try {
+        const program = service.getProgram();
+        assert.deepEqual(Array.from(program.getMissingFilePaths()), []);
+        assert.equal(service.getProgram(), program, "classic keeps a program whose unsupported root exists");
+        const checker = program.getTypeChecker();
+        const declaration = program.getSourceFile("/a.ts").statements[0].declarationList.declarations[0];
+        const clone = ts.getSynthesizedDeepClone(declaration.name);
+        assert.equal(checker.getSymbolAtLocation(clone), checker.getSymbolAtLocation(declaration.name));
+        assert.equal(checker.typeToString(checker.getTypeAtLocation(clone)), "0");
+        assert.equal(checker.getSignatureFromDeclaration(ts.factory.createFunctionDeclaration(undefined, undefined, "f", undefined, [], undefined, undefined)), undefined);
+        assert.equal(program.useCaseSensitiveFileNames(), true);
+        assert.equal(program.fileExists("/a.js"), true);
+        assert.equal(program.isEmittedFile("/a.js"), true);
+    } finally { service.dispose(); }
+});

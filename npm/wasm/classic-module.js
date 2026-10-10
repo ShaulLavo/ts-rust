@@ -21,3 +21,16 @@ export function compiledModule() {
 export function classicInstance() {
     return sharedInstance(compiledModule());
 }
+
+let namespace;
+
+/** Sets the classic `ts` namespace whose utilities program objects use; the package entry sets it. */
+export function useClassicNamespace(ts) {
+    namespace = ts;
+}
+
+/** The classic namespace: its utilities, never its compiler, which is guarded. */
+export function classicNamespace() {
+    if (!namespace) throw new Error("the classic TypeScript namespace is not loaded");
+    return namespace;
+}

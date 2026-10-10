@@ -3,6 +3,7 @@ import { materializeSourceFile, resolveSourceNode } from "./classic-source-files
 import { createTypeChecker } from "./classic-checker.js";
 import { createModeAwareCache } from "./classic-resolutions.js";
 import { SyntaxKind } from "./classic-enums.js";
+import { classicNamespace } from "./classic-module.js";
 
 const programs = new WeakMap();
 const leases = new WeakMap();
@@ -99,6 +100,42 @@ export function createProgramGraph(channel, handle, settings = {}) {
         return resolutions().typeReferences?.get(file.path)?.get(typeDirectiveName, mode);
     }
 
+    function facts() {
+        return lease.facts ??= graph("getProgramFacts");
+    }
+
+    // Classic `getPackagesMap`: a package maps to true when a resolution found its declarations.
+    function getPackagesMap() {
+        if (lease.packages) return lease.packages;
+        const packages = new Map();
+        program.forEachResolvedModule(({ resolvedModule }) => {
+            if (resolvedModule?.packageId) packages.set(resolvedModule.packageId.name, resolvedModule.extension === ".d.ts" || !!packages.get(resolvedModule.packageId.name));
+        });
+        return lease.packages = packages;
+    }
+
+    function hasUnsupportedExtension(fileName) {
+        const ts = classicNamespace();
+        if (settings.allowNonTsExtensions || !ts.hasExtension(fileName)) return false;
+        const canonicalFileName = program.getCanonicalFileName?.(fileName) ?? fileName;
+        const extensions = ts.getSupportedExtensionsWithJsonIfResolveJsonModule(settings, ts.getSupportedExtensions(settings)).flat();
+        return !extensions.some(extension => ts.fileExtensionIs(canonicalFileName, extension));
+    }
+
+    /** Classic `getSourceFileFromReferenceWorker` without diagnostics. */
+    function getSourceFileFromReferenceWorker(fileName) {
+        const ts = classicNamespace();
+        const supportedExtensions = ts.getSupportedExtensions(settings);
+        if (ts.hasExtension(fileName)) return hasUnsupportedExtension(fileName) ? undefined : getSourceFile(fileName);
+        const sourceFileNoExtension = settings.allowNonTsExtensions && getSourceFile(fileName);
+        if (sourceFileNoExtension) return sourceFileNoExtension;
+        for (const extension of supportedExtensions[0]) {
+            const file = getSourceFile(fileName + extension);
+            if (file) return file;
+        }
+        return undefined;
+    }
+
     function diagnostic(response) {
         const result = { ...response, file: response.fileName ? getSourceFile(response.fileName) : undefined };
         delete result.fileName;
@@ -118,7 +155,8 @@ export function createProgramGraph(channel, handle, settings = {}) {
         getTypeChecker: () => lease.checker ??= createTypeChecker(lease, resolveNode),
         getCurrentDirectory: () => graph("getCurrentDirectory"),
         getSourceFileByPath: path => program.getSourceFiles().find(file => (file.resolvedPath ?? file.fileName) === path),
-        getMissingFilePaths: () => new Map(graph("getMissingFilePaths")),
+        // Classic never looks for a file whose extension the options do not support, so it is not missing.
+        getMissingFilePaths: () => new Map(graph("getMissingFilePaths").filter(([, fileName]) => !hasUnsupportedExtension(fileName))),
         getImpliedNodeFormatForEmit: file => graph("getImpliedNodeFormatForEmit", { fileName: file.fileName }) ?? undefined,
         getEmitModuleFormatOfFile: file => graph("getEmitModuleFormatOfFile", { fileName: file.fileName }) ?? undefined,
         getDefaultResolutionModeForFile: file => graph("getDefaultResolutionModeForFile", { fileName: file.fileName }) ?? undefined,
@@ -141,6 +179,33 @@ export function createProgramGraph(channel, handle, settings = {}) {
             return getResolvedModule(sourceFile, moduleSpecifier.text, program.getModeForUsageLocation(sourceFile, moduleSpecifier));
         },
         getResolvedTypeReferenceDirective,
+        getResolvedTypeReferenceDirectiveFromTypeReferenceDirective: (typeRef, sourceFile) => getResolvedTypeReferenceDirective(
+            sourceFile, typeRef.fileName, typeRef.resolutionMode || program.getDefaultResolutionModeForFile(sourceFile)),
+        getCurrentPackagesMap: getPackagesMap,
+        typesPackageExists: packageName => getPackagesMap().has(classicNamespace().getTypesPackageName(packageName)),
+        packageBundlesTypes: packageName => !!getPackagesMap().get(packageName),
+        getCommonSourceDirectory: () => facts().commonSourceDirectory,
+        get usesUriStyleNodeCoreModules() { return facts().usesUriStyleNodeCoreModules ?? undefined; },
+        get redirectTargetsMap() {
+            if (lease.redirectTargets) return lease.redirectTargets;
+            const map = classicNamespace().createMultiMap();
+            for (const [path, names] of facts().redirectTargets) for (const name of names) map.add(path, name);
+            return lease.redirectTargets = map;
+        },
+        get sourceFileToPackageName() { return lease.sourceFileToPackageName ??= new Map(); },
+        // Programs build without project references, so these have classic's answers for none.
+        getCompilerOptionsForFile: () => settings,
+        getRedirectFromSourceFile: () => undefined,
+        getRedirectFromOutput: () => undefined,
+        getResolvedProjectReferenceByPath: () => undefined,
+        forEachResolvedProjectReference: () => undefined,
+        isSourceOfProjectReferenceRedirect: () => false,
+        getLibFileFromReference(ref) {
+            const libFileName = classicNamespace().getLibFileNameFromLibReference(ref);
+            const actualFileName = libFileName && resolutions().libraries?.get(libFileName)?.actual;
+            return actualFileName !== undefined ? getSourceFile(actualFileName) : undefined;
+        },
+        getSourceFileFromReference: (referencingFile, ref) => getSourceFileFromReferenceWorker(classicNamespace().resolveTripleslashReference(ref.fileName, referencingFile.fileName)),
         forEachResolvedModule: (callback, file) => forEachResolution(resolutions().modules, callback, file),
         forEachResolvedTypeReferenceDirective: (callback, file) => forEachResolution(resolutions().typeReferences, callback, file),
         isSourceFileDefaultLibrary: file => metadata.get(file)?.defaultLibrary ?? false,

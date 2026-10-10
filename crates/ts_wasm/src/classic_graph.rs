@@ -104,6 +104,7 @@ impl Graphs {
             )),
             "getSourceFile" => Self::source_file(&owner, &request["fileName"]),
             "getResolutions" => Ok(crate::classic_resolutions::resolutions(program)),
+            "getProgramFacts" => Ok(program_facts(program)),
             "getSyntacticDiagnostics"
             | "getSemanticDiagnostics"
             | "getSuggestionDiagnostics"
@@ -222,6 +223,31 @@ impl Graphs {
         result["externalLibrary"] = json!(program.is_source_file_from_external_library(&file));
         Ok(result)
     }
+}
+
+/// Program-wide values classic keeps on its program object.
+fn program_facts(program: &NewProgram) -> Value {
+    let mut redirect_targets = program
+        .processed_files
+        .redirect_targets_map
+        .as_ref()
+        .map(|targets| {
+            targets
+                .iter()
+                .map(|(path, names)| (path.0.clone(), names.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    redirect_targets.sort();
+    json!({
+        "commonSourceDirectory": program.common_source_directory(),
+        "usesUriStyleNodeCoreModules": match program.uses_uri_style_node_core_modules() {
+            ts_goport::options::Tristate::True => Value::Bool(true),
+            ts_goport::options::Tristate::False => Value::Bool(false),
+            _ => Value::Null,
+        },
+        "redirectTargets": redirect_targets,
+    })
 }
 
 /// A program's resolution mode for a file, or for a usage location in it.

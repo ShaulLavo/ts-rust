@@ -1,9 +1,9 @@
-import { compiledModule } from "./classic-module.js";
+import { classicNamespace, compiledModule } from "./classic-module.js";
 import { createServiceChannel } from "./service-channel.js";
 import { createProgramGraph } from "./classic-program.js";
 import { sourceFileLease } from "./classic-source-files.js";
 import { compilerOptionsToJson } from "./classic-compiler-options.js";
-import { getDirectoryPath } from "./classic-paths.js";
+import { createGetCanonicalFileName, getDirectoryPath } from "./classic-paths.js";
 import { ScriptTarget } from "./classic-enums.js";
 import { fixedExternalModuleIndicator, getEmitScriptTarget, sourceFileOptionsChanged, withRequestedPath } from "./classic-registry.js";
 
@@ -94,8 +94,52 @@ export function createProgram(rootNamesOrOptions, options, host, oldProgram, con
     const program = createProgramGraph(graphChannel, handle, options);
     const projectReferences = createProgramOptions.projectReferences;
     program.getProjectReferences = () => projectReferences;
+    addHostMembers(program, host, options);
     releaseOldSourceFiles(oldProgram, host, shouldCreateNewSourceFile, requested);
     return program;
+}
+
+/** Program members classic `createProgram` takes from its compiler host. */
+function addHostMembers(program, host, options) {
+    const currentDirectory = host.getCurrentDirectory();
+    const getCanonicalFileName = createGetCanonicalFileName(host.useCaseSensitiveFileNames());
+    let symlinks;
+    Object.assign(program, {
+        useCaseSensitiveFileNames: () => host.useCaseSensitiveFileNames(),
+        getCanonicalFileName,
+        // Classic's `fileExists` without project references; it then has no `directoryExists`.
+        fileExists: fileName => host.fileExists(fileName),
+        readFile: host.readFile.bind(host),
+        directoryExists: undefined,
+        realpath: host.realpath?.bind(host),
+        getGlobalTypingsCacheLocation: host.getGlobalTypingsCacheLocation?.bind(host),
+        getSymlinkCache() {
+            if (host.getSymlinkCache) return host.getSymlinkCache();
+            const ts = classicNamespace();
+            symlinks ??= ts.createSymlinkCache(currentDirectory, getCanonicalFileName);
+            if (!symlinks.hasProcessedResolutions()) {
+                symlinks.setSymlinksFromResolutions(program.forEachResolvedModule, program.forEachResolvedTypeReferenceDirective, program.getAutomaticTypeDirectiveResolutions());
+            }
+            return symlinks;
+        },
+        isEmittedFile(file) {
+            if (options.noEmit) return false;
+            const ts = classicNamespace();
+            const filePath = ts.toPath(file, currentDirectory, getCanonicalFileName);
+            if (program.getSourceFileByPath(filePath)) return false;
+            const ignoreCase = !host.useCaseSensitiveFileNames();
+            const isSameFile = (file1, file2) => ts.comparePaths(file1, file2, currentDirectory, ignoreCase) === 0;
+            const out = options.outFile;
+            if (out) return isSameFile(filePath, out) || isSameFile(filePath, ts.removeFileExtension(out) + ".d.ts");
+            if (options.declarationDir && ts.containsPath(options.declarationDir, filePath, currentDirectory, ignoreCase)) return true;
+            if (options.outDir) return ts.containsPath(options.outDir, filePath, currentDirectory, ignoreCase);
+            if (ts.fileExtensionIsOneOf(filePath, ts.supportedJSExtensionsFlat) || ts.isDeclarationFileName(filePath)) {
+                const filePathWithoutExtension = ts.removeFileExtension(filePath);
+                return !!program.getSourceFileByPath(filePathWithoutExtension + ".ts") || !!program.getSourceFileByPath(filePathWithoutExtension + ".tsx");
+            }
+            return false;
+        },
+    });
 }
 
 /** `createProgram` releases the old program's files that the new program does not reuse. */

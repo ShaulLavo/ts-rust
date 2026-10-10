@@ -1,5 +1,6 @@
 import { nodeHandle, nodeLease } from "./classic-ast.js";
-import { SyntaxKind, TypeFlags, ObjectFlags, SymbolFlags, nativeTypeFlags, nativeObjectFlags, nativeSymbolFlags } from "./classic-enums.js";
+import { classicNamespace } from "./classic-module.js";
+import { NodeFlags, SyntaxKind, TypeFlags, ObjectFlags, SymbolFlags, nativeTypeFlags, nativeObjectFlags, nativeSymbolFlags } from "./classic-enums.js";
 
 function translateBits(flags, source, destination) {
     let result = 0;
@@ -8,6 +9,16 @@ function translateBits(flags, source, destination) {
         if ((flags & bit) !== 0) result |= destination[name] ?? 0;
     }
     return result;
+}
+
+/** Classic `getParseTreeNode` (utilities.ts): the node, or the first parse-tree node it came from. */
+function getParseTreeNode(node, nodeTest) {
+    if (node === undefined || (node.flags & NodeFlags.Synthesized) === 0) return node;
+    node = node.original;
+    while (node) {
+        if ((node.flags & NodeFlags.Synthesized) === 0) return !nodeTest || nodeTest(node) ? node : undefined;
+        node = node.original;
+    }
 }
 
 /** Classic `symbolName`. */
@@ -174,12 +185,22 @@ export function createTypeChecker(lease, resolveNode) {
     for (const method of ["getAnyType", "getStringType", "getNumberType", "getBooleanType", "getVoidType", "getUndefinedType", "getNullType", "getNeverType", "getUnknownType", "getBigIntType", "getESSymbolType"]) {
         checker[method] = () => query(method);
     }
-    for (const method of ["getTypeAtLocation", "getTypeFromTypeNode"]) {
-        checker[method] = node => query(method, { location: location(node) });
-    }
-    // Classic `getParseTreeNode` of a missing node is undefined, and these answer it.
-    for (const [method, missing] of [["getSymbolAtLocation", undefined], ["getShorthandAssignmentValueSymbol", undefined], ["getSignatureFromDeclaration", undefined], ["isOptionalParameter", false]]) {
-        checker[method] = node => node === undefined ? missing : query(method, { location: location(node) });
+    // Classic public methods take the parse-tree node of a synthesized one (`getParseTreeNode`,
+    // optionally with a node test) and answer a default when there is none.
+    const parseTree = (node, test) => getParseTreeNode(node, test && (candidate => classicNamespace()[test](candidate)));
+    const errorType = () => query("getErrorType");
+    for (const [method, test, missing] of [
+        ["getTypeAtLocation", undefined, errorType],
+        ["getTypeFromTypeNode", "isTypeNode", errorType],
+        ["getSymbolAtLocation", undefined, () => undefined],
+        ["getShorthandAssignmentValueSymbol", undefined, () => undefined],
+        ["getSignatureFromDeclaration", "isFunctionLike", () => undefined],
+        ["isOptionalParameter", "isParameter", () => false],
+    ]) {
+        checker[method] = nodeIn => {
+            const node = parseTree(nodeIn, test);
+            return node ? query(method, { location: location(node) }) : missing();
+        };
     }
     for (const method of ["getDeclaredTypeOfSymbol", "getTypeOfSymbol", "getAliasedSymbol", "getImmediateAliasedSymbol", "getMergedSymbol", "getRootSymbols", "getExportsOfModule", "getFullyQualifiedName"]) {
         checker[method] = object => query(method, { symbol: handle(object, "symbol"), origin: objectHandles.get(object)?.origin });
@@ -195,11 +216,16 @@ export function createTypeChecker(lease, resolveNode) {
         };
     }
     const meaning = flags => translateBits(flags, SymbolFlags, nativeSymbolFlags);
-    checker.getSymbolsInScope = (node, flags) => node === undefined ? [] : query("getSymbolsInScope", { location: location(node), meaning: meaning(flags) });
+    checker.getSymbolsInScope = (nodeIn, flags) => {
+        const node = parseTree(nodeIn);
+        return node ? query("getSymbolsInScope", { location: location(node), meaning: meaning(flags) }) : [];
+    };
     let ambientModules;
     checker.getAmbientModules = () => ambientModules ??= query("getAmbientModules");
-    checker.tryGetThisTypeAt = (node, includeGlobalThis, container) => node === undefined ? undefined
-        : query("tryGetThisTypeAt", { location: location(node), includeGlobalThis, container: container === undefined ? undefined : location(container) });
+    checker.tryGetThisTypeAt = (nodeIn, includeGlobalThis, container) => {
+        const node = parseTree(nodeIn);
+        return node && query("tryGetThisTypeAt", { location: location(node), includeGlobalThis, container: container === undefined ? undefined : location(container) });
+    };
     checker.resolveName = (name, node, flags, excludeGlobals) => query("resolveName", { name, location: node === undefined ? undefined : location(node), meaning: meaning(flags), excludeGlobals });
     checker.getResolvedSignatureForSignatureHelp = (node, candidatesOutArray, argumentCount) => {
         const { signature, candidates } = query("getResolvedSignatureForSignatureHelp", { location: location(node), argumentCount });
@@ -217,15 +243,27 @@ export function createTypeChecker(lease, resolveNode) {
     checker.getUnmatchedProperties = (source, target, requireOptionalProperties, matchDiscriminantProperties) => query("getUnmatchedProperties", {
         type: handle(source, "type"), target: handle(target, "type"), requireOptionalProperties, matchDiscriminantProperties, origin: objectHandles.get(source)?.origin,
     }).values();
+    // Classic runs the callback with the token set for its checker's own polling. The Rust
+    // checker does not poll a classic token yet, so work inside the callback runs to its end.
+    checker.runWithCancellationToken = (token, callback) => callback(checker);
     checker.getReturnTypeOfSignature = signature => query("getReturnTypeOfSignature", { signature: handle(signature, "signature"), origin: objectHandles.get(signature)?.origin });
-    checker.getTypeOfSymbolAtLocation = (symbol, node) => query("getTypeOfSymbolAtLocation", { symbol: handle(symbol, "symbol"), location: location(node) });
+    checker.getTypeOfSymbolAtLocation = (symbol, locationIn) => {
+        const node = parseTree(locationIn);
+        return node ? query("getTypeOfSymbolAtLocation", { symbol: handle(symbol, "symbol"), location: location(node) }) : errorType();
+    };
     checker.getPropertyOfType = (type, name) => query("getPropertyOfType", { type: handle(type, "type"), name, origin: objectHandles.get(type)?.origin });
     checker.getTypeOfPropertyOfType = (type, name) => query("getTypeOfPropertyOfType", { type: handle(type, "type"), name, origin: objectHandles.get(type)?.origin });
     checker.getSignaturesOfType = (type, kind) => query("getSignaturesOfType", { type: handle(type, "type"), kind, origin: objectHandles.get(type)?.origin });
     checker.getIndexTypeOfType = (type, kind) => query("getIndexTypeOfType", { type: handle(type, "type"), kind, origin: objectHandles.get(type)?.origin });
-    checker.getContextualType = (node, contextFlags = 0) => query("getContextualType", { location: location(node), contextFlags });
+    checker.getContextualType = (nodeIn, contextFlags = 0) => {
+        const node = parseTree(nodeIn, "isExpression");
+        return node ? query("getContextualType", { location: location(node), contextFlags }) : undefined;
+    };
     checker.getResolvedSignature = node => query("getResolvedSignature", { location: location(node) });
-    checker.typeToString = (type, enclosing) => query("typeToString", { type: handle(type, "type"), location: enclosing && location(enclosing), origin: objectHandles.get(type)?.origin });
+    checker.typeToString = (type, enclosingIn) => {
+        const enclosing = parseTree(enclosingIn);
+        return query("typeToString", { type: handle(type, "type"), location: enclosing && location(enclosing), origin: objectHandles.get(type)?.origin });
+    };
     checker.symbolToString = symbol => query("symbolToString", { symbol: handle(symbol, "symbol") });
     checker.signatureToString = signature => query("signatureToString", { signature: handle(signature, "signature"), origin: objectHandles.get(signature)?.origin });
     return checker;

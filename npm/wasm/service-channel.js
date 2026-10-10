@@ -1,4 +1,5 @@
 import { prepareRun } from "./runtime.js";
+import { decodeProtocolString } from "./wtf8.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -18,12 +19,12 @@ export function createServiceChannel(module, options) {
         let response;
         busy = true;
         try {
-            const ptr = exports.ts_input(input.length);
+            const ptr = exports.ts_input(input.length) >>> 0;
             new Uint8Array(exports.memory.buffer).set(input, ptr);
             exports.ts_service();
             response = JSON.parse(decoder.decode(new Uint8Array(
-                exports.memory.buffer, exports.ts_output(), exports.ts_output_len(),
-            )));
+                exports.memory.buffer, exports.ts_output() >>> 0, exports.ts_output_len() >>> 0,
+            )), (_, value) => decodeProtocolString(value));
         } catch (error) {
             failure = Object.assign(error, { stderr: run.stderrText() });
             throw failure;
@@ -54,5 +55,5 @@ export function createServiceChannel(module, options) {
         run.detach();
         throw error;
     }
-    return { call, dispose };
+    return { call, dispose, isAlive: () => exports !== undefined && failure === undefined };
 }

@@ -1,12 +1,11 @@
 // Compiler and editor calls share the same WASI and host-file-system bridge.
 import { fileEntries } from "./file-map.js";
 import { prepareRun } from "./runtime.js";
+import { encodeWtf8, decodeWtf8 } from "./wtf8.js";
 export { WasiExit } from "./runtime.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-// Preserve a leading BOM in file text, including emitted files.
-const fileDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 /**
  * Runs `tsc` once in a new instance of `module` (a compiled ts-rust wasm
@@ -75,11 +74,11 @@ export async function createLanguageService(module, options = {}) {
         const input = encoder.encode(JSON.stringify(request));
         let result;
         try {
-            const ptr = exports.ts_input(input.length);
+            const ptr = exports.ts_input(input.length) >>> 0;
             new Uint8Array(exports.memory.buffer).set(input, ptr);
             await invoke();
             result = JSON.parse(decoder.decode(new Uint8Array(
-                exports.memory.buffer, exports.ts_output(), exports.ts_output_len(),
+                exports.memory.buffer, exports.ts_output() >>> 0, exports.ts_output_len() >>> 0,
             )));
         } catch (error) {
             failure = Object.assign(error, { stderr: run.stderrText() });
@@ -159,7 +158,7 @@ export function memoryFileSystem(files = new Map()) {
         readFile: path => map.get(path),
         stat(path) {
             const text = map.get(path);
-            if (text !== undefined) return { isDirectory: false, size: text.length, mtimeMs: 0 };
+            if (text !== undefined) return { isDirectory: false, size: encodeWtf8(text).length, mtimeMs: 0 };
             return isDir(path) ? { isDirectory: true, size: 0, mtimeMs: 0 } : undefined;
         },
         readDirectory(path) {
@@ -176,7 +175,7 @@ export function memoryFileSystem(files = new Map()) {
         },
         realpath: path => (map.has(path) || isDir(path) ? path : undefined),
         writeFile(path, data, append) {
-            const text = fileDecoder.decode(data);
+            const text = decodeWtf8(data);
             map.set(path, append ? (map.get(path) ?? "") + text : text);
         },
         remove(path) {

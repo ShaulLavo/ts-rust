@@ -82,6 +82,19 @@ test("setup errors retain command and configuration diagnostics", async () => {
     }
 });
 
+test("configuration warnings allow the project to open", async () => {
+    const service = await createLanguageService({ cwd: "/p", args: ["-p", "/p"], files: {
+        "/p/tsconfig.json": JSON.stringify({ compilerOptions: {
+            strict: true, types: [], plugins: [{ name: "@effect/language-service", diagnosticSeverity: { noSuchRule: "error" } }],
+        }, files: ["a.ts"] }),
+        "/p/a.ts": 'export const value: number = "wrong";',
+    } });
+    try {
+        const result = await service.request("textDocument/diagnostic", { textDocument: { uri: "file:///p/a.ts" } });
+        assert.ok(result.items.some(item => item.code === 2322));
+    } finally { await service.dispose(); }
+});
+
 test("method errors and invalid parameters keep the service usable", async () => {
     const service = await createLanguageService({ args: ["/a.ts"], files: { "/a.ts": "export const value = 1;" } });
     const params = { textDocument: { uri: "file:///a.ts" }, position: { line: 0, character: 14 } };
@@ -114,6 +127,10 @@ function rawService(module) {
         imports[entry.module] ??= {};
         imports[entry.module][entry.name] = () => { throw new Error(`unexpected import during initialization: ${entry.module}.${entry.name}`); };
     }
+    imports.wasi_snapshot_preview1.random_get = (ptr, length) => {
+        new Uint8Array(instance.exports.memory.buffer, ptr >>> 0, length >>> 0).fill(37);
+        return 0;
+    };
     instance = new WebAssembly.Instance(module, imports);
     return text => {
         const bytes = new TextEncoder().encode(text);

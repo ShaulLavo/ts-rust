@@ -78,6 +78,8 @@ pub mod symbol_tracker;
 pub mod types;
 pub mod utilities_p1;
 pub mod utilities_p2;
+#[cfg(target_family = "wasm")]
+mod wasm_binary;
 
 pub use checker_p01::*;
 pub use checker_p02::*;

@@ -3,6 +3,8 @@
 // It needs only WebAssembly, TextEncoder, TextDecoder, crypto and
 // performance, so it runs in Node, Deno, Bun and browsers.
 
+import { encodeWtf8, decodeWtf8 } from "./wtf8.js";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -32,6 +34,7 @@ const OP_WRITE = 4;
 const OP_APPEND = 5;
 const OP_REMOVE = 6;
 const OP_CHTIMES = 7;
+const OP_SOURCE_METADATA = 8;
 
 const KIND_CHAR = { file: "f", directory: "d", symlink: "l", other: "o" };
 
@@ -52,12 +55,12 @@ function writeResult(result) {
  * `{ error }` when it fails with an error text.
  */
 function fsCall(fs, op, request) {
-    const text = decoder.decode(request);
+    const text = decodeWtf8(request);
     switch (op) {
         case OP_READ: {
             const data = fs.readFile(text);
             if (data === undefined) return undefined;
-            return typeof data === "string" ? encoder.encode(data) : data;
+            return typeof data === "string" ? encodeWtf8(data) : data;
         }
         case OP_STAT: {
             const stat = fs.stat(text);
@@ -69,16 +72,16 @@ function fsCall(fs, op, request) {
         case OP_READ_DIR: {
             const entries = fs.readDirectory(text);
             if (!entries) return undefined;
-            return encoder.encode(entries.map(e => `${KIND_CHAR[e.kind] ?? "o"}${e.name}\0`).join(""));
+            return encodeWtf8(entries.map(e => `${KIND_CHAR[e.kind] ?? "o"}${e.name}\0`).join(""));
         }
         case OP_REALPATH: {
             const real = fs.realpath ? fs.realpath(text) : undefined;
-            return real === undefined ? undefined : encoder.encode(real);
+            return real === undefined ? undefined : encodeWtf8(real);
         }
         case OP_WRITE:
         case OP_APPEND: {
             const nul = request.indexOf(0);
-            const path = decoder.decode(request.subarray(0, nul));
+            const path = decodeWtf8(request.subarray(0, nul));
             const data = request.subarray(nul + 1);
             if (!fs.writeFile) return undefined;
             return writeResult(fs.writeFile(path, data, op === OP_APPEND));
@@ -90,6 +93,10 @@ function fsCall(fs, op, request) {
             const [path, atime, mtime] = text.split("\0");
             if (!fs.chtimes) return new Uint8Array();
             return writeResult(fs.chtimes(path, atime ? BigInt(atime) : undefined, mtime ? BigInt(mtime) : undefined));
+        }
+        case OP_SOURCE_METADATA: {
+            const metadata = fs.sourceMetadata?.(text);
+            return metadata === undefined ? undefined : encoder.encode(JSON.stringify(metadata));
         }
     }
     return undefined;
@@ -116,6 +123,8 @@ export function prepareRun(module, options) {
 
     const envBytes = Object.entries(env).map(([k, v]) => encoder.encode(`${k}=${v}\0`));
     const writeStrings = (list, ptrs, buf) => {
+        ptrs >>>= 0;
+        buf >>>= 0;
         const view = dv();
         let at = buf;
         list.forEach((bytes, i) => {
@@ -126,6 +135,8 @@ export function prepareRun(module, options) {
         return SUCCESS;
     };
     const sizes = (list, countPtr, sizePtr) => {
+        countPtr >>>= 0;
+        sizePtr >>>= 0;
         dv().setUint32(countPtr, list.length, true);
         dv().setUint32(sizePtr, list.reduce((n, b) => n + b.length, 0), true);
         return SUCCESS;
@@ -137,6 +148,7 @@ export function prepareRun(module, options) {
         environ_sizes_get: (countPtr, sizePtr) => sizes(envBytes, countPtr, sizePtr),
         environ_get: (ptrs, buf) => writeStrings(envBytes, ptrs, buf),
         clock_time_get: (id, _precision, out) => {
+            out >>>= 0;
             // Wall time with sub-millisecond steps (not Date.now): tsc leaves
             // out a statistics row whose time is zero.
             const ms = id === 0 ? performance.timeOrigin + performance.now() : performance.now();
@@ -145,10 +157,13 @@ export function prepareRun(module, options) {
             return SUCCESS;
         },
         clock_res_get: (_id, out) => {
+            out >>>= 0;
             dv().setBigUint64(out, 1000n, true);
             return SUCCESS;
         },
         random_get: (buf, len) => {
+            buf >>>= 0;
+            len >>>= 0;
             for (let at = 0; at < len; at += 65536) {
                 crypto.getRandomValues(u8().subarray(buf + at, buf + Math.min(len, at + 65536)));
             }
@@ -156,6 +171,9 @@ export function prepareRun(module, options) {
         },
         fd_write: (fd, iovs, iovsLen, nwritten) => {
             if (fd !== 1 && fd !== 2) return EBADF;
+            iovs >>>= 0;
+            iovsLen >>>= 0;
+            nwritten >>>= 0;
             const view = dv();
             let total = 0;
             for (let i = 0; i < iovsLen; i++) {
@@ -174,6 +192,7 @@ export function prepareRun(module, options) {
         },
         fd_fdstat_get: (fd, out) => {
             if (fd > 2) return EBADF;
+            out >>>= 0;
             // A character device without seek rights is a terminal for Rust's
             // `IsTerminal`.
             u8().fill(0, out, out + 24);
@@ -186,6 +205,7 @@ export function prepareRun(module, options) {
         },
         sched_yield: () => SUCCESS,
         poll_oneoff: (_in, _out, _n, nevents) => {
+            nevents >>>= 0;
             dv().setUint32(nevents, 0, true);
             return SUCCESS;
         },
@@ -195,6 +215,8 @@ export function prepareRun(module, options) {
         if (name === "wasi_snapshot_preview1") imports[name][field] = wasi[field] ?? (() => ENOSYS);
     }
     imports.ts_host.fs = (op, ptr, len) => {
+        ptr >>>= 0;
+        len >>>= 0;
         const result = fsCall(fs, op, u8().slice(ptr, ptr + len));
         if (result === undefined) return -1;
         if (result.error !== undefined) {
@@ -205,6 +227,7 @@ export function prepareRun(module, options) {
         return staged.length;
     };
     imports.ts_host.fs_take = ptr => {
+        ptr >>>= 0;
         u8().set(staged, ptr);
         staged = undefined;
     };
@@ -229,8 +252,8 @@ export function prepareRun(module, options) {
             let flags = 0;
             if (diagnosticsJson) flags |= FLAG_DIAGNOSTICS_JSON;
             if (caseInsensitive) flags |= FLAG_CASE_INSENSITIVE;
-            const request = encoder.encode([cwd, String(flags), ...args].join("\0"));
-            u8().set(request, exports.ts_input(request.length));
+            const request = encoder.encode([cwd, String(flags)].concat(args).join("\0"));
+            u8().set(request, exports.ts_input(request.length) >>> 0);
             return exports.ts_run;
         },
         /** The result of a `ts_run` call that returned `exitCode` or threw `error`. */
@@ -244,8 +267,8 @@ export function prepareRun(module, options) {
             }
             let diagnostics;
             if (diagnosticsJson) {
-                const ptr = exports.ts_output();
-                const len = exports.ts_output_len();
+                const ptr = exports.ts_output() >>> 0;
+                const len = exports.ts_output_len() >>> 0;
                 diagnostics = len ? JSON.parse(decoder.decode(u8().subarray(ptr, ptr + len))) : [];
             }
             return { exitCode, diagnostics };

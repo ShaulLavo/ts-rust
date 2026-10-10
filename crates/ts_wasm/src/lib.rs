@@ -31,6 +31,18 @@ use ts_goport::scanner_util::go_string_from_utf8;
 
 pub mod host;
 #[cfg(target_family = "wasm")]
+mod editor_host;
+#[cfg(target_family = "wasm")]
+mod classic_graph;
+#[cfg(target_family = "wasm")]
+mod classic_checker;
+#[cfg(target_family = "wasm")]
+mod classic_sources;
+#[cfg(target_family = "wasm")]
+mod classic_strings;
+#[cfg(target_family = "wasm")]
+mod classic_metadata;
+#[cfg(target_family = "wasm")]
 mod language_service;
 
 /// Report the diagnostics as JSON in the reply, not as text on stdout.

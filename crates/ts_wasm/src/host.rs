@@ -37,6 +37,7 @@ pub enum Op {
     Append = 5,
     Remove = 6,
     Chtimes = 7,
+    SourceMetadata = 8,
 }
 
 /// Runs `op` on `request` in the host.
@@ -119,6 +120,15 @@ fn host_root(root: &str) -> Option<Box<dyn IoFs>> {
 /// `ts_goport::scanner_util::GO_STRING_MARKER`).
 fn bytes(text: &str) -> Vec<u8> {
     go_string_bytes(text).into_owned()
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn read_source_snapshot(path: &str) -> Option<String> {
+    if let Some(text) = ts_goport::frontend::bundled::bundled_text(path) {
+        return Some(text.to_owned());
+    }
+    let data = call(Op::Read, &bytes(path)).ok()?;
+    Some(ts_goport::scanner_util::go_string_from_bytes(data))
 }
 
 /// The error of a failed host write: the host's Go error text, or a
@@ -385,6 +395,7 @@ pub mod test_host {
                 Some(Vec::new())
             }
             Op::Chtimes => Some(Vec::new()),
+            Op::SourceMetadata => None,
         }
     }
 }

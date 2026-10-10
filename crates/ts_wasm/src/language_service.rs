@@ -67,7 +67,10 @@ impl ServiceError {
 }
 
 fn check_config(diagnostics: &[Diagnostic]) -> Result<(), ServiceError> {
-    if diagnostics.is_empty() {
+    if !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.category() == ts_goport::diagnostics::Category::Error)
+    {
         return Ok(());
     }
     let diagnostics = new_diagnostic_responses(diagnostics);
@@ -127,6 +130,10 @@ pub struct Service {
     args: Vec<String>,
     context: Context,
     language: Option<ls::LanguageService>,
+    parse_pools: Rc<RefCell<crate::classic_metadata::ParsePools>>,
+    program_owner: Option<Rc<crate::classic_graph::ProgramOwner>>,
+    graphs: crate::classic_graph::Graphs,
+    retired: bool,
 }
 
 impl Service {
@@ -161,6 +168,10 @@ impl Service {
             args,
             context,
             language: None,
+            parse_pools: Rc::new(RefCell::default()),
+            program_owner: None,
+            graphs: crate::classic_graph::Graphs::default(),
+            retired: false,
         })
     }
 
@@ -168,14 +179,28 @@ impl Service {
         let Some(language) = self.language.take() else {
             return;
         };
-        let program = language.program.clone();
         drop(language);
-        ls_program::release_program(&program);
+        self.program_owner.take();
     }
 
     fn language(&mut self) -> Result<&ls::LanguageService, ServiceError> {
+        if self.retired {
+            return Err("language service is disposed".into());
+        }
         if self.language.is_none() {
-            self.language = Some(build_language(&self.cwd, &self.args)?);
+            let (language, metadata) = build_language(
+                &self.cwd,
+                &self.args,
+                &self.parse_pools,
+            )?;
+            self.program_owner = Some(Rc::new(crate::classic_graph::ProgramOwner {
+                program: language.program.clone(),
+                checker: std::cell::OnceCell::new(),
+                parse_target: std::cell::Cell::new(None),
+                metadata,
+            }));
+            self.language = Some(language);
+            self.parse_pools.borrow_mut().prune();
         }
         self.language
             .as_ref()
@@ -223,6 +248,13 @@ fn command(service: &mut Option<Service>, request: &Value) -> Result<String, Ser
             *service = None;
             Ok("null".into())
         }
+        Some("retire") => {
+            let service = service.as_mut().ok_or("language service is disposed")?;
+            service.invalidate();
+            service.retired = true;
+            service.parse_pools.borrow_mut().prune();
+            Ok("null".into())
+        }
         Some("invalidate") => {
             service
                 .as_mut()
@@ -247,20 +279,53 @@ fn command(service: &mut Option<Service>, request: &Value) -> Result<String, Ser
                 .ok_or("language service is disposed")?
                 .request(method, &request["params"])
         }
+        Some("getProgram") => {
+            let service = service.as_mut().ok_or("language service is disposed")?;
+            service.language()?;
+            let owner = service.program_owner.as_ref().ok_or("program is unavailable")?;
+            owner.checker.get_or_init(|| crate::classic_checker::ClassicChecker::new(&owner.program, &service.context));
+            Ok(service.graphs.retain(owner).to_string())
+        }
+        Some("graph") => {
+            let service = service.as_mut().ok_or("language service is disposed")?;
+            service.graphs.request(&service.context, request).map(|value| value.to_string()).map_err(ServiceError::InvalidParams)
+        }
+        Some("source") => {
+            let id = request["source"].as_u64().ok_or("source file lease is required")?;
+            let id = u32::try_from(id).map_err(|error| error.to_string())?;
+            service.as_ref().ok_or("language service is disposed")?.graphs.sources.response(id).map(|value| value.to_string()).map_err(ServiceError::InvalidParams)
+        }
+        Some("releaseSource") => {
+            let id = request["source"].as_u64().ok_or("source file lease is required")?;
+            let id = u32::try_from(id).map_err(|error| error.to_string())?;
+            service.as_mut().ok_or("language service is disposed")?.graphs.sources.release(id);
+            Ok("null".into())
+        }
+        Some("releaseProgram") => {
+            let id = request["program"].as_u64().ok_or("program handle is required")?;
+            let id = u32::try_from(id).map_err(|error| error.to_string())?;
+            service.as_mut().ok_or("language service is disposed")?.graphs.release(id);
+            Ok("null".into())
+        }
         _ => Err("unknown language service action".into()),
     }
 }
 
-fn build_language(cwd: &str, args: &[String]) -> Result<ls::LanguageService, ServiceError> {
+fn build_language(
+    cwd: &str,
+    args: &[String],
+    parse_pools: &Rc<RefCell<crate::classic_metadata::ParsePools>>,
+) -> Result<(ls::LanguageService, HashMap<String, crate::classic_metadata::SourceMetadata>), ServiceError> {
     let sys = new_os_system().map_err(|status| {
         ServiceError::Internal(format!("cannot initialize host: {}", status.code()))
     })?;
     let config = read_config(args, &sys)?;
     let host =
         compiler::new_compiler_host(cwd, sys.fs(), &sys.default_library_path(), None, None, None);
+    let host = Rc::new(crate::editor_host::EditorHost::new(host, parse_pools.clone(), config.compiler_options().target.0));
     let program = ls_program::new_program(
         ProgramOptions {
-            host,
+            host: host.clone(),
             config: Rc::new(config),
             use_source_of_project_reference: false,
             single_threaded: Tristate::True,
@@ -271,28 +336,29 @@ fn build_language(cwd: &str, args: &[String]) -> Result<ls::LanguageService, Ser
         },
         None,
     );
+    if let Some(error) = host.take_metadata_error() {
+        ls_program::release_program(&program);
+        return Err(ServiceError::InvalidParams(error));
+    }
+    let metadata = host.metadata();
     let fs = program.host().fs();
-    let lines_fs = fs.clone();
     let line_maps = RefCell::new(HashMap::<String, Rc<lsconv::LSPLineMap>>::new());
     let converters = lsconv::new_converters(lsproto::PositionEncodingKind::UTF16, move |name| {
         if let Some(lines) = line_maps.borrow().get(name).cloned() {
             return Some(lines);
         }
-        let (text, found) = lines_fs.read_file(name);
-        if !found {
-            return None;
-        }
+        let text = host::read_source_snapshot(name)?;
         let lines = lsconv::compute_lsp_line_starts(&text);
         line_maps.borrow_mut().insert(name.into(), lines.clone());
         Some(lines)
     });
     let host = Rc::new(LanguageHost { fs, converters });
-    Ok(ls::new_language_service(
+    Ok((ls::new_language_service(
         ls::autoimport::ProjectID(cwd.into()),
         program,
         host,
         "",
-    ))
+    ), metadata))
 }
 
 fn read_config(args: &[String], sys: &dyn System) -> Result<ParsedCommandLine, ServiceError> {

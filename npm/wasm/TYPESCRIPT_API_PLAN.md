@@ -149,6 +149,35 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Classic dispatch on Rust (unit 2, second part)
+
+`scripts/generate-classic-services.mjs` turns the published `typescript@6.0.3`
+`lib/typescript.js` (checked by version, gitHead and recorded sha256) into
+`classic-services.js`, a factory for the whole `ts` namespace. It redirects `createProgram`,
+`createSourceFile`, `createLanguageServiceSourceFile`, `updateLanguageServiceSourceFile` and
+`getSetExternalModuleIndicator` to the Rust-backed functions, and makes the classic parser,
+incremental parser, binder, checker and emitter throw if reached. Each patched header must occur
+exactly once. `createLanguageService`, the document registry, every service algorithm and the
+utilities are the published code. `classic.js` loads the module, builds the namespace and
+exports it; the generated file stays out of git like the WASM module.
+
+Classic compiler hosts read the old program while a build asks them for files, so a host
+callback may now send requests to other sessions; only a running session cannot be reentered,
+and Rust borrows each session on its own.
+
+Program members added for the dispatch: `getMissingFilePaths` (Rust's missing files),
+`getSourceFileByPath`, `getProjectReferences` (from `createProgram`), `getResolvedProjectReferences`
+and `resolvedLibReferences` (none yet). A bundled library's `version` is `undefined`, as a
+classic host's version is for a file it does not own, so `isProgramUptoDate` holds.
+
+Checks: `test/classic-dispatch.test.mjs` (skipped with its reason when the bundle is not
+generated): semantic diagnostics through the unchanged dispatch with `file` identical to the
+program's source file, program reuse while the host is unchanged, a version change, the old
+source file kept, syntactic diagnostics and the navigation tree, and the guards. Injected
+upstream run (`/work/tmp/tsrust-ls-probes/u2/run-classic-candidate-v2.cjs`, which also routes
+`createDocumentRegistry` and `OperationCanceledException` to the candidate): navigation bar,
+outlining and brace slice 73/77.
+
 ## Rust `createProgram` over a classic compiler host (unit 2, first part)
 
 `createProgram(rootNames, options, host, oldProgram)` and its options-object form open a
@@ -235,8 +264,9 @@ Remaining units, in order. Each ends with its narrow checks and then the injecte
    (public export moves to unit 2 with the factory).
 2. Classic dispatch bundle with guarded compiler entries and the Rust `createProgram` bridge.
    - [x] `createProgram` over a classic `CompilerHost` (`classic-create-program.js`), below.
-   - [ ] The guarded dispatch bundle, its `createProgram` injection, and public
-     `createLanguageService` and `createDocumentRegistry` exports with the module ready at load.
+   - [x] The guarded dispatch bundle and its Rust injection (`classic.js`, Node), below.
+   - [ ] Public `createLanguageService` and `createDocumentRegistry` exports with the module
+     ready at load in every supported runtime (unit 6 decides browser loading).
 3. Classic `Program` members the dispatch reads (`getSourceFileByPath`, `getMissingFilePaths`,
    resolved modules and references, `structureIsReused`, emit).
 4. `TypeChecker` members and symbol/type internals each service family reads, by family.

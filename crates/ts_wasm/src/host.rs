@@ -118,6 +118,12 @@ pub fn set_case_sensitive(case_sensitive: bool) {
     CASE_SENSITIVE.with(|cell| cell.set(case_sensitive));
 }
 
+/// The case sensitivity of the active host file system.
+#[must_use]
+pub fn case_sensitive() -> bool {
+    CASE_SENSITIVE.with(Cell::get)
+}
+
 /// The host file system. Reads go through Go's `vfs/internal.Common`, as
 /// the OS file system does, so BOM handling, text decoding and link
 /// following match a native run.

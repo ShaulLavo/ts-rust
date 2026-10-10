@@ -11,7 +11,7 @@ export function createServiceChannel(module, options) {
     function call(request) {
         if (session === undefined) throw new Error("language service is disposed");
         if (!instance.isAlive()) throw instance.failure();
-        if (instance.inCallback()) throw new Error("language service cannot reenter a host callback");
+        if (instance.isRunning(session)) throw new Error("language service cannot reenter a host callback");
         const { response, held } = instance.send(Object.assign({ session }, request), files);
         if (held) {
             if (request.action !== "invalidate") call({ action: "invalidate" });
@@ -22,7 +22,7 @@ export function createServiceChannel(module, options) {
 
     function dispose() {
         if (session === undefined) return;
-        if (instance.inCallback()) throw new Error("language service cannot dispose during a host callback");
+        if (instance.isRunning(session)) throw new Error("language service cannot dispose during a host callback");
         try {
             if (instance.isAlive()) instance.call({ action: "close", session });
         } finally {

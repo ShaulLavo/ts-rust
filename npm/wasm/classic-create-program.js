@@ -83,6 +83,8 @@ export function createProgram(rootNamesOrOptions, options, host, oldProgram, con
         },
     };
     const program = createProgramGraph(graphChannel, handle, options);
+    const projectReferences = createProgramOptions.projectReferences;
+    program.getProjectReferences = () => projectReferences;
     releaseOldSourceFiles(oldProgram, host, shouldCreateNewSourceFile, requested);
     return program;
 }

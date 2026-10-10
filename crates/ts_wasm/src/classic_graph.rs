@@ -90,6 +90,14 @@ impl Graphs {
                     .collect::<Vec<_>>()
             )),
             "getCurrentDirectory" => Ok(json!(program.get_current_directory())),
+            "getMissingFilePaths" => Ok(json!(
+                program
+                    .processed_files
+                    .missing_files
+                    .iter()
+                    .map(|name| (program.to_path(name).0, name))
+                    .collect::<Vec<_>>()
+            )),
             "getSourceFile" => Self::source_file(&owner, &request["fileName"]),
             "getSyntacticDiagnostics"
             | "getSemanticDiagnostics"

@@ -50,6 +50,8 @@ export function createProgramGraph(channel, handle, settings = {}) {
         file = files.get(response.fileName);
         if (file) return file;
         file = materializeSourceFile(channel.instance, response);
+        // A bundled library has no host version, as a classic host has none for a file it does not own.
+        if (file.resolvedPath === undefined) file.version = undefined;
         files.set(response.fileName, file);
         metadata.set(file, response);
         return file;
@@ -73,6 +75,11 @@ export function createProgramGraph(channel, handle, settings = {}) {
         getCompilerOptions: () => settings,
         getTypeChecker: () => lease.checker ??= createTypeChecker(lease, resolveNode),
         getCurrentDirectory: () => graph("getCurrentDirectory"),
+        getSourceFileByPath: path => program.getSourceFiles().find(file => (file.resolvedPath ?? file.fileName) === path),
+        getMissingFilePaths: () => new Map(graph("getMissingFilePaths")),
+        getProjectReferences: () => undefined,
+        getResolvedProjectReferences: () => undefined,
+        resolvedLibReferences: undefined,
         isSourceFileDefaultLibrary: file => metadata.get(file)?.defaultLibrary ?? false,
         isSourceFileFromExternalLibrary: file => metadata.get(file)?.externalLibrary ?? false,
         getSyntacticDiagnostics: file => diagnostics("getSyntacticDiagnostics", file),

@@ -274,11 +274,13 @@ impl Drop for Service {
     }
 }
 
-/// The language-service sessions of one instance.
+/// The language-service sessions of one instance. Each session borrows on its own, so a
+/// host callback of one session's build can query another session's programs, as classic
+/// compiler hosts query the old program.
 #[derive(Default)]
 struct Sessions {
     next_id: u32,
-    services: HashMap<u32, Service>,
+    services: HashMap<u32, Rc<RefCell<Service>>>,
 }
 
 thread_local! {
@@ -334,24 +336,27 @@ fn instance_command(request: &Value, payload: &[u8]) -> Result<String, ServiceEr
                 .checked_add(1)
                 .ok_or("language service sessions exhausted")?;
             let id = sessions.next_id;
-            sessions.services.insert(id, service);
+            sessions.services.insert(id, Rc::new(RefCell::new(service)));
             Ok(id.to_string())
         }),
         Some(_) => {
             let id = lease_id(request, "session", "language service session is required")?;
-            SESSIONS.with(|sessions| {
-                let mut sessions = sessions.borrow_mut();
-                if request["action"] == "close" {
-                    sessions.services.remove(&id);
-                    return Ok("null".into());
-                }
-                let service = sessions
-                    .services
-                    .get_mut(&id)
-                    .ok_or("language service is disposed")?;
-                host::set_case_sensitive(service.case_sensitive);
-                command(service, request)
-            })
+            if request["action"] == "close" {
+                let closed = SESSIONS.with(|sessions| sessions.borrow_mut().services.remove(&id));
+                drop(closed);
+                return Ok("null".into());
+            }
+            let service = SESSIONS
+                .with(|sessions| sessions.borrow().services.get(&id).cloned())
+                .ok_or("language service is disposed")?;
+            let mut service = service
+                .try_borrow_mut()
+                .map_err(|_| "language service cannot reenter a host callback")?;
+            let case_sensitive = host::case_sensitive();
+            host::set_case_sensitive(service.case_sensitive);
+            let result = command(&mut service, request);
+            host::set_case_sensitive(case_sensitive);
+            result
         }
         None => Err("unknown language service action".into()),
     }

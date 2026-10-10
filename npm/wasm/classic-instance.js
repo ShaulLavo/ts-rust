@@ -22,8 +22,9 @@ export function sharedInstance(module) {
 
 function createInstance(module) {
     let active;
-    let documentRequests = 0;
     let depth = 0;
+    // Sessions whose requests are running, outermost first.
+    const running = [];
     let failure;
     // Host file operations reach the session whose request is running.
     const fs = {
@@ -31,24 +32,20 @@ function createInstance(module) {
         stat: path => active.stat(path),
         readDirectory: path => active.readDirectory(path),
         realpath: path => active.realpath?.(path),
-        getSourceFile(request) {
-            documentRequests++;
-            try { return active.getSourceFile(request); }
-            finally { documentRequests--; }
-        },
+        getSourceFile: request => active.getSourceFile(request),
     };
     const run = prepareRun(module, { fs, holdHostExceptions: true });
     let exports = run.attach(new WebAssembly.Instance(module, run.imports));
 
     /**
      * Sends one request and returns its response with the first exception a
-     * host callback threw during it. Only a document parse may run inside a
-     * host callback, and only while a session's build asks its compiler host
-     * for a file.
+     * host callback threw during it. A host callback may send requests for
+     * documents and for other sessions, as a classic compiler host parses
+     * files and reads the old program; a running session cannot be reentered.
      */
     function send(request, files, payload) {
         if (failure) throw failure;
-        if (depth > 0 && !(documentRequests > 0 && request.action === "parseDocument")) {
+        if (request.session !== undefined && running.includes(request.session)) {
             throw new Error("language service cannot reenter a host callback");
         }
         const json = encoder.encode(JSON.stringify(request));
@@ -61,6 +58,7 @@ function createInstance(module) {
         }
         const previous = active;
         if (files) active = files;
+        if (request.session !== undefined) running.push(request.session);
         depth++;
         let response;
         try {
@@ -77,6 +75,7 @@ function createInstance(module) {
             throw failure;
         } finally {
             depth--;
+            if (request.session !== undefined) running.pop();
             active = previous;
         }
         return { response, held: depth === 0 ? run.takeHostException() : undefined };
@@ -93,6 +92,7 @@ function createInstance(module) {
         call,
         isAlive: () => failure === undefined,
         inCallback: () => depth > 0,
+        isRunning: session => running.includes(session),
         failure: () => failure,
         source: source => call({ action: "source", source }),
         releaseSource(source) {

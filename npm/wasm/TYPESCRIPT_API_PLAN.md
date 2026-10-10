@@ -158,12 +158,18 @@ json-stream reporter, via `watch-run.sh`): **2,453 of 7,853** pass (fourslash 1,
 services units 981 of 1,531), against the reference's 7,853. Two runs on the same source match
 name for name (`full5-passes.txt`, `full6-passes.txt` in that directory). The roster takes about
 three minutes; memory stays flat (RSS about 2.8 GiB, WASM memory 463 MiB) with ordinary GC.
+The runner routes the pinned test bundle's `createLanguageService`, `createDocumentRegistry`,
+`createDocumentRegistryInternal` (the server `ProjectService` registry, with its external
+cache) and `OperationCanceledException` to the candidate, each seam asserted to occur once;
+its counters for the last run were 6,874 services, 6,332 registries and 538 internal registries.
+With the internal-registry seam the result is the same 2,453 by name (`full7-passes.txt`); the
+538 server-project units that had received classic-parser files now reach the candidate.
 
 Largest failure groups, the queue for units 3 and 4 (counts are failing tests by first error):
 
 | Count | First error | Owner |
 | --- | --- | --- |
-| 538 | compiler host returned a source file this compiler does not own | foreign `SourceFile` adoption (registry objects from classic `createSourceFile` callers, harness caches across a trap) |
+| 538 | `program.getAutomaticTypeDirectiveResolutions` | Program members (unit 3); all server-project services units |
 | 490 | `Cannot read properties of undefined` | per-case diagnosis |
 | 461, 145 | `isUnknownSymbol`, `isUndefinedSymbol` | checker identity members |
 | 426 | `getSymbolsInScope` | completions family |

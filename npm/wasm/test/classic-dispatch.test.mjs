@@ -149,3 +149,28 @@ test("an unsupported root is not missing, and synthesized nodes answer through t
         assert.equal(program.isEmittedFile("/a.js"), true);
     } finally { service.dispose(); }
 });
+
+test("quick info display parts come from Rust's node builder through the classic printer", { skip }, async () => {
+    const { default: ts } = await import("../classic.js");
+    const text = 'namespace N { export interface I<T> { x: T; s: "q" } }\nconst v: N.I<string> = { x: "", s: "q" };\nfunction f(a: number, b?: string): void {}\nclass C<T> {}\n';
+    const host = {
+        getCompilationSettings: () => ({ noLib: true }), getScriptFileNames: () => ["/a.ts"], getScriptVersion: () => "1",
+        getScriptSnapshot: path => path === "/a.ts" ? ts.ScriptSnapshot.fromString(text) : undefined,
+        getCurrentDirectory: () => "/", getDefaultLibFileName: () => "/lib.d.ts", useCaseSensitiveFileNames: () => true,
+        readFile: path => path === "/a.ts" ? text : undefined, fileExists: path => path === "/a.ts",
+    };
+    const service = ts.createLanguageService(host);
+    try {
+        // Expected parts were read from typescript@6.0.3 on the same input.
+        const parts = at => service.getQuickInfoAtPosition("/a.ts", text.indexOf(at)).displayParts.map(part => [part.text, part.kind]);
+        assert.deepEqual(parts("v:"), [["const", "keyword"], [" ", "space"], ["v", "localName"], [":", "punctuation"], [" ", "space"], ["N", "moduleName"], [".", "punctuation"], ["I", "interfaceName"], ["<", "punctuation"], ["string", "keyword"], [">", "punctuation"]]);
+        assert.deepEqual(parts("C<"), [["class", "keyword"], [" ", "space"], ["C", "className"], ["<", "punctuation"], ["T", "typeParameterName"], [">", "punctuation"]]);
+        assert.deepEqual(parts("f(").map(part => part[0]).join(""), "function f(a: number, b?: string): void");
+        const program = service.getProgram();
+        const checker = program.getTypeChecker();
+        const file = program.getSourceFile("/a.ts");
+        const node = checker.typeToTypeNode(checker.getTypeAtLocation(file.statements[1].declarationList.declarations[0].name), undefined, undefined);
+        assert.deepEqual([node.kind, node.pos, node.flags & ts.NodeFlags.Synthesized], [ts.SyntaxKind.TypeReference, -1, ts.NodeFlags.Synthesized]);
+        assert.equal(ts.createPrinter().printNode(ts.EmitHint.Unspecified, node, file), "I<string>");
+    } finally { service.dispose(); }
+});

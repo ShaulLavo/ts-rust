@@ -149,6 +149,46 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Node builder, display parts and program host members (unit 4, second batch)
+
+Injected run: **3,685 of 7,853** (fourslash 2,460, services 1,225), none lost against the
+previous batch (`r9` in `/work/tmp/tsrust-ls-probes/u3/`, WASM f32d1cd33302f227, peak RSS
+2.5 GiB).
+
+- Rust's node builder answers classic `typeToTypeNode`, `typeParameterToDeclaration`,
+  `symbolToEntityName`, `symbolToExpression`, `symbolToNode`, `symbolToParameterDeclaration`,
+  `symbolToTypeParameterDeclarations`, `signatureToSignatureDeclaration` and
+  `indexInfoToIndexSignatureDeclaration`. Its nodes cross as binary AST data
+  (`encode_node`) and decode as classic synthesized nodes: positions -1, no parent,
+  `NodeFlags.Synthesized`, and each identifier's `symbol` the builder recorded. `writeSymbol`,
+  `writeType` and `writeSignature` are classic's `symbolToString`, `typeToString` and
+  `signatureToString` with a writer: the builder's node printed by the classic printer, so
+  display parts carry classic kinds.
+- Symbols and signatures have classic's documentation members (`getDocumentationComment`,
+  `getContextualDocumentationComment`, `getJsDocTags`, `getContextualJsDocTags`), ported from
+  `services.ts` into `classic-symbol-docs.js` over the classic JSDoc utilities.
+- Checker members: `isImplementationOfOverload`, `isValidPropertyAccess`,
+  `isValidPropertyAccessForCompletions`, `isPropertyAccessible`, `getJsxNamespace`,
+  `getTypeArgumentConstraint`, `getExportSpecifierLocalTargetSymbol`,
+  `getSuggestedSymbolForNonexistentProperty`, `getCandidateSignaturesForStringLiteralCompletions`,
+  `getExportsAndPropertiesOfModule`, `resolveExternalModuleSymbol`, `getParameterType`,
+  `getPromiseType`, `createPromiseType`, `getIndexType`, `getUnionType`, `isTypeAssignableTo`,
+  `getDiagnostics`, `getGlobalDiagnostics`; node arguments go through classic's
+  `getParseTreeNode` with its node tests and defaults.
+- Program members from the compiler host and program-wide facts: see the commit "Add classic
+  program host members"; `getMissingFilePaths` leaves out files with extensions classic never
+  looks for, so `isProgramUptoDate` holds.
+
+Deviations: the node builder takes no symbol tracker, maximum length or verbosity level
+(`typeToTypeNode`'s `tracker`, hover verbosity); `symbolToTypeParameterDeclarations` is
+undefined when there are none; `getSuggestedSymbolForNonexistentProperty` takes a name node, not
+a string; `runWithCancellationToken` and `getDiagnostics` do not poll the token.
+
+Next by failing count (`r9`): `Cannot read properties of undefined` (1,085, per case), symbols
+of another checker (556), unbacked nodes (498), `position cannot precede the beginning of the
+file` (222), `getExpandedParameters`, `getTypePredicateOfSignature`, `isDeclarationVisible`,
+`getJsxFragmentFactory`, `getAccessibleSymbolChain`, `isTypeInvalidDueToUnionDiscriminant`.
+
 ## Checker members (unit 4, first batch)
 
 Injected run: **2,773 of 7,853** (fourslash 1,792, services 981), none lost against the

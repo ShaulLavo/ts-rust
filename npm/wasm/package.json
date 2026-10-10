@@ -45,6 +45,7 @@
         "classic-resolutions.js",
         "classic-program.js",
         "classic-checker.js",
+        "classic-symbol-docs.js",
         "classic-options.js",
         "classic-compiler-options.js",
         "classic-create-program.js",

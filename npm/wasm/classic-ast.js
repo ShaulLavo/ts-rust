@@ -112,8 +112,13 @@ export function nodeLease(node) {
 
 export function nodeHandle(node) {
     const data = nativeNodes.get(node);
-    if (!data || !(data.node instanceof RemoteNode)) throw new TypeError("Node is not backed by this compiler");
+    if (!data || data.synthetic || !(data.node instanceof RemoteNode)) throw new TypeError("Node is not backed by this compiler");
     return { index: data.node.index, fileName: data.root.fileName, nativeKind: data.node.kind, source: data.lease?.source };
+}
+
+/** Classic synthesized nodes from the node builder's binary output. */
+export function decodeSyntheticNode(bytes, symbols) {
+    return decodeSourceFile(bytes, {}, undefined, { symbols });
 }
 
 export function resolveNodeHandle(sourceFile, handle) {
@@ -148,7 +153,7 @@ function materializeNode(root, index) {
 }
 
 /** Decode the compiler's immutable AST, preserving one wrapper per native node. */
-export function decodeSourceFile(bytes, metadata = {}, lease) {
+export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
     const data = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
     if (data.length < 64 || data[3] !== 9) throw new RangeError("Unsupported compiler AST encoding");
     const root = decodeNode(data);
@@ -166,7 +171,9 @@ export function decodeSourceFile(bytes, metadata = {}, lease) {
         const methods = new Map();
         const deleted = new Set();
         const fields = publicFields(value);
-        const allowed = new Set(fields.concat(Array.from(nodeMethods), value === root ? Array.from(fileMethods) : []));
+        const allowed = new Set(fields.concat(Array.from(nodeMethods), value === root && !synthetic ? Array.from(fileMethods) : []));
+        // A synthesized identifier carries the symbol the node builder named it for.
+        if (synthetic?.symbols.has(value.index)) overrides.symbol = synthetic.symbols.get(value.index);
         const keys = () => Reflect.isExtensible(overrides) ? Array.from(new Set(fields.filter(field => !deleted.has(field)).concat(Reflect.ownKeys(overrides)))) : Reflect.ownKeys(overrides);
         const get = property => {
             if (Object.hasOwn(overrides, property)) return Reflect.get(overrides, property, node);
@@ -198,7 +205,7 @@ export function decodeSourceFile(bytes, metadata = {}, lease) {
             },
         });
         nodes.set(value, node);
-        nativeNodes.set(node, { node: value, root, wrap, lease });
+        nativeNodes.set(node, { node: value, root, wrap, lease, synthetic: synthetic !== undefined });
         return node;
     }
 
@@ -210,13 +217,17 @@ export function decodeSourceFile(bytes, metadata = {}, lease) {
         for (const property of ["pos", "end", "hasTrailingComma", "transformFlags"]) {
             if (value[property] !== undefined) result[property] = value[property];
         }
+        if (synthetic) result.pos = result.end = -1;
         return result;
     }
 
     function read(raw, overrides, property) {
         if (Object.hasOwn(overrides, property)) return overrides[property];
         if (property === "kind") return translateKind(raw.kind);
-        if (property === "flags") return translateNodeFlags(raw);
+        // Builder output is synthesized, as classic factory nodes are: no position, no parent.
+        if (synthetic && (property === "pos" || property === "end")) return -1;
+        if (synthetic && property === "parent") return undefined;
+        if (property === "flags") return translateNodeFlags(raw) | (synthetic ? NodeFlags.Synthesized : 0);
         if (property === "tokenFlags") return translateFlags(raw.tokenFlags ?? 0, tokenFlagBits);
         if (property === "templateFlags") return translateFlags(templateFlags(raw), tokenFlagBits) & TokenFlags.TemplateLiteralLikeFlags;
         if (property === "modifierFlags") return translateFlags(raw.modifierFlags ?? 0, modifierFlagBits);

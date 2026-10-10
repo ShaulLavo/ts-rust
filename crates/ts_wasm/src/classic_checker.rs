@@ -7,15 +7,16 @@ use ts_goport::api::{encoder, proto};
 use ts_goport::ast::{escape_symbol_name, get_source_file_of_node, is_part_of_type_node};
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::binder::go_symbol_name;
-use ts_goport::checker::Checker;
+use ts_goport::checker::{Checker, InternalNodeBuilderFlags, NodeBuilderFlags};
 use ts_goport::core::{IndexInfoId, Node, SignatureId, SymbolId, TypeId};
-use ts_goport::flags::{ContextFlags, SignatureKind, SymbolFlags, TypeFlags};
+use ts_goport::flags::{ContextFlags, SignatureKind, SymbolFlags, TypeFlags, UnionReduction};
 use ts_goport::frontend::compiler::NewProgram;
 use ts_goport::gostd::Context;
 use ts_goport::program::ls_program;
 
 pub struct ClassicChecker {
     checker: Rc<RefCell<Checker>>,
+    context: Context,
     types: RefCell<HashSet<u32>>,
     symbols: RefCell<HashSet<u32>>,
     signatures: RefCell<HashSet<u32>>,
@@ -27,6 +28,7 @@ impl ClassicChecker {
         drop(release);
         Self {
             checker,
+            context: context.clone(),
             types: RefCell::default(),
             symbols: RefCell::default(),
             signatures: RefCell::default(),
@@ -144,6 +146,84 @@ impl ClassicChecker {
             "containsArgumentsReference" => {
                 Ok(json!(checker.contains_arguments_reference(location)))
             }
+            "nodeBuilder" => self.build_node(&mut checker, location, t, symbol, signature, request),
+            "isImplementationOfOverload" => Ok(json!(classic_is_implementation_of_overload(
+                &mut checker,
+                location
+            ))),
+            "isValidPropertyAccess" => Ok(json!(
+                checker.is_valid_property_access_exported(location, string(request, "name")?)
+            )),
+            "isValidPropertyAccessForCompletions" => Ok(json!(
+                checker.is_valid_property_access_for_completions_exported(location, t, symbol)
+            )),
+            "isPropertyAccessible" => Ok(json!(checker.is_property_accessible_exported(
+                location,
+                request["isSuper"].as_bool().unwrap_or(false),
+                request["isWrite"].as_bool().unwrap_or(false),
+                t,
+                symbol,
+            ))),
+            "getJsxNamespace" => Ok(json!(checker.get_jsx_namespace_exported(location))),
+            "getTypeArgumentConstraint" => {
+                Ok(self.type_ref(checker.get_type_argument_constraint_exported(location)))
+            }
+            "getExportSpecifierLocalTargetSymbol" => {
+                Ok(self.symbol_ref(checker.get_export_specifier_local_target_symbol(location)))
+            }
+            "getSuggestedSymbolForNonexistentProperty" => {
+                Ok(self
+                    .symbol_ref(checker.get_suggested_symbol_for_nonexistent_property(location, t)))
+            }
+            "getCandidateSignaturesForStringLiteralCompletions" => {
+                let editing = node(request, "editingArgument")?;
+                Ok(self.signature_refs(
+                    &checker
+                        .get_candidate_signatures_for_string_literal_completions(location, editing),
+                ))
+            }
+            "getExportsAndPropertiesOfModule" => {
+                Ok(self.symbol_refs(&checker.get_exports_and_properties_of_module(symbol)))
+            }
+            "resolveExternalModuleSymbol" => {
+                Ok(self.symbol_ref(checker.resolve_external_module_symbol_exported(symbol)))
+            }
+            "getParameterType" => {
+                let index = request["index"].as_i64().map_or(Ok(0), i32::try_from);
+                Ok(self.type_ref(checker.get_type_at_position_exported(
+                    signature,
+                    index.map_err(|error| error.to_string())?,
+                )))
+            }
+            "getPromiseType" => Ok(self.type_ref(checker.get_global_promise_type())),
+            "getUnionType" => {
+                let types = self.handles(request, "types", &self.types)?;
+                let reduction = match number(request, "reduction")? {
+                    0 => UnionReduction::NONE,
+                    1 => UnionReduction::LITERAL,
+                    2 => UnionReduction::SUBTYPE,
+                    _ => return Err("union reduction must be None, Literal or Subtype".into()),
+                };
+                Ok(self.type_ref(checker.get_union_type_ex(&types, reduction, None, TypeId::NIL)))
+            }
+            "isTypeAssignableTo" => {
+                let target = TypeId(Self::handle(request, "target", &self.types)?);
+                Ok(json!(checker.is_type_assignable_to_exported(t, target)))
+            }
+            "getDiagnostics" => Ok(Value::Array(
+                checker
+                    .get_diagnostics(&self.context, location, false)
+                    .iter()
+                    .map(crate::classic_graph::diagnostic)
+                    .collect(),
+            )),
+            "getGlobalDiagnostics" => Ok(Value::Array(
+                checker
+                    .get_global_diagnostics()
+                    .iter()
+                    .map(crate::classic_graph::diagnostic)
+                    .collect(),
+            )),
             _ => self.type_request(&mut checker, method, t, request),
         }
     }
@@ -196,6 +276,8 @@ impl ClassicChecker {
                 let error_node = node(request, "errorNode")?;
                 Ok(self.type_ref(checker.get_promised_type_of_promise_ex(t, error_node, None)))
             }
+            "createPromiseType" => Ok(self.type_ref(checker.create_promise_type(t))),
+            "getIndexType" => Ok(self.type_ref(checker.get_index_type(t))),
             "createArrayType" => Ok(self.type_ref(
                 checker.create_array_type_ex(t, request["readonly"].as_bool().unwrap_or(false)),
             )),
@@ -237,6 +319,95 @@ impl ClassicChecker {
         }
     }
 
+    /// The node builder's synthesized nodes for a classic `typeToTypeNode`, `symbolToNode` and
+    /// the other builder members: each node tree as binary AST data with the symbols the builder
+    /// recorded for its identifiers (classic sets `identifier.symbol`).
+    fn build_node(
+        &self,
+        checker: &mut Checker,
+        enclosing: Node,
+        t: TypeId,
+        symbol: SymbolId,
+        signature: SignatureId,
+        request: &Value,
+    ) -> Result<Value, String> {
+        let flags = NodeBuilderFlags(number(request, "flags")?);
+        let internal = InternalNodeBuilderFlags(
+            i32::try_from(number(request, "internalFlags")?).map_err(|error| error.to_string())?,
+        );
+        let meaning = symbol_flags(request)?;
+        let builder = checker.get_node_builder_ex(None);
+        let nodes = match string(request, "operation")? {
+            "typeToTypeNode" => vec![
+                checker
+                    .node_builder_type_to_type_node(&builder, t, enclosing, flags, internal, None),
+            ],
+            "typeParameterToDeclaration" => {
+                vec![checker.node_builder_type_parameter_to_declaration(
+                    &builder, t, enclosing, flags, internal, None,
+                )]
+            }
+            "symbolToEntityName" => vec![checker.node_builder_symbol_to_entity_name(
+                &builder, symbol, meaning, enclosing, flags, internal, None,
+            )],
+            "symbolToExpression" => vec![checker.node_builder_symbol_to_expression(
+                &builder, symbol, meaning, enclosing, flags, internal, None,
+            )],
+            "symbolToNode" => vec![checker.node_builder_symbol_to_node(
+                &builder, symbol, meaning, enclosing, flags, internal, None,
+            )],
+            "symbolToParameterDeclaration" => {
+                vec![checker.node_builder_symbol_to_parameter_declaration(
+                    &builder, symbol, enclosing, flags, internal, None,
+                )]
+            }
+            "symbolToTypeParameterDeclarations" => checker
+                .node_builder_symbol_to_type_parameter_declarations(
+                    &builder, symbol, enclosing, flags, internal, None,
+                ),
+            "signatureToSignatureDeclaration" => {
+                let kind = u16::try_from(number(request, "kind")?)
+                    .ok()
+                    .and_then(|kind| SyntaxKind::try_from(kind).ok())
+                    .ok_or("signature declaration kind is not a syntax kind")?;
+                vec![checker.node_builder_signature_to_signature_declaration(
+                    &builder, signature, kind, enclosing, flags, internal, None,
+                )]
+            }
+            "indexInfoToIndexSignatureDeclaration" => {
+                let info = IndexInfoId(number(request, "indexInfo")?);
+                vec![
+                    checker.node_builder_index_info_to_index_signature_declaration(
+                        &builder, info, enclosing, flags, internal, None,
+                    ),
+                ]
+            }
+            operation => return Err(format!("unknown node builder operation: {operation}")),
+        };
+        let identifiers = builder.borrow().impl_.borrow().id_to_symbol.clone();
+        let mut results = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            if node.is_nil() {
+                results.push(Value::Null);
+                continue;
+            }
+            let (bytes, table) =
+                encoder::encode_node(node, Node::NIL).map_err(|error| error.to_string())?;
+            let (offset, length) = crate::exports::push_payload(&bytes);
+            let symbols = table
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    let symbol = identifiers.get(node)?;
+                    Some(json!([index, self.symbol_ref(*symbol)]))
+                })
+                .collect::<Vec<_>>();
+            results.push(json!({"$synthetic": {"$payload": [offset, length]}, "symbols": symbols}));
+        }
+        Ok(Value::Array(results))
+    }
+
     /// Classic `IndexInfo`; `id` keeps one object per index info of the checker.
     fn index_info(&self, checker: &Checker, info: IndexInfoId) -> Value {
         if info.is_nil() {
@@ -251,6 +422,31 @@ impl ClassicChecker {
                 Value::Array(data.components.iter().copied().map(node_ref).collect());
         }
         result
+    }
+
+    fn handles(
+        &self,
+        request: &Value,
+        key: &str,
+        issued: &RefCell<HashSet<u32>>,
+    ) -> Result<Vec<TypeId>, String> {
+        let values = request[key]
+            .as_array()
+            .ok_or_else(|| format!("{key} must be an array"))?;
+        values
+            .iter()
+            .map(|value| {
+                let id = value
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .ok_or_else(|| format!("{key} must hold handles"))?;
+                if issued.borrow().contains(&id) {
+                    Ok(TypeId(id))
+                } else {
+                    Err(format!("{key} handle was not issued by this checker"))
+                }
+            })
+            .collect()
     }
 
     fn handle(request: &Value, key: &str, issued: &RefCell<HashSet<u32>>) -> Result<u32, String> {
@@ -452,6 +648,24 @@ fn signature_kind(request: &Value) -> Result<SignatureKind, String> {
         1 => Ok(SignatureKind::CONSTRUCT),
         _ => Err("signature kind must be Call or Construct".into()),
     }
+}
+
+/// Classic `isImplementationOfOverload`: a function-like declaration with a body whose symbol
+/// has another signature.
+fn classic_is_implementation_of_overload(checker: &mut Checker, node: Node) -> bool {
+    if !ts_goport::ast::node_is_present(node.body()) {
+        return false;
+    }
+    if matches!(
+        node.kind(),
+        SyntaxKind::GetAccessor | SyntaxKind::SetAccessor
+    ) {
+        return false;
+    }
+    let symbol = checker.get_symbol_of_declaration(node);
+    let signatures = checker.get_signatures_of_symbol(symbol);
+    signatures.len() > 1
+        || (signatures.len() == 1 && checker.sig(signatures[0]).declaration() != node)
 }
 
 fn classic_type_from_type_node(checker: &mut Checker, node: Node) -> TypeId {

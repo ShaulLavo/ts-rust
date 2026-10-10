@@ -143,6 +143,8 @@ export function createProgramGraph(channel, handle, settings = {}) {
         return result;
     }
 
+    lease.diagnostic = diagnostic;
+
     function diagnostics(method, file) {
         return graph(method, { fileName: typeof file === "string" ? file : file?.fileName }).map(diagnostic);
     }

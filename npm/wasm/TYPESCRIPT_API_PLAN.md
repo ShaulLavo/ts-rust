@@ -149,6 +149,36 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Rust `createProgram` over a classic compiler host (unit 2, first part)
+
+`createProgram(rootNames, options, host, oldProgram)` and its options-object form open a
+documents session whose host callbacks go to the classic `CompilerHost`: `fileExists`,
+`directoryExists`, `getDirectories`, `readDirectory`, `realpath`, `readFile`, and
+`getSourceFileByPath` (or `getSourceFile`) for each non-bundled file, with
+`shouldCreateNewSourceFile` when a source-file-affecting option changed. The returned objects
+become the program's source files, with `fileName`, `path`, `resolvedPath` and
+`originalFileName` set as `findSourceFile` sets them. After the build, `onReleaseOldSourceFile`
+runs for the old program's files under classic's condition.
+
+Options travel as tsconfig `compilerOptions`: `classic-compiler-options.js` names enum values
+(`lib` entries too) from the declarations that `scripts/generate-classic-options.mjs` writes
+from `typescript@6.0.3` into `classic-options.js`, and drops non-option fields
+(`configFilePath`, `pathsBasePath`, `configFile`). Rust converts them with the tsconfig
+converter (`configureProgram`) against the current directory and builds from the roots. 136 of
+the 141 enum values build cleanly; ES3, module `None` and `importsNotUsedAsValues`, which the Go
+pin removed, build with a TS6046 or TS5023 configuration diagnostic.
+
+Checks: `test/classic-create-program.test.mjs` (option names; a compiler host shaped like
+`synchronizeHostDataWorker`'s: registry documents become the program's files, diagnostics carry
+them, an unchanged version keeps its file, an edit updates without release, a removed root
+releases with classic's arguments, an old program's file keeps its text). 45/45 runtime tests,
+controls as in unit 1.
+
+Deviations: classic reports removed options with its own codes (for example TS5108 for ES3).
+Bundled libraries are never offered to `onReleaseOldSourceFile`. `onError` is not passed to
+the host. A missing host (classic's default `createCompilerHost`) is a `TypeError`, since
+standalone `createProgram` is outside this contract.
+
 ## Shared instance and document registry (unit 1, done)
 
 The instance holds any number of sessions. Each session keeps its own current directory, case
@@ -204,6 +234,9 @@ Remaining units, in order. Each ends with its narrow checks and then the injecte
 1. [x] Per-service host state in one instance; registry-backed documents; classic `createDocumentRegistry`
    (public export moves to unit 2 with the factory).
 2. Classic dispatch bundle with guarded compiler entries and the Rust `createProgram` bridge.
+   - [x] `createProgram` over a classic `CompilerHost` (`classic-create-program.js`), below.
+   - [ ] The guarded dispatch bundle, its `createProgram` injection, and public
+     `createLanguageService` and `createDocumentRegistry` exports with the module ready at load.
 3. Classic `Program` members the dispatch reads (`getSourceFileByPath`, `getMissingFilePaths`,
    resolved modules and references, `structureIsReused`, emit).
 4. `TypeChecker` members and symbol/type internals each service family reads, by family.

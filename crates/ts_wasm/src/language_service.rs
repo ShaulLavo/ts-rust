@@ -12,6 +12,12 @@ use ts_goport::core::Diagnostic;
 use ts_goport::execute::tsc::{System, new_os_system};
 use ts_goport::frontend::compiler::{self, ProgramOptions};
 use ts_goport::frontend::json::{MarshalerTo, UnmarshalerFrom, json_marshal, json_unmarshal};
+use ts_goport::frontend::tsoptions::command_line_option::CompilerOptionsValue;
+use ts_goport::frontend::tsoptions::parsed_command_line::new_parsed_command_line;
+use ts_goport::frontend::tsoptions::parsing_helpers::CompilerOptionsParser;
+use ts_goport::frontend::tsoptions::tsconfig_p1::{
+    COMMAND_LINE_COMPILER_OPTIONS_MAP, convert_options_from_json,
+};
 use ts_goport::frontend::tsoptions::{self, ParsedCommandLine};
 use ts_goport::frontend::tspath;
 use ts_goport::frontend::vfs::{Fs, OsOverride, install_os_override};
@@ -20,6 +26,7 @@ use ts_goport::ls::{self, lsconv, lsutil};
 use ts_goport::lsp::lsproto;
 use ts_goport::options::Tristate;
 use ts_goport::program::ls_program;
+use ts_goport::scanner_util::go_string_from_utf8;
 use ts_goport::sourcemap;
 
 use crate::host;
@@ -137,9 +144,17 @@ pub fn ensure_runtime() {
     ts_goport::ast::set_editor_process();
 }
 
+/// The roots and options of a classic `createProgram` call, in place of tsc arguments.
+#[derive(Clone)]
+struct ProgramConfig {
+    root_names: Vec<String>,
+    options: Value,
+}
+
 pub struct Service {
     cwd: String,
     args: Vec<String>,
+    program_config: Option<ProgramConfig>,
     context: Context,
     case_sensitive: bool,
     /// Whether builds take source files from the host's documents.
@@ -174,6 +189,7 @@ impl Service {
         Ok(Self {
             cwd: cwd.into(),
             args,
+            program_config: None,
             context,
             case_sensitive,
             documents: request["documents"].as_bool().unwrap_or(false),
@@ -203,7 +219,13 @@ impl Service {
             return Err("language service is disposed".into());
         }
         if self.language.is_none() {
-            let (language, metadata) = build_language(&self.cwd, &self.args, self.documents)?;
+            let (language, metadata) = build_language(
+                &self.cwd,
+                &self.args,
+                self.program_config.as_ref(),
+                self.case_sensitive,
+                self.documents,
+            )?;
             self.program_owner = Some(Rc::new(crate::classic_graph::ProgramOwner {
                 program: language.program.clone(),
                 checker: std::cell::OnceCell::new(),
@@ -347,11 +369,25 @@ fn command(service: &mut Service, request: &Value) -> Result<String, ServiceErro
             service.invalidate();
             Ok("null".into())
         }
+        Some("configureProgram") => {
+            let root_names: Vec<String> = serde_json::from_value(request["rootNames"].clone())
+                .map_err(|error| error.to_string())?;
+            if !request["options"].is_object() {
+                return Err("program options must be an object".into());
+            }
+            service.invalidate();
+            service.program_config = Some(ProgramConfig {
+                root_names: root_names.into_iter().map(go_string_from_utf8).collect(),
+                options: request["options"].clone(),
+            });
+            Ok("null".into())
+        }
         Some("configure") => {
             let args: Vec<String> = serde_json::from_value(request["args"].clone())
                 .map_err(|error| error.to_string())?;
             service.invalidate();
             service.args = args;
+            service.program_config = None;
             Ok("null".into())
         }
         Some("request") => {
@@ -402,6 +438,8 @@ fn graph_command(
 fn build_language(
     cwd: &str,
     args: &[String],
+    program_config: Option<&ProgramConfig>,
+    case_sensitive: bool,
     documents: bool,
 ) -> Result<
     (
@@ -414,7 +452,10 @@ fn build_language(
     let sys = new_os_system().map_err(|status| {
         ServiceError::Internal(format!("cannot initialize host: {}", status.code()))
     })?;
-    let config = read_config(args, &SessionConfigHost { fs: sys.fs(), cwd })?;
+    let config = match program_config {
+        Some(config) => program_command_line(cwd, case_sensitive, config)?,
+        None => read_config(args, &SessionConfigHost { fs: sys.fs(), cwd })?,
+    };
     let host =
         compiler::new_compiler_host(cwd, sys.fs(), &sys.default_library_path(), None, None, None);
     let host = Rc::new(crate::editor_host::EditorHost::new(
@@ -469,6 +510,57 @@ fn build_language(
         ls::new_language_service(ls::autoimport::ProjectID(cwd.into()), program, host, ""),
         metadata,
     ))
+}
+
+/// A tsconfig-form JSON value as the option converter reads it.
+fn options_value(value: &Value) -> CompilerOptionsValue {
+    match value {
+        Value::Null => CompilerOptionsValue::Nil,
+        Value::Bool(value) => CompilerOptionsValue::Bool(*value),
+        Value::Number(value) => CompilerOptionsValue::Number(value.as_f64().unwrap_or_default()),
+        Value::String(value) => CompilerOptionsValue::String(go_string_from_utf8(value.clone())),
+        Value::Array(values) => {
+            CompilerOptionsValue::List(values.iter().map(options_value).collect())
+        }
+        Value::Object(values) => CompilerOptionsValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), options_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+/// The command line of a classic program: its roots, and its options as tsconfig
+/// `compilerOptions` resolved against the current directory.
+#[allow(clippy::unnecessary_wraps)]
+fn program_command_line(
+    cwd: &str,
+    case_sensitive: bool,
+    config: &ProgramConfig,
+) -> Result<ParsedCommandLine, ServiceError> {
+    let mut options = ts_goport::options::CompilerOptions::default();
+    let (_, errors) = convert_options_from_json(
+        &COMMAND_LINE_COMPILER_OPTIONS_MAP,
+        &options_value(&config.options),
+        cwd,
+        CompilerOptionsParser {
+            compiler_options: &mut options,
+        },
+    );
+    // An option this compiler does not know is a configuration diagnostic of the program,
+    // as classic programs report removed options, so the program still builds.
+    let mut command_line = new_parsed_command_line(
+        Rc::new(options),
+        config.root_names.clone(),
+        None,
+        tspath::ComparePathsOptions {
+            use_case_sensitive_file_names: case_sensitive,
+            current_directory: cwd.into(),
+        },
+    );
+    command_line.errors = errors;
+    Ok(command_line)
 }
 
 /// The configuration host of a session: the instance's file system with the

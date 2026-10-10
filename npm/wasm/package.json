@@ -44,6 +44,9 @@
         "native-ast.js",
         "classic-program.js",
         "classic-checker.js",
+        "classic-options.js",
+        "classic-compiler-options.js",
+        "classic-create-program.js",
         "classic-enums.js",
         "classic-utilities.js",
         "file-map.js",
@@ -54,6 +57,7 @@
         "node-language-service.js",
         "language-service-worker.js",
         "scripts/check-typescript-api.mjs",
+        "scripts/generate-classic-options.mjs",
         "TYPESCRIPT_API_PLAN.md",
         "ts_rust.wasm"
     ],

@@ -145,6 +145,22 @@ mod exports {
     thread_local! {
         static INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        /// The binary payloads of the running `ts_service` calls, innermost last.
+        static PAYLOADS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Adds `bytes` to the reply of the running `ts_service` call and returns their
+    /// offset and length in its payload, which follows the JSON reply and a NUL.
+    pub(crate) fn push_payload(bytes: &[u8]) -> (usize, usize) {
+        PAYLOADS.with(|payloads| {
+            let mut payloads = payloads.borrow_mut();
+            let Some(payload) = payloads.last_mut() else {
+                return (0, 0);
+            };
+            let offset = payload.len();
+            payload.extend_from_slice(bytes);
+            (offset, bytes.len())
+        })
     }
 
     /// Makes the input buffer `len` bytes long and returns its address. The
@@ -179,8 +195,15 @@ mod exports {
     pub extern "C" fn ts_service() {
         install_panic_hook();
         let request = INPUT.with(|input| std::mem::take(&mut *input.borrow_mut()));
+        PAYLOADS.with(|payloads| payloads.borrow_mut().push(Vec::new()));
         let reply = super::language_service::receive(&request);
-        OUTPUT.with(|output| *output.borrow_mut() = reply.into_bytes());
+        let payload = PAYLOADS.with(|payloads| payloads.borrow_mut().pop().unwrap_or_default());
+        let mut reply = reply.into_bytes();
+        if !payload.is_empty() {
+            reply.push(0);
+            reply.extend_from_slice(&payload);
+        }
+        OUTPUT.with(|output| *output.borrow_mut() = reply);
     }
 
     /// The address of the reply of the last `ts_run`.

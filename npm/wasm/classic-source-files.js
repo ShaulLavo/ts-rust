@@ -31,9 +31,18 @@ export function materializeSourceFile(instance, response) {
     let file = lease.file?.deref();
     if (!file) {
         file = decodeSourceFile(response.data, { languageVersion: target, version: response.version }, lease);
+        file.parseDiagnostics = (response.parseDiagnostics ?? []).map(diagnostic => withFile(diagnostic, file));
         lease.file = new WeakRef(file);
     }
     return file;
+}
+
+/** A classic `DiagnosticWithLocation` of `file`. */
+function withFile(response, file) {
+    const result = { file, ...response };
+    delete result.fileName;
+    if (response.relatedInformation) result.relatedInformation = response.relatedInformation.map(related => withFile(related, file));
+    return result;
 }
 
 export function resolveSourceNode(instance, handle) {

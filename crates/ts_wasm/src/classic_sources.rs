@@ -146,9 +146,21 @@ impl Sources {
         let file = &source.file;
         let (bytes, _) =
             encoder::encode_parsed_source_file(file).map_err(|error| error.to_string())?;
-        Ok(
-            json!({"source": id, "fileId": file.root.file_index(), "languageVersion": source.language_version, "version": {"$string": source.version}, "fileName": file.file_name(), "data": bytes}),
-        )
+        let (offset, length) = crate::exports::push_payload(&bytes);
+        let diagnostics: Vec<Value> = file
+            .diagnostics
+            .iter()
+            .map(crate::classic_graph::diagnostic)
+            .collect();
+        Ok(json!({
+            "source": id,
+            "fileId": file.root.file_index(),
+            "languageVersion": source.language_version,
+            "version": {"$string": source.version},
+            "fileName": file.file_name(),
+            "data": {"$payload": [offset, length]},
+            "parseDiagnostics": diagnostics,
+        }))
     }
 
     pub fn resolve(&self, location: &Value) -> Result<Node, String> {

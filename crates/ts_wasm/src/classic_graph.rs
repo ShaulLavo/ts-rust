@@ -253,7 +253,7 @@ fn diagnostics(
     Ok(Value::Array(diagnostics.iter().map(diagnostic).collect()))
 }
 
-fn diagnostic(value: &Diagnostic) -> Value {
+pub(crate) fn diagnostic(value: &Diagnostic) -> Value {
     diagnostic_response(&new_diagnostic_response(value))
 }
 

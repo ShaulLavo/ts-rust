@@ -65,9 +65,7 @@ function createInstance(module) {
             const ptr = exports.ts_input(input.length) >>> 0;
             new Uint8Array(exports.memory.buffer).set(input, ptr);
             exports.ts_service();
-            response = JSON.parse(decoder.decode(new Uint8Array(
-                exports.memory.buffer, exports.ts_output() >>> 0, exports.ts_output_len() >>> 0,
-            )), (_, value) => decodeProtocolString(value));
+            response = decodeResponse(new Uint8Array(exports.memory.buffer, exports.ts_output() >>> 0, exports.ts_output_len() >>> 0));
         } catch (error) {
             failure = Object.assign(error, { stderr: run.stderrText() });
             exports = undefined;
@@ -100,6 +98,16 @@ function createInstance(module) {
         },
         parseDocument: (request, text) => call(Object.assign({ action: "parseDocument" }, request), undefined, text),
     };
+}
+
+/** A reply: JSON, then optionally NUL and the binary payload its `$payload` ranges point into. */
+function decodeResponse(output) {
+    const end = output.indexOf(0);
+    const payload = end < 0 ? undefined : output.slice(end + 1);
+    return JSON.parse(decoder.decode(end < 0 ? output : output.subarray(0, end)), (_, value) => {
+        if (payload && Array.isArray(value?.$payload)) return payload.slice(value.$payload[0], value.$payload[0] + value.$payload[1]);
+        return decodeProtocolString(value);
+    });
 }
 
 /** The result of a response, or its compiler error. */

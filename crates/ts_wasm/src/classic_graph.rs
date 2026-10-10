@@ -30,7 +30,6 @@ pub struct Graphs {
     next_id: u32,
     programs: HashMap<u32, Rc<ProgramOwner>>,
     identities: HashMap<usize, (Weak<ProgramOwner>, u32)>,
-    pub sources: crate::classic_sources::Sources,
 }
 
 impl Graphs {
@@ -91,7 +90,7 @@ impl Graphs {
                     .collect::<Vec<_>>()
             )),
             "getCurrentDirectory" => Ok(json!(program.get_current_directory())),
-            "getSourceFile" => self.source_file(&owner, &request["fileName"]),
+            "getSourceFile" => Self::source_file(&owner, &request["fileName"]),
             "getSyntacticDiagnostics"
             | "getSemanticDiagnostics"
             | "getSuggestionDiagnostics"
@@ -102,7 +101,9 @@ impl Graphs {
                 diagnostics(program, context, method, &request["fileName"])
             }
             _ => {
-                let location = self.sources.resolve(&request["location"])?;
+                let location = crate::classic_sources::with_sources(|sources| {
+                    sources.resolve(&request["location"])
+                })?;
                 let checker = owner
                     .checker
                     .get_or_init(|| crate::classic_checker::ClassicChecker::new(program, context));
@@ -114,14 +115,17 @@ impl Graphs {
                     .map(u32::try_from)
                     .transpose()
                     .map_err(|error| error.to_string())?;
-                self.attach_node_provenance(&mut result, origin)?;
+                crate::classic_sources::with_sources(|sources| {
+                    self.attach_node_provenance(sources, &mut result, origin)
+                })?;
                 Ok(result)
             }
         }
     }
 
     fn attach_node_provenance(
-        &mut self,
+        &self,
+        sources: &mut crate::classic_sources::Sources,
         value: &mut Value,
         origin: Option<u32>,
     ) -> Result<(), String> {
@@ -139,13 +143,12 @@ impl Graphs {
                 .as_u64()
                 .ok_or("node file identity is missing")?;
             let same_origin = origin.filter(|&id| {
-                self.sources
+                sources
                     .origin(id)
                     .is_some_and(|(file, _)| file as u64 == file_id)
             });
-            let retained = self
-                .sources
-                .find(usize::try_from(file_id).map_err(|error| error.to_string())?);
+            let retained =
+                sources.find(usize::try_from(file_id).map_err(|error| error.to_string())?);
             let id = if let Some(id) = same_origin.or(retained) {
                 id
             } else {
@@ -167,7 +170,7 @@ impl Graphs {
                         Some((file, owner.parse_target.get().unwrap_or(1), version))
                     })
                     .ok_or("node source file has been released")?;
-                self.sources.retain(&file, target, &version)
+                sources.retain(&file, target, &version)
             };
             node["source"] = json!(id);
             return Ok(());
@@ -175,12 +178,12 @@ impl Graphs {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    self.attach_node_provenance(value, origin)?;
+                    self.attach_node_provenance(sources, value, origin)?;
                 }
             }
             Value::Object(values) => {
                 for value in values.values_mut() {
-                    self.attach_node_provenance(value, origin)?;
+                    self.attach_node_provenance(sources, value, origin)?;
                 }
             }
             _ => {}
@@ -188,7 +191,7 @@ impl Graphs {
         Ok(())
     }
 
-    fn source_file(&mut self, owner: &ProgramOwner, name: &Value) -> Result<Value, String> {
+    fn source_file(owner: &ProgramOwner, name: &Value) -> Result<Value, String> {
         let program = &owner.program;
         let name = name.as_str().ok_or("fileName must be a string")?;
         let Some(file) = program.get_source_file(name) else {
@@ -198,10 +201,10 @@ impl Graphs {
             .metadata
             .get(name)
             .map_or(&[][..], |metadata| metadata.version.as_slice());
-        let id = self
-            .sources
-            .retain(&file, owner.parse_target.get().unwrap_or(1), version);
-        let mut result = self.sources.response(id)?;
+        let mut result = crate::classic_sources::with_sources(|sources| {
+            let id = sources.retain(&file, owner.parse_target.get().unwrap_or(1), version);
+            sources.response(id)
+        })?;
         result["defaultLibrary"] = json!(program.is_source_file_default_library(file.path()));
         result["externalLibrary"] = json!(program.is_source_file_from_external_library(&file));
         Ok(result)

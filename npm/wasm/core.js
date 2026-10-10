@@ -68,10 +68,11 @@ export async function createLanguageService(module, options = {}) {
     let queue = Promise.resolve();
     let disposal;
     let failure;
+    let session;
 
     async function call(request) {
         if (failure) throw failure;
-        const input = encoder.encode(JSON.stringify(request));
+        const input = encoder.encode(JSON.stringify(session === undefined ? request : { ...request, session }));
         let result;
         try {
             const ptr = exports.ts_input(input.length) >>> 0;
@@ -95,7 +96,7 @@ export async function createLanguageService(module, options = {}) {
         return result;
     }
 
-    await call({ action: "initialize", cwd: options.cwd ?? "/", args: options.args ?? [], caseInsensitive: options.caseInsensitive ?? false, capabilities: options.capabilities ?? {} });
+    session = await call({ action: "open", cwd: options.cwd ?? "/", args: options.args ?? [], caseInsensitive: options.caseInsensitive ?? false, capabilities: options.capabilities ?? {} });
     return {
         request(method, params = {}) {
             return enqueue(() => call({ action: "request", method, params }));
@@ -121,7 +122,7 @@ export async function createLanguageService(module, options = {}) {
         dispose() {
             disposal ??= queue.then(async () => {
                 try {
-                    if (!failure) await call({ action: "dispose" });
+                    if (!failure) await call({ action: "close" });
                 } finally {
                     exports = undefined;
                     invoke = undefined;

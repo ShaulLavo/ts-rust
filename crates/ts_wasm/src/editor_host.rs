@@ -10,31 +10,35 @@ use ts_goport::frontend::tsoptions::ParsedCommandLine;
 use ts_goport::frontend::tspath::Path;
 use ts_goport::frontend::vfs::Fs;
 use ts_goport::gostd::GoError;
-use ts_goport::project::{self, HashedSourceFile, ParseCache, ParseCacheKey};
+use ts_goport::project::{self, ParseCache, ParseCacheKey};
+use ts_goport::scanner_util::go_string_bytes;
 
-use crate::classic_metadata::{ParsePools, SourceMetadata};
+use crate::classic_metadata::SourceMetadata;
+use crate::host::{self, Op};
 
 struct ParsedLease {
     cache: Rc<ParseCache>,
-    parsed: HashedSourceFile,
+    key: ParseCacheKey,
 }
 
-/// Parse-cache leases assign file versions before the program publishes its AST.
+/// Program builds load bundled libraries from the instance's parse pools. A
+/// session with documents loads every other file from its compiler host's
+/// documents (`createLanguageServiceSourceFile`); one without reads files.
 pub struct EditorHost {
     inner: Rc<dyn CompilerHost>,
-    pools: Rc<RefCell<ParsePools>>,
     target: i32,
-    acquired: RefCell<HashMap<ParseCacheKey, ParsedLease>>,
+    documents: bool,
+    acquired: RefCell<HashMap<String, ParsedLease>>,
     metadata: RefCell<HashMap<String, SourceMetadata>>,
     metadata_error: RefCell<Option<String>>,
 }
 
 impl EditorHost {
-    pub fn new(inner: Rc<dyn CompilerHost>, pools: Rc<RefCell<ParsePools>>, target: i32) -> Self {
+    pub fn new(inner: Rc<dyn CompilerHost>, target: i32, documents: bool) -> Self {
         Self {
             inner,
-            pools,
             target,
+            documents,
             acquired: RefCell::new(HashMap::new()),
             metadata: RefCell::new(HashMap::new()),
             metadata_error: RefCell::new(None),
@@ -49,13 +53,74 @@ impl EditorHost {
         self.metadata_error.borrow_mut().take()
     }
 
-    fn read_metadata(&self, path: &str) -> Option<SourceMetadata> {
-        match SourceMetadata::read(path) {
-            Ok(metadata) => Some(metadata),
-            Err(error) => {
-                self.metadata_error.replace(Some(error));
-                None
-            }
+    fn pooled(&self, options: &SourceFileParseOptions, text: &str) -> Rc<ParsedSourceFile> {
+        let file = project::new_cached_file_handle(&options.file_name, text.to_owned());
+        let key = project::new_parse_cache_key(
+            options,
+            file.hash(),
+            ts_goport::flags::ScriptKind::UNKNOWN,
+        );
+        let cache = crate::classic_metadata::with_pools(|pools| pools.get(self.target, 0));
+        let source = cache.acquire(key.clone(), file).file;
+        self.metadata
+            .borrow_mut()
+            .insert(options.file_name.clone(), SourceMetadata::default());
+        self.remember(&options.file_name, ParsedLease { cache, key });
+        source
+    }
+
+    /// Asks the host's compiler host for the file. The host acquires it from
+    /// its document registry, which parses it in this instance, and answers
+    /// with the document's lease.
+    fn document(&self, options: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
+        let request = serde_json::json!({
+            "fileName": options.file_name,
+            "path": options.path.0,
+            "jsx": options.external_module_indicator_options.jsx,
+            "force": options.external_module_indicator_options.force,
+        });
+        let reply = host::call(Op::GetSourceFile, &go_string_bytes(&request.to_string())).ok()?;
+        let id = std::str::from_utf8(&reply).ok()?.parse::<u32>();
+        let Ok(id) = id else {
+            self.metadata_error.replace(Some(
+                "compiler host returned a source file this compiler does not own".into(),
+            ));
+            return None;
+        };
+        let Some(lease) = crate::classic_sources::with_sources(|sources| sources.document(id))
+        else {
+            self.metadata_error
+                .replace(Some("compiler host returned a released source file".into()));
+            return None;
+        };
+        let document = lease.document;
+        let source = document
+            .cache
+            .acquire(document.key.clone(), document.handle.clone())
+            .file;
+        self.metadata.borrow_mut().insert(
+            options.file_name.clone(),
+            SourceMetadata {
+                version: lease.version,
+            },
+        );
+        self.remember(
+            &options.file_name,
+            ParsedLease {
+                cache: document.cache,
+                key: document.key,
+            },
+        );
+        Some(source)
+    }
+
+    fn remember(&self, file_name: &str, lease: ParsedLease) {
+        if let Some(previous) = self
+            .acquired
+            .borrow_mut()
+            .insert(file_name.to_owned(), lease)
+        {
+            previous.cache.deref(&previous.key);
         }
     }
 }
@@ -78,23 +143,14 @@ impl CompilerHost for EditorHost {
     }
 
     fn get_source_file(&self, options: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
-        let text = crate::host::read_source_snapshot(&options.file_name)?;
-        let metadata = self.read_metadata(&options.file_name)?;
-        let file = project::new_cached_file_handle(&options.file_name, text);
-        let key = project::new_parse_cache_key(options, file.hash(), metadata.script_kind.native());
-        if let Some(parsed) = self.acquired.borrow().get(&key) {
-            return Some(parsed.parsed.file.clone());
+        if let Some(text) = ts_goport::frontend::bundled::bundled_text(&options.file_name) {
+            return Some(self.pooled(options, text));
         }
-        let cache = self.pools.borrow_mut().get(self.target, metadata.snapshot);
-        let parsed = cache.acquire(key.clone(), file);
-        let source = parsed.file.clone();
-        self.metadata
-            .borrow_mut()
-            .insert(options.file_name.clone(), metadata);
-        self.acquired
-            .borrow_mut()
-            .insert(key, ParsedLease { cache, parsed });
-        Some(source)
+        if self.documents {
+            return self.document(options);
+        }
+        let text = host::read_source_snapshot(&options.file_name)?;
+        Some(self.pooled(options, &text))
     }
 
     fn get_content_mapped_source_files(
@@ -126,8 +182,8 @@ impl CompilerHost for EditorHost {
     }
 
     fn release(&self) {
-        for (key, lease) in self.acquired.borrow_mut().drain() {
-            lease.cache.deref(&key);
+        for (_, lease) in self.acquired.borrow_mut().drain() {
+            lease.cache.deref(&lease.key);
         }
         self.inner.release();
     }

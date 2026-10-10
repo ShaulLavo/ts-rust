@@ -1,32 +1,32 @@
-import { decodeSourceFile, resolveNodeHandle } from "./classic-ast.js";
+import { decodeSourceFile, nodeLease, resolveNodeHandle } from "./classic-ast.js";
 
 const sources = new WeakMap();
-const release = new FinalizationRegistry(({ channel, source, token }) => {
-    const cache = sources.get(channel);
+const release = new FinalizationRegistry(({ instance, source, token }) => {
+    const cache = sources.get(instance);
     if (cache?.get(source)?.token !== token) return;
     cache.delete(source);
-    channel.releaseSource(source);
+    instance.releaseSource(source);
 });
 
-function sourceLease(channel, source) {
-    let cache = sources.get(channel);
+function sourceLease(instance, source) {
+    let cache = sources.get(instance);
     if (!cache) {
         cache = new Map();
-        sources.set(channel, cache);
+        sources.set(instance, cache);
     }
     let lease = cache.get(source)?.reference.deref();
     if (!lease) {
-        lease = { channel, source };
+        lease = { instance, source };
         const token = {};
         cache.set(source, { reference: new WeakRef(lease), token });
-        release.register(lease, { channel, source, token });
+        release.register(lease, { instance, source, token });
     }
     return lease;
 }
 
-/** One source object per Rust file version and classic parse target. */
-export function materializeSourceFile(channel, response) {
-    const lease = sourceLease(channel, response.source);
+/** One source object per Rust file version and classic parse target, shared by every user of the instance. */
+export function materializeSourceFile(instance, response) {
+    const lease = sourceLease(instance, response.source);
     const target = response.languageVersion;
     let file = lease.file?.deref();
     if (!file) {
@@ -36,11 +36,17 @@ export function materializeSourceFile(channel, response) {
     return file;
 }
 
-export function resolveSourceNode(channel, handle) {
-    const lease = sourceLease(channel, handle.source);
+export function resolveSourceNode(instance, handle) {
+    const lease = sourceLease(instance, handle.source);
     const retained = lease.file?.deref();
     if (retained) return resolveNodeHandle(retained, handle);
-    const response = channel.source(handle.source);
-    const file = materializeSourceFile(channel, response);
+    const response = instance.source(handle.source);
+    const file = materializeSourceFile(instance, response);
     return resolveNodeHandle(file, handle);
+}
+
+/** The lease of a source file this compiler decoded, when `instance` owns it. */
+export function sourceFileLease(file, instance) {
+    const lease = file && nodeLease(file);
+    return lease?.instance === instance ? lease.source : undefined;
 }

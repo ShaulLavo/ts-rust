@@ -9,7 +9,7 @@ use serde_json::Value;
 use ts_goport::api::proto::new_diagnostic_responses;
 use ts_goport::ast::FileText;
 use ts_goport::core::Diagnostic;
-use ts_goport::execute::tsc::{System, SystemParseConfigHost, new_os_system};
+use ts_goport::execute::tsc::{System, new_os_system};
 use ts_goport::frontend::compiler::{self, ProgramOptions};
 use ts_goport::frontend::json::{MarshalerTo, UnmarshalerFrom, json_marshal, json_unmarshal};
 use ts_goport::frontend::tsoptions::{self, ParsedCommandLine};
@@ -125,12 +125,26 @@ enum Method {
     SemanticTokensRange,
 }
 
+/// Installs the host file system once per instance. Sessions pass their
+/// current directory and case sensitivity with each request instead.
+pub fn ensure_runtime() {
+    if !ts_goport::frontend::vfs::os_override_installed() {
+        install_os_override(OsOverride {
+            fs: Arc::new(|| Rc::new(host::HostFs::new()) as Rc<dyn Fs>),
+            current_directory: "/".into(),
+        });
+    }
+    ts_goport::ast::set_editor_process();
+}
+
 pub struct Service {
     cwd: String,
     args: Vec<String>,
     context: Context,
+    case_sensitive: bool,
+    /// Whether builds take source files from the host's documents.
+    documents: bool,
     language: Option<ls::LanguageService>,
-    parse_pools: Rc<RefCell<crate::classic_metadata::ParsePools>>,
     program_owner: Option<Rc<crate::classic_graph::ProgramOwner>>,
     /// Kept until the next build acquires its parses, so unchanged files reuse them.
     previous_owner: Option<Rc<crate::classic_graph::ProgramOwner>>,
@@ -155,22 +169,15 @@ impl Service {
             &context::background(),
             Arc::new(lsproto::ClientCapabilities::resolve(Some(&capabilities))),
         );
-        if ts_goport::frontend::vfs::os_override_installed() {
-            return Err("each WASM instance owns one language service".into());
-        }
         let case_sensitive = !request["caseInsensitive"].as_bool().unwrap_or(false);
-        let _ = host::CASE_SENSITIVE.set(case_sensitive);
-        install_os_override(OsOverride {
-            fs: Arc::new(|| Rc::new(host::HostFs::new()) as Rc<dyn Fs>),
-            current_directory: cwd.into(),
-        });
-        ts_goport::ast::set_editor_process();
+        ensure_runtime();
         Ok(Self {
             cwd: cwd.into(),
             args,
             context,
+            case_sensitive,
+            documents: request["documents"].as_bool().unwrap_or(false),
             language: None,
-            parse_pools: Rc::new(RefCell::default()),
             program_owner: None,
             previous_owner: None,
             graphs: crate::classic_graph::Graphs::default(),
@@ -188,7 +195,7 @@ impl Service {
 
     fn release_unused(&mut self) {
         self.previous_owner.take();
-        self.parse_pools.borrow_mut().prune();
+        crate::classic_metadata::with_pools(crate::classic_metadata::ParsePools::prune);
     }
 
     fn language(&mut self) -> Result<&ls::LanguageService, ServiceError> {
@@ -196,7 +203,7 @@ impl Service {
             return Err("language service is disposed".into());
         }
         if self.language.is_none() {
-            let (language, metadata) = build_language(&self.cwd, &self.args, &self.parse_pools)?;
+            let (language, metadata) = build_language(&self.cwd, &self.args, self.documents)?;
             self.program_owner = Some(Rc::new(crate::classic_graph::ProgramOwner {
                 program: language.program.clone(),
                 checker: std::cell::OnceCell::new(),
@@ -245,47 +252,104 @@ impl Drop for Service {
     }
 }
 
-pub fn receive(service: &mut Option<Service>, input: &[u8]) -> String {
-    let result = serde_json::from_slice::<Value>(input)
+/// The language-service sessions of one instance.
+#[derive(Default)]
+struct Sessions {
+    next_id: u32,
+    services: HashMap<u32, Service>,
+}
+
+thread_local! {
+    static SESSIONS: RefCell<Sessions> = RefCell::default();
+}
+
+/// Handles one request: JSON, optionally followed by NUL and a WTF-8 payload.
+///
+/// Source and document actions belong to the instance and never borrow the
+/// sessions, so a document registry can parse while a session's build is
+/// waiting on its compiler host.
+pub fn receive(input: &[u8]) -> String {
+    let (json, payload) = match input.iter().position(|&byte| byte == 0) {
+        Some(at) => (&input[..at], &input[at + 1..]),
+        None => (input, &[][..]),
+    };
+    let result = serde_json::from_slice::<Value>(json)
         .map_err(|error| ServiceError::Parse(error.to_string()))
-        .and_then(|request| command(service, &request));
+        .and_then(|request| instance_command(&request, payload));
     match result {
         Ok(result) => format!("{{\"result\":{result}}}"),
         Err(error) => error.response(),
     }
 }
 
-fn command(service: &mut Option<Service>, request: &Value) -> Result<String, ServiceError> {
+fn lease_id(request: &Value, field: &str, message: &'static str) -> Result<u32, ServiceError> {
+    let id = request[field].as_u64().ok_or(message)?;
+    u32::try_from(id).map_err(|error| error.to_string().into())
+}
+
+fn instance_command(request: &Value, payload: &[u8]) -> Result<String, ServiceError> {
     match request["action"].as_str() {
-        Some("initialize") => {
-            if service.is_some() {
-                return Err("language service is already initialized".into());
-            }
-            *service = Some(Service::new(request)?);
+        Some("parseDocument") => crate::classic_sources::parse_document(request, payload)
+            .map(|value| value.to_string())
+            .map_err(ServiceError::InvalidParams),
+        Some("source") => {
+            let id = lease_id(request, "source", "source file lease is required")?;
+            crate::classic_sources::with_sources(|sources| sources.response(id))
+                .map(|value| value.to_string())
+                .map_err(ServiceError::InvalidParams)
+        }
+        Some("releaseSource") => {
+            let id = lease_id(request, "source", "source file lease is required")?;
+            crate::classic_sources::with_sources(|sources| sources.release(id));
+            crate::classic_metadata::with_pools(crate::classic_metadata::ParsePools::prune);
             Ok("null".into())
         }
-        Some("dispose") => {
-            *service = None;
-            Ok("null".into())
+        Some("open") => SESSIONS.with(|sessions| {
+            let service = Service::new(request)?;
+            let mut sessions = sessions.borrow_mut();
+            sessions.next_id = sessions
+                .next_id
+                .checked_add(1)
+                .ok_or("language service sessions exhausted")?;
+            let id = sessions.next_id;
+            sessions.services.insert(id, service);
+            Ok(id.to_string())
+        }),
+        Some(_) => {
+            let id = lease_id(request, "session", "language service session is required")?;
+            SESSIONS.with(|sessions| {
+                let mut sessions = sessions.borrow_mut();
+                if request["action"] == "close" {
+                    sessions.services.remove(&id);
+                    return Ok("null".into());
+                }
+                let service = sessions
+                    .services
+                    .get_mut(&id)
+                    .ok_or("language service is disposed")?;
+                host::set_case_sensitive(service.case_sensitive);
+                command(service, request)
+            })
         }
+        None => Err("unknown language service action".into()),
+    }
+}
+
+fn command(service: &mut Service, request: &Value) -> Result<String, ServiceError> {
+    match request["action"].as_str() {
         Some("retire") => {
-            let service = service.as_mut().ok_or("language service is disposed")?;
             service.invalidate();
             service.retired = true;
             service.release_unused();
             Ok("null".into())
         }
         Some("invalidate") => {
-            service
-                .as_mut()
-                .ok_or("language service is disposed")?
-                .invalidate();
+            service.invalidate();
             Ok("null".into())
         }
         Some("configure") => {
             let args: Vec<String> = serde_json::from_value(request["args"].clone())
                 .map_err(|error| error.to_string())?;
-            let service = service.as_mut().ok_or("language service is disposed")?;
             service.invalidate();
             service.args = args;
             Ok("null".into())
@@ -294,15 +358,9 @@ fn command(service: &mut Option<Service>, request: &Value) -> Result<String, Ser
             let method = request["method"]
                 .as_str()
                 .ok_or("method must be a string")?;
-            service
-                .as_mut()
-                .ok_or("language service is disposed")?
-                .request(method, &request["params"])
+            service.request(method, &request["params"])
         }
-        Some("missingFiles") => service
-            .as_ref()
-            .ok_or("language service is disposed")?
-            .missing_files(&request["paths"]),
+        Some("missingFiles") => service.missing_files(&request["paths"]),
         Some(action) => graph_command(service, action, request),
         None => Err("unknown language service action".into()),
     }
@@ -310,13 +368,12 @@ fn command(service: &mut Option<Service>, request: &Value) -> Result<String, Ser
 
 /// Actions on retained programs and source files exported to the classic facade.
 fn graph_command(
-    service: &mut Option<Service>,
+    service: &mut Service,
     action: &str,
     request: &Value,
 ) -> Result<String, ServiceError> {
     match Some(action) {
         Some("getProgram") => {
-            let service = service.as_mut().ok_or("language service is disposed")?;
             service.language()?;
             let owner = service
                 .program_owner
@@ -327,46 +384,15 @@ fn graph_command(
             });
             Ok(service.graphs.retain(owner).to_string())
         }
-        Some("graph") => {
-            let service = service.as_mut().ok_or("language service is disposed")?;
-            service
-                .graphs
-                .request(&service.context, request)
-                .map(|value| value.to_string())
-                .map_err(ServiceError::InvalidParams)
-        }
-        Some("source") => {
-            let id = request["source"]
-                .as_u64()
-                .ok_or("source file lease is required")?;
-            let id = u32::try_from(id).map_err(|error| error.to_string())?;
-            service
-                .as_ref()
-                .ok_or("language service is disposed")?
-                .graphs
-                .sources
-                .response(id)
-                .map(|value| value.to_string())
-                .map_err(ServiceError::InvalidParams)
-        }
-        Some("releaseSource") => {
-            let id = request["source"]
-                .as_u64()
-                .ok_or("source file lease is required")?;
-            let id = u32::try_from(id).map_err(|error| error.to_string())?;
-            let service = service.as_mut().ok_or("language service is disposed")?;
-            service.graphs.sources.release(id);
-            service.parse_pools.borrow_mut().prune();
-            Ok("null".into())
-        }
+        Some("graph") => service
+            .graphs
+            .request(&service.context, request)
+            .map(|value| value.to_string())
+            .map_err(ServiceError::InvalidParams),
         Some("releaseProgram") => {
-            let id = request["program"]
-                .as_u64()
-                .ok_or("program handle is required")?;
-            let id = u32::try_from(id).map_err(|error| error.to_string())?;
-            let service = service.as_mut().ok_or("language service is disposed")?;
+            let id = lease_id(request, "program", "program handle is required")?;
             service.graphs.release(id);
-            service.parse_pools.borrow_mut().prune();
+            crate::classic_metadata::with_pools(crate::classic_metadata::ParsePools::prune);
             Ok("null".into())
         }
         _ => Err("unknown language service action".into()),
@@ -376,7 +402,7 @@ fn graph_command(
 fn build_language(
     cwd: &str,
     args: &[String],
-    parse_pools: &Rc<RefCell<crate::classic_metadata::ParsePools>>,
+    documents: bool,
 ) -> Result<
     (
         ls::LanguageService,
@@ -388,13 +414,13 @@ fn build_language(
     let sys = new_os_system().map_err(|status| {
         ServiceError::Internal(format!("cannot initialize host: {}", status.code()))
     })?;
-    let config = read_config(args, &sys)?;
+    let config = read_config(args, &SessionConfigHost { fs: sys.fs(), cwd })?;
     let host =
         compiler::new_compiler_host(cwd, sys.fs(), &sys.default_library_path(), None, None, None);
     let host = Rc::new(crate::editor_host::EditorHost::new(
         host,
-        parse_pools.clone(),
         config.compiler_options().target.0,
+        documents,
     ));
     let program = ls_program::new_program(
         ProgramOptions {
@@ -422,11 +448,18 @@ fn build_language(
     let metadata = host.metadata();
     let fs = program.host().fs();
     let line_maps = RefCell::new(HashMap::<String, Rc<lsconv::LSPLineMap>>::new());
+    let texts = Rc::downgrade(&program);
     let converters = lsconv::new_converters(lsproto::PositionEncodingKind::UTF16, move |name| {
         if let Some(lines) = line_maps.borrow().get(name).cloned() {
             return Some(lines);
         }
-        let text = host::read_source_snapshot(name)?;
+        let text = match texts
+            .upgrade()
+            .and_then(|program| program.get_source_file(name))
+        {
+            Some(file) => file.text().to_owned(),
+            None => host::read_source_snapshot(name)?,
+        };
         let lines = lsconv::compute_lsp_line_starts(&text);
         line_maps.borrow_mut().insert(name.into(), lines.clone());
         Some(lines)
@@ -438,21 +471,39 @@ fn build_language(
     ))
 }
 
-fn read_config(args: &[String], sys: &dyn System) -> Result<ParsedCommandLine, ServiceError> {
-    let host = SystemParseConfigHost(sys);
-    let parsed = tsoptions::parse_command_line(args, &host);
+/// The configuration host of a session: the instance's file system with the
+/// session's current directory.
+struct SessionConfigHost<'a> {
+    fs: Rc<dyn Fs>,
+    cwd: &'a str,
+}
+
+impl tsoptions::ParseConfigHost for SessionConfigHost<'_> {
+    fn fs(&self) -> Rc<dyn Fs> {
+        self.fs.clone()
+    }
+
+    fn get_current_directory(&self) -> String {
+        self.cwd.into()
+    }
+}
+
+fn read_config(
+    args: &[String],
+    host: &SessionConfigHost<'_>,
+) -> Result<ParsedCommandLine, ServiceError> {
+    let parsed = tsoptions::parse_command_line(args, host);
     check_config(&parsed.get_config_file_parsing_diagnostics())?;
     let options = parsed.compiler_options();
     if options.project.is_empty() {
         return Ok(parsed);
     }
-    let mut path =
-        tspath::get_normalized_absolute_path(&options.project, &sys.get_current_directory());
-    if sys.fs().directory_exists(&path) {
+    let mut path = tspath::get_normalized_absolute_path(&options.project, host.cwd);
+    if host.fs.directory_exists(&path) {
         path = tspath::combine_paths(&path, &["tsconfig.json"]);
     }
     let (config, errors) =
-        tsoptions::get_parsed_command_line_of_config_file(&path, Some(options), None, &host, None);
+        tsoptions::get_parsed_command_line_of_config_file(&path, Some(options), None, host, None);
     check_config(&errors)?;
     let config = config.ok_or_else(|| {
         ServiceError::Internal(format!("project configuration was not returned: {path}"))
@@ -529,7 +580,12 @@ fn normalize_document(
     if file.is_nil() {
         return Err("document is not part of the program".into());
     }
-    let text = language.program.host().fs().read_file(&uri.file_name()).0;
+    let text = language
+        .program
+        .get_source_file(&uri.file_name())
+        .ok_or("document is not part of the program")?
+        .text()
+        .to_owned();
     let lines = lsconv::compute_lsp_line_starts(&text);
     if let Some(position) = params.get_mut("position") {
         normalize_position(&text, &lines, position)?;

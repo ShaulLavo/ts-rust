@@ -35,6 +35,7 @@ const OP_APPEND = 5;
 const OP_REMOVE = 6;
 const OP_CHTIMES = 7;
 const OP_SOURCE_METADATA = 8;
+const OP_GET_SOURCE_FILE = 9;
 
 const KIND_CHAR = { file: "f", directory: "d", symlink: "l", other: "o" };
 
@@ -97,6 +98,10 @@ function fsCall(fs, op, request) {
         case OP_SOURCE_METADATA: {
             const metadata = fs.sourceMetadata?.(text);
             return metadata === undefined ? undefined : encoder.encode(JSON.stringify(metadata));
+        }
+        case OP_GET_SOURCE_FILE: {
+            const lease = fs.getSourceFile?.(JSON.parse(text));
+            return lease === undefined ? undefined : encoder.encode(String(lease));
         }
     }
     return undefined;

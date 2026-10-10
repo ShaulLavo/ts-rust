@@ -17,8 +17,9 @@
 //! | `Write`, `Append` | path, NUL, data | empty |
 //! | `Remove` | path (recursive) | empty |
 //! | `Chtimes` | path, NUL, atime ns, NUL, mtime ns (empty: unchanged) | empty |
+//! | `GetSourceFile` | JSON `{fileName, path, jsx, force}` | the decimal document lease, or -1 when missing |
 
-use std::sync::OnceLock;
+use std::cell::Cell;
 use std::time::{Duration, SystemTime};
 
 use ts_goport::frontend::vfs::{
@@ -38,6 +39,7 @@ pub enum Op {
     Remove = 6,
     Chtimes = 7,
     SourceMetadata = 8,
+    GetSourceFile = 9,
 }
 
 thread_local! {
@@ -78,7 +80,12 @@ pub fn call(op: Op, request: &[u8]) -> Result<Vec<u8>, String> {
         ..-1 => {
             if matches!(
                 op,
-                Op::Read | Op::Stat | Op::ReadDir | Op::Realpath | Op::SourceMetadata
+                Op::Read
+                    | Op::Stat
+                    | Op::ReadDir
+                    | Op::Realpath
+                    | Op::SourceMetadata
+                    | Op::GetSourceFile
             ) {
                 READ_FAILED.with(|failed| failed.set(true));
             }
@@ -99,10 +106,17 @@ pub fn call(op: Op, request: &[u8]) -> Result<Vec<u8>, String> {
     test_host::call(op, request).ok_or_else(String::new)
 }
 
-/// Whether the host file system tells apart names that differ only in case.
-/// Set once per instance by the request (`crate::run`); true by default, as
-/// Go's osvfs assumes on wasm.
-pub static CASE_SENSITIVE: OnceLock<bool> = OnceLock::new();
+thread_local! {
+    /// Whether the active host file system tells apart names that differ only
+    /// in case. A tsc run sets it once; each language-service session sets it
+    /// before its requests. True by default, as Go's osvfs assumes on wasm.
+    static CASE_SENSITIVE: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Sets the case sensitivity of the active host file system.
+pub fn set_case_sensitive(case_sensitive: bool) {
+    CASE_SENSITIVE.with(|cell| cell.set(case_sensitive));
+}
 
 /// The host file system. Reads go through Go's `vfs/internal.Common`, as
 /// the OS file system does, so BOM handling, text decoding and link
@@ -264,7 +278,7 @@ fn ns_since_epoch(time: Option<SystemTime>) -> String {
 
 impl Fs for HostFs {
     fn use_case_sensitive_file_names(&self) -> bool {
-        *CASE_SENSITIVE.get_or_init(|| true)
+        CASE_SENSITIVE.with(Cell::get)
     }
 
     fn file_exists(&self, path: &str) -> bool {
@@ -414,7 +428,7 @@ pub mod test_host {
                 Some(Vec::new())
             }
             Op::Chtimes => Some(Vec::new()),
-            Op::SourceMetadata => None,
+            Op::SourceMetadata | Op::GetSourceFile => None,
         }
     }
 }

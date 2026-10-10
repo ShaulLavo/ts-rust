@@ -39,7 +39,7 @@ export function createProgramGraph(channel, handle, settings = {}) {
     graph("setParseTarget", { target: settings.target ?? 1 });
 
     function resolveNode(handle) {
-        return resolveSourceNode(channel, handle);
+        return resolveSourceNode(channel.instance, handle);
     }
 
     function getSourceFile(fileName) {
@@ -49,7 +49,7 @@ export function createProgramGraph(channel, handle, settings = {}) {
         if (!response) return undefined;
         file = files.get(response.fileName);
         if (file) return file;
-        file = materializeSourceFile(channel, response);
+        file = materializeSourceFile(channel.instance, response);
         files.set(response.fileName, file);
         metadata.set(file, response);
         return file;

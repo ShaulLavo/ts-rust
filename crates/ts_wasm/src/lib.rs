@@ -107,7 +107,7 @@ pub fn run(request: &str) -> (i32, String) {
         return (1, String::new());
     }
 
-    let _ = host::CASE_SENSITIVE.set(flags & FLAG_CASE_INSENSITIVE == 0);
+    host::set_case_sensitive(flags & FLAG_CASE_INSENSITIVE == 0);
     install_os_override(OsOverride {
         fs: Arc::new(|| Rc::new(host::HostFs::new()) as Rc<dyn Fs>),
         current_directory: cwd,
@@ -145,7 +145,6 @@ mod exports {
     thread_local! {
         static INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-        static SERVICE: RefCell<Option<super::language_service::Service>> = const { RefCell::new(None) };
     }
 
     /// Makes the input buffer `len` bytes long and returns its address. The
@@ -172,14 +171,15 @@ mod exports {
         status
     }
 
-    /// Handles one editor request in this instance's persistent language service.
+    /// Handles one request for this instance's language-service sessions and
+    /// documents. A document registry can call it again from inside a host
+    /// callback of a session's build.
     #[allow(unsafe_code)]
     #[unsafe(no_mangle)]
     pub extern "C" fn ts_service() {
         install_panic_hook();
         let request = INPUT.with(|input| std::mem::take(&mut *input.borrow_mut()));
-        let reply = SERVICE
-            .with(|service| super::language_service::receive(&mut service.borrow_mut(), &request));
+        let reply = super::language_service::receive(&request);
         OUTPUT.with(|output| *output.borrow_mut() = reply.into_bytes());
     }
 

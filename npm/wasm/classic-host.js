@@ -1,28 +1,39 @@
 import { memoryFileSystem } from "./core.js";
 import { createServiceChannel } from "./service-channel.js";
-import { encodeWtf8 } from "./wtf8.js";
 import { ScriptKind } from "./classic-enums.js";
+import { sourceFileLease } from "./classic-source-files.js";
+import { createGetCanonicalFileName, toPath } from "./classic-paths.js";
+import { compiledModuleOrUndefined, useCompiledModule } from "./classic-module.js";
+import { createDocumentRegistry, ensureScriptKind, sourceFileOptionsChanged, fixedExternalModuleIndicator, getEmitScriptTarget, withRequestedPath } from "./classic-registry.js";
 
-/** Private host bridge; the classic facade supplies compiler-option translation. */
-export function createHostServiceChannel(module, host, argumentsForSettings) {
+/**
+ * Private host bridge; the classic facade supplies compiler-option translation.
+ * Source files come from `documentRegistry` as classic `getOrCreateSourceFileByPath`
+ * acquires them, so services sharing a registry share their source files.
+ */
+export function createHostServiceChannel(module, host, argumentsForSettings, documentRegistry) {
+    if (!compiledModuleOrUndefined()) useCompiledModule(module);
+    const useCaseSensitiveFileNames = host.useCaseSensitiveFileNames?.() ?? false;
+    const currentDirectory = host.getCurrentDirectory();
+    const getCanonicalFileName = createGetCanonicalFileName(useCaseSensitiveFileNames);
+    documentRegistry ??= createDocumentRegistry(host.useCaseSensitiveFileNames && host.useCaseSensitiveFileNames(), currentDirectory, host.jsDocParsingMode);
     let roots = new Set();
-    let snapshots = new Map();
-    const files = new Map();
-    const memory = memoryFileSystem(files);
+    // The files of the current program: path -> { fileName, version, scriptKind, sourceFile } or { missing }.
+    let loaded = new Map();
+    let settings;
+    let settingsKey;
+    let building;
     let argsKey;
     let currentArgs;
     let lastTypeRootsVersion = 0;
-    let previousSnapshots = new Map();
     let absentFiles = new Set();
     let projectVersion;
     let disposed = false;
     let synchronizing = false;
     let channel;
     let selectedGeneration;
-    let nextSnapshot = 0;
     const generations = new Map();
-    const sources = new Set();
-    let filesystemFacts = { stats: new Map(), directories: new Map(), realpaths: new Map() };
+    let filesystemFacts = { stats: new Map(), directories: new Map(), realpaths: new Map(), reads: new Map() };
 
     function metadata(path) {
         const version = host.getScriptVersion(path);
@@ -35,39 +46,59 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
         return record.version === current.version && record.scriptKind === current.scriptKind;
     }
 
-    /** TypeScript reads every loaded file's snapshot on each build and keeps the old parse for an unchanged version. */
-    function capture(path) {
-        const current = metadata(path);
-        const snapshot = host.getScriptSnapshot(path);
-        if (snapshot === undefined) return { ...current, text: undefined };
-        const previous = previousSnapshots.get(path);
-        if (previous?.text !== undefined && unchanged(previous, current)) return previous;
-        if (nextSnapshot === 0xffffffff) throw new RangeError("source snapshot identity exhausted");
-        return { ...current, snapshot, text: snapshot.getText(0, snapshot.getLength()), identity: ++nextSnapshot };
-    }
-
-    function record(path) {
-        let found = snapshots.get(path);
-        if (!found) {
-            found = capture(path);
-            snapshots.set(path, found);
-            if (found.text !== undefined) files.set(path, found.text);
+    /** `getOrCreateSourceFileByPath` of `synchronizeHostDataWorker`. */
+    function getSourceFile(request) {
+        const fileName = request.fileName;
+        const path = toPath(fileName, currentDirectory, getCanonicalFileName);
+        const cached = building.files.get(path);
+        if (cached) return sourceFileLease(cached.sourceFile, channel.instance);
+        const scriptSnapshot = host.getScriptSnapshot(fileName);
+        if (!scriptSnapshot) {
+            building.files.set(path, { fileName, missing: true });
+            return undefined;
         }
-        return found;
+        const { version } = metadata(fileName);
+        const scriptKind = ensureScriptKind(fileName, host.getScriptKind?.(fileName));
+        const options = {
+            languageVersion: getEmitScriptTarget(settings),
+            impliedNodeFormat: undefined,
+            setExternalModuleIndicator: fixedExternalModuleIndicator(request.jsx, request.force),
+            jsDocParsingMode: host.jsDocParsingMode,
+        };
+        const sourceFile = withRequestedPath(fileName, request.path, () => {
+            const old = building.reuse ? loaded.get(path)?.sourceFile : undefined;
+            if (old) {
+                if (scriptKind === old.scriptKind || building.releasedScriptKinds.has(old.resolvedPath)) {
+                    return documentRegistry.updateDocumentWithKey(fileName, path, host, settingsKey, scriptSnapshot, version, scriptKind, options);
+                }
+                documentRegistry.releaseDocumentWithKey(old.resolvedPath, building.oldKey, old.scriptKind, old.impliedNodeFormat);
+                building.releasedScriptKinds.add(old.resolvedPath);
+            }
+            return documentRegistry.acquireDocumentWithKey(fileName, path, host, settingsKey, scriptSnapshot, version, scriptKind, options);
+        });
+        sourceFile.path = path;
+        sourceFile.resolvedPath = path;
+        sourceFile.originalFileName = fileName;
+        building.files.set(path, Object.assign(metadata(fileName), { fileName, sourceFile }));
+        const lease = sourceFileLease(sourceFile, channel.instance);
+        if (lease === undefined) throw new TypeError("the document registry returned a source file this compiler does not own");
+        return lease;
     }
 
     function readFile(path) {
-        if (selectedGeneration) return selectedGeneration.files.get(path);
-        return record(path).text;
+        if (selectedGeneration) return selectedGeneration.facts.reads.get(path);
+        const result = host.readFile?.(path);
+        filesystemFacts.reads.set(path, result);
+        return result;
     }
 
     const fs = {
-        ...memory,
         readFile,
-        sourceMetadata(path) {
-            const found = selectedGeneration ? selectedGeneration.snapshots.get(path) : record(path);
-            if (found?.text === undefined) return undefined;
-            return { snapshot: found.identity, version: Array.from({ length: found.version.length }, (_, index) => found.version.charCodeAt(index)), scriptKind: ScriptKind[found.scriptKind] };
+        getSourceFile(request) {
+            // Rust also rebuilds on its own after a host exception left it without a program.
+            building ??= newBuild(settings, true);
+            building.started = true;
+            return getSourceFile(request);
         },
         stat(path) {
             if (selectedGeneration) return selectedGeneration.facts.stats.get(path) ?? selectedGeneration.memory.stat(path);
@@ -88,41 +119,36 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
             return result;
         },
     };
+    const empty = memoryFileSystem(new Map());
 
     function stat(path) {
-            const known = memory.stat(path);
-            if (known?.isDirectory) return known;
-            if (roots.has(path) || host.fileExists(path)) {
-                const text = readFile(path);
-                return text === undefined ? undefined : { isDirectory: false, size: encodeWtf8(text).length };
-            }
-            absentFiles.add(path);
-            return directoryProbablyExists(path) ? { isDirectory: true, size: 0 } : undefined;
+        if (roots.has(path) || host.fileExists(path)) return { isDirectory: false, size: 0 };
+        absentFiles.add(path);
+        return directoryProbablyExists(path) ? { isDirectory: true, size: 0 } : undefined;
     }
 
     function directoryProbablyExists(path) {
-            return !host.directoryExists || host.directoryExists(path);
+        return !host.directoryExists || host.directoryExists(path);
     }
 
     function readDirectory(path) {
-            const known = memory.readDirectory(path);
-            const files = host.readDirectory?.(path);
-            const directories = host.getDirectories?.(path);
-            if (!known && !files && !directories && !directoryProbablyExists(path)) return undefined;
-            const entries = new Map((known ?? []).map(entry => [entry.name, entry]));
-            const prefix = path.endsWith("/") ? path : `${path}/`;
-            for (const file of files ?? []) {
-                if (!file.startsWith(prefix)) continue;
-                const relative = file.slice(prefix.length);
-                const slash = relative.indexOf("/");
-                const name = slash < 0 ? relative : relative.slice(0, slash);
-                entries.set(name, { name, kind: slash < 0 ? "file" : "directory" });
-            }
-            for (const directory of directories ?? []) {
-                const name = directory.startsWith(prefix) ? directory.slice(prefix.length) : directory;
-                entries.set(name, { name, kind: "directory" });
-            }
-            return Array.from(entries.values());
+        const files = host.readDirectory?.(path);
+        const directories = host.getDirectories?.(path);
+        if (!files && !directories && !directoryProbablyExists(path)) return undefined;
+        const entries = new Map();
+        const prefix = path.endsWith("/") ? path : `${path}/`;
+        for (const file of files ?? []) {
+            if (!file.startsWith(prefix)) continue;
+            const relative = file.slice(prefix.length);
+            const slash = relative.indexOf("/");
+            const name = slash < 0 ? relative : relative.slice(0, slash);
+            entries.set(name, { name, kind: slash < 0 ? "file" : "directory" });
+        }
+        for (const directory of directories ?? []) {
+            const name = directory.startsWith(prefix) ? directory.slice(prefix.length) : directory;
+            entries.set(name, { name, kind: "directory" });
+        }
+        return Array.from(entries.values());
     }
 
     function synchronize() {
@@ -139,48 +165,93 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
             if (hostProjectVersion) projectVersion = hostProjectVersion;
         }
         const typeRootsVersion = host.getTypeRootsVersion?.() ?? 0;
-        let changed = typeRootsVersion !== lastTypeRootsVersion;
+        // A new type-roots version drops the old program, so its files are neither updated nor released.
+        const dropped = typeRootsVersion !== lastTypeRootsVersion;
+        let changed = dropped;
         lastTypeRootsVersion = typeRootsVersion;
         const names = host.getScriptFileNames();
-        const args = argumentsForSettings(host.getCompilationSettings(), names);
+        const nextSettings = host.getCompilationSettings();
+        const args = argumentsForSettings(nextSettings, names);
         const nextKey = JSON.stringify(args);
-        changed ||= nextKey !== argsKey || names.some(path => !snapshots.has(path)) || host.hasChangedAutomaticTypeDirectiveNames?.() === true;
+        changed ||= nextKey !== argsKey || names.some(name => !loaded.has(toPath(name, currentDirectory, getCanonicalFileName))) || host.hasChangedAutomaticTypeDirectiveNames?.() === true;
         if (!changed && absentFiles.size) {
             for (const path of channel.call({ action: "missingFiles", paths: Array.from(absentFiles) })) {
                 if (changed) break;
                 changed = host.fileExists(path);
             }
         }
-        for (const [path, found] of snapshots) {
+        for (const found of loaded.values()) {
             if (changed) break;
-            if (found.text === undefined) changed = host.fileExists(path);
-            else changed = !unchanged(found, metadata(path)) || host.hasInvalidatedResolutions?.(path) === true;
+            if (found.missing) changed = host.fileExists(found.fileName);
+            else changed = !unchanged(found, metadata(found.fileName)) || host.hasInvalidatedResolutions?.(found.sourceFile.path) === true;
         }
         if (!changed) return currentArgs = args;
         channel?.call({ action: "configure", args });
         roots = new Set(names);
-        previousSnapshots = snapshots;
-        snapshots = new Map();
         absentFiles = new Set();
         argsKey = nextKey;
         currentArgs = args;
-        files.clear();
-        filesystemFacts = { stats: new Map(), directories: new Map(), realpaths: new Map() };
+        building = newBuild(nextSettings, !dropped);
+        settings = nextSettings;
+        settingsKey = documentRegistry.getKeyForCompilationSettings(settings);
+        filesystemFacts = { stats: new Map(), directories: new Map(), realpaths: new Map(), reads: new Map() };
         return args;
+    }
+
+    /** The build of `nextSettings`; `oldProgram` says whether the current program is its old program. */
+    function newBuild(nextSettings, oldProgram) {
+        const reuse = oldProgram && loaded.size > 0;
+        return { files: new Map(), releasedScriptKinds: new Set(), oldKey: settingsKey, oldProgram: reuse,
+            reuse: reuse && !sourceFileOptionsChanged(settings, nextSettings) };
+    }
+
+    /** A build ran: release the old program's documents the new one does not use, as `createProgram` does. */
+    function finishBuild() {
+        const previous = loaded;
+        loaded = building.files;
+        if (building.oldProgram) {
+            for (const found of previous.values()) {
+                if (found.missing) continue;
+                const next = loaded.get(found.sourceFile.resolvedPath);
+                if (building.reuse && next?.sourceFile && next.sourceFile.impliedNodeFormat === found.sourceFile.impliedNodeFormat) continue;
+                documentRegistry.releaseDocumentWithKey(found.sourceFile.resolvedPath, building.oldKey, found.sourceFile.scriptKind, found.sourceFile.impliedNodeFormat);
+            }
+        }
+        building = undefined;
+    }
+
+    /**
+     * Runs a request that may build. A request that returns or fails in the
+     * compiler has finished its build, so its documents replace the old ones.
+     * After a host exception the next request builds again with them.
+     */
+    function build(request) {
+        let finished = false;
+        try {
+            const result = channel.call(request);
+            finished = true;
+            return result;
+        }
+        catch (error) {
+            finished = error.code !== undefined;
+            throw error;
+        }
+        finally { if (finished && building?.started) finishBuild(); }
     }
 
     const args = synchronize();
     channel = createServiceChannel(module, {
-        args, fs, cwd: host.getCurrentDirectory(), caseInsensitive: host.useCaseSensitiveFileNames?.() === false,
+        args, fs, cwd: currentDirectory, caseInsensitive: !useCaseSensitiveFileNames, documents: true,
     });
     return {
+        instance: channel.instance,
+        documentRegistry,
         getProgram() {
             if (disposed) throw new Error("language service is disposed");
             synchronize();
-            const program = channel.call({ action: "getProgram" });
+            const program = build({ action: "getProgram" });
             if (!generations.has(program)) {
-                const generationFiles = new Map(files);
-                generations.set(program, { files: generationFiles, snapshots: new Map(snapshots), memory: memoryFileSystem(generationFiles), facts: filesystemFacts });
+                generations.set(program, { memory: empty, facts: filesystemFacts });
             }
             return program;
         },
@@ -188,11 +259,7 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
             if (!generations.has(program)) throw new Error("program handle has been released");
             const previous = selectedGeneration;
             selectedGeneration = generations.get(program);
-            try {
-                const response = channel.call({ action: "graph", program, method, ...params });
-                rememberSources(response);
-                return response;
-            }
+            try { return channel.call({ action: "graph", program, method, ...params }); }
             finally { selectedGeneration = previous; }
         },
         releaseProgram(program) {
@@ -201,20 +268,10 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
             generations.delete(program);
             closeUnreferencedChannel();
         },
-        source(source) {
-            const result = channel.call({ action: "source", source });
-            sources.add(source);
-            return result;
-        },
-        releaseSource(source) {
-            if (!sources.delete(source)) return;
-            if (channel.isAlive()) channel.call({ action: "releaseSource", source });
-            closeUnreferencedChannel();
-        },
         request(method, params) {
             if (disposed) throw new Error("language service is disposed");
             synchronize();
-            return channel.call({ action: "request", method, params });
+            return build({ action: "request", method, params });
         },
         dispose() {
             if (synchronizing) throw new Error("language service cannot dispose during host synchronization");
@@ -222,32 +279,21 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
             if (channel.isAlive()) channel.call({ action: "retire" });
             else {
                 generations.clear();
-                sources.clear();
                 channel.dispose();
             }
             disposed = true;
-            snapshots.clear();
-            previousSnapshots.clear();
+            for (const found of loaded.values()) {
+                if (found.missing) continue;
+                documentRegistry.releaseDocumentWithKey(found.sourceFile.resolvedPath, settingsKey, found.sourceFile.scriptKind, found.sourceFile.impliedNodeFormat);
+            }
+            loaded.clear();
+            building = undefined;
             absentFiles.clear();
-            files.clear();
             closeUnreferencedChannel();
         },
     };
 
     function closeUnreferencedChannel() {
-        if (disposed && generations.size === 0 && sources.size === 0) channel.dispose();
-    }
-
-    function rememberSources(value) {
-        if (!value || typeof value !== "object") return;
-        if (value.source && value.data) {
-            sources.add(value.source);
-            return;
-        }
-        if (value.$node) {
-            sources.add(value.$node.source);
-            return;
-        }
-        for (const child of Object.values(value)) rememberSources(child);
+        if (disposed && generations.size === 0) channel.dispose();
     }
 }

@@ -101,8 +101,8 @@ parse. Non-root files exist when `fileExists` says so, and a host without `direc
 every directory. A host exception inside a build reaches the caller, and the next call rebuilds.
 
 Known deviations: callback order and counts follow the Rust module resolver, not the reference.
-A root with a snapshot exists even when `fileExists` denies it, so an import of such a root
-resolves. A rebuild resolves every import again, while the reference reuses resolutions of
+A root exists for module resolution even when `fileExists` denies it, so an import of such a
+root resolves. A rebuild resolves every import again, while the reference reuses resolutions of
 unchanged files. A `/// <reference path>` target that is created later with an unchanged
 referencing file stays missing: the Rust loader rejects it before loading, so it never enters
 the program's missing files, which the reference checks again. After a host exception the next call retries even when the project version is
@@ -145,15 +145,64 @@ reached. Each classic service algorithm then works exactly as far as the Rust-ba
 source-file, symbol, type and signature objects satisfy its dependencies. A dependency that
 cannot be bridged moves its algorithm into Rust.
 
-A `DocumentRegistry` owns one WASM instance, and every service created with that registry lives
-in it. A shared registry therefore shares Rust parses, so `SourceFile` and node identity hold
-across services. The runtime currently allows one service per instance (`Service::new` rejects a
-second OS override), so the host override must become per-service state first.
+Every classic service and registry of a compiled module lives in one shared WASM instance
+(`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
+identity hold across services.
+
+## Shared instance and document registry (unit 1, done)
+
+The instance holds any number of sessions. Each session keeps its own current directory, case
+sensitivity, arguments and programs; the host file system is installed once, and each host
+callback reaches the session whose request is running. Source leases and parsed documents belong
+to the instance, so one parse has one lease and one `SourceFile` object wherever it appears.
+
+`classic-registry.js` is the pinned `documentRegistry.ts` with its bookkeeping unchanged
+(buckets, keys, script-kind maps, reference counts, `reportStats`, `getBuckets`, the internal
+external cache). Its `createLanguageServiceSourceFile` and `updateLanguageServiceSourceFile` parse
+in Rust (`parseDocument`), each call a new parse with its own lease. A program build asks its
+compiler host for every non-bundled file (`GetSourceFile`); the host bridge then follows
+`getOrCreateSourceFileByPath`: read the snapshot, update the old program's document or release it
+on a script-kind change, otherwise acquire. A finished build releases the old program's documents
+as `createProgram` does (all of them when a source-file-affecting option changed), a type-roots
+change drops the old program without releases, and `dispose` releases the current program's
+documents. The registry parse runs inside the build's host callback; only that nested call may
+reenter the instance. The file-system async service keeps reading files (`documents: false`).
+
+Checks: `test/classic-registry.test.mjs` (two services on one registry share source files, nodes
+and checker answers; separate registries do not; edits, version races and root removal keep
+classic reference counts; a wrapper serving another registry's cached file, as the fourslash
+harness does; direct acquire, update, release and `Debug Failure` paths). 43/43 runtime tests,
+16/17 prior controls (the 17th, `lifetime`, uses a snapshot without `getChangeRange`; TypeScript
+6.0.3 throws the same `TypeError` there, and a conforming copy passes), async edit growth 6.9 MiB
+over 500 edits (5.5 before), and 600 alternating classic edits plateau after 200.
+
+Deviations:
+
+- The plan said each registry owns an instance. The fourslash harness caches lib `SourceFile`
+  objects across registries (`libSourceFileCache`), so all registries share one instance per
+  compiled module instead. A trap ends that instance for every service and registry in it; the
+  next call gets a new instance, and objects from the old one stop working (no adoption yet).
+- Documents a Rust build asks for have no `impliedNodeFormat`, because the Rust loader computes
+  file metadata after the parse, so their registry buckets carry no mode.
+- `updateLanguageServiceSourceFile` parses the new text in full: the Rust parser has no
+  incremental mode, so unchanged nodes are new objects.
+- The Rust parser ignores `jsDocParsingMode`. A `setExternalModuleIndicator` callback that did not
+  come from `getSetExternalModuleIndicator` or a build parses with the legacy rule and is not called.
+- A relative file name parses at the root; the object keeps the classic name.
+- `getImpliedNodeFormatForFile` with a host reads the nearest `package.json` `type` through the
+  host, without the module-resolution cache.
+- A file's `stat` size is 0, so existence checks read no snapshot.
+- Released documents are freed when their `SourceFile` objects are collected, which needs the
+  event loop to turn.
+- Bundled libraries still bypass the registry.
+- `createDocumentRegistry` is not yet a public package export: the public entry gets it with the
+  classic factory, since both need the module ready at load.
 
 Remaining units, in order. Each ends with its narrow checks and then the injected upstream run
 (`run-classic-candidate.cjs`: the reference passes 6,322 fourslash and 1,531 services tests):
 
-1. Per-service host state in one instance; registry-owned instances; public `createDocumentRegistry`.
+1. [x] Per-service host state in one instance; registry-backed documents; classic `createDocumentRegistry`
+   (public export moves to unit 2 with the factory).
 2. Classic dispatch bundle with guarded compiler entries and the Rust `createProgram` bridge.
 3. Classic `Program` members the dispatch reads (`getSourceFileByPath`, `getMissingFilePaths`,
    resolved modules and references, `structureIsReused`, emit).

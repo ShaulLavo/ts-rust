@@ -141,13 +141,16 @@ function rawService(module) {
     };
 }
 
-test("raw initialization can recover and distinguishes parse errors", async () => {
+test("raw sessions can recover, coexist and distinguish parse errors", async () => {
     const call = rawService(await loadModule());
     assert.equal(call("{").error.code, -32700);
-    assert.equal(call(JSON.stringify({ action: "initialize", cwd: "/", args: [], capabilities: 1, caseInsensitive: true })).error.code, -32602);
-    assert.deepEqual(call(JSON.stringify({ action: "initialize", cwd: "/", args: [], capabilities: {}, caseInsensitive: false })), { result: null });
-    assert.deepEqual(call(JSON.stringify({ action: "dispose" })), { result: null });
-    assert.equal(call(JSON.stringify({ action: "initialize", cwd: "/", args: [], capabilities: {} })).error.code, -32602);
+    assert.equal(call(JSON.stringify({ action: "open", cwd: "/", args: [], capabilities: 1, caseInsensitive: true })).error.code, -32602);
+    assert.deepEqual(call(JSON.stringify({ action: "open", cwd: "/", args: [], capabilities: {}, caseInsensitive: false })), { result: 1 });
+    assert.deepEqual(call(JSON.stringify({ action: "open", cwd: "/", args: [], capabilities: {} })), { result: 2 });
+    assert.deepEqual(call(JSON.stringify({ action: "close", session: 1 })), { result: null });
+    assert.equal(call(JSON.stringify({ action: "invalidate", session: 1 })).error.code, -32602);
+    assert.deepEqual(call(JSON.stringify({ action: "invalidate", session: 2 })), { result: null });
+    assert.equal(call(JSON.stringify({ action: "invalidate" })).error.code, -32602);
 });
 
 test("position-heavy results reuse the program's file line map", async () => {

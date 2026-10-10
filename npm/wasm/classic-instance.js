@@ -1,0 +1,111 @@
+import { prepareRun } from "./runtime.js";
+import { decodeProtocolString, encodeWtf8 } from "./wtf8.js";
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const instances = new WeakMap();
+
+/**
+ * The WebAssembly instance every classic service and document registry of a
+ * compiled module shares, so that a document parsed for one registry can
+ * serve every service that receives it, as classic source files do. A trap
+ * ends the instance; the next caller gets a new one.
+ */
+export function sharedInstance(module) {
+    let instance = instances.get(module);
+    if (!instance?.isAlive()) {
+        instance = createInstance(module);
+        instances.set(module, instance);
+    }
+    return instance;
+}
+
+function createInstance(module) {
+    let active;
+    let documentRequests = 0;
+    let depth = 0;
+    let failure;
+    // Host file operations reach the session whose request is running.
+    const fs = {
+        readFile: path => active.readFile(path),
+        stat: path => active.stat(path),
+        readDirectory: path => active.readDirectory(path),
+        realpath: path => active.realpath?.(path),
+        getSourceFile(request) {
+            documentRequests++;
+            try { return active.getSourceFile(request); }
+            finally { documentRequests--; }
+        },
+    };
+    const run = prepareRun(module, { fs, holdHostExceptions: true });
+    let exports = run.attach(new WebAssembly.Instance(module, run.imports));
+
+    /**
+     * Sends one request and returns its response with the first exception a
+     * host callback threw during it. Only a document parse may run inside a
+     * host callback, and only while a session's build asks its compiler host
+     * for a file.
+     */
+    function send(request, files, payload) {
+        if (failure) throw failure;
+        if (depth > 0 && !(documentRequests > 0 && request.action === "parseDocument")) {
+            throw new Error("language service cannot reenter a host callback");
+        }
+        const json = encoder.encode(JSON.stringify(request));
+        let input = json;
+        if (payload !== undefined) {
+            const text = encodeWtf8(payload);
+            input = new Uint8Array(json.length + 1 + text.length);
+            input.set(json);
+            input.set(text, json.length + 1);
+        }
+        const previous = active;
+        if (files) active = files;
+        depth++;
+        let response;
+        try {
+            const ptr = exports.ts_input(input.length) >>> 0;
+            new Uint8Array(exports.memory.buffer).set(input, ptr);
+            exports.ts_service();
+            response = JSON.parse(decoder.decode(new Uint8Array(
+                exports.memory.buffer, exports.ts_output() >>> 0, exports.ts_output_len() >>> 0,
+            )), (_, value) => decodeProtocolString(value));
+        } catch (error) {
+            failure = Object.assign(error, { stderr: run.stderrText() });
+            exports = undefined;
+            run.detach();
+            throw failure;
+        } finally {
+            depth--;
+            active = previous;
+        }
+        return { response, held: depth === 0 ? run.takeHostException() : undefined };
+    }
+
+    function call(request, files, payload) {
+        const { response, held } = send(request, files, payload);
+        if (held) throw held.error;
+        return result(response);
+    }
+
+    return {
+        send,
+        call,
+        isAlive: () => failure === undefined,
+        inCallback: () => depth > 0,
+        failure: () => failure,
+        source: source => call({ action: "source", source }),
+        releaseSource(source) {
+            if (failure === undefined && depth === 0) call({ action: "releaseSource", source });
+        },
+        parseDocument: (request, text) => call(Object.assign({ action: "parseDocument" }, request), undefined, text),
+    };
+}
+
+/** The result of a response, or its compiler error. */
+export function result(response) {
+    if (response.error) throw Object.assign(new Error(response.error.message), {
+        code: response.error.code, data: response.error.data,
+    });
+    return response.result;
+}

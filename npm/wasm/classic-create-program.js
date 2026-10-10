@@ -81,6 +81,7 @@ export function createProgram(rootNamesOrOptions, options, host, oldProgram, con
             channel.call({ action: "releaseProgram", program });
             channel.dispose();
         },
+        releaser: program => channel.closingReleaser(program),
     };
     const program = createProgramGraph(graphChannel, handle, options);
     const projectReferences = createProgramOptions.projectReferences;

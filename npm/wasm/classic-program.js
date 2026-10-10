@@ -1,14 +1,17 @@
+import { nodeHandle } from "./classic-ast.js";
 import { materializeSourceFile, resolveSourceNode } from "./classic-source-files.js";
 import { createTypeChecker } from "./classic-checker.js";
 
 const programs = new WeakMap();
 const leases = new WeakMap();
-const releases = new FinalizationRegistry(({ channel, handle, token }) => {
-    const cache = leases.get(channel);
-    if (cache?.get(handle)?.token !== token) return;
-    cache.delete(handle);
-    programs.get(channel)?.delete(handle);
-    channel.releaseProgram(handle);
+// A held value must not reach its lease, or the lease never collects: it holds the
+// caches and a release function, never the channel, whose host callbacks can reach
+// the service that holds the program.
+const releases = new FinalizationRegistry(({ leaseCache, programCache, release, handle, token }) => {
+    if (leaseCache.get(handle)?.token !== token) return;
+    leaseCache.delete(handle);
+    programCache.delete(handle);
+    release();
 });
 
 /** Private retained program bridge. The classic facade owns host synchronization. */
@@ -30,7 +33,8 @@ export function createProgramGraph(channel, handle, settings = {}) {
         lease = { channel, handle, settings, files: new Map(), metadata: new WeakMap() };
         const token = {};
         leaseCache.set(handle, { reference: new WeakRef(lease), token });
-        releases.register(lease, { channel, handle, token });
+        const release = channel.releaser ? channel.releaser(handle) : programReleaser(channel, handle);
+        releases.register(lease, { leaseCache, programCache: cache, release, handle, token });
     }
     settings = lease.settings;
     const files = lease.files;
@@ -77,6 +81,10 @@ export function createProgramGraph(channel, handle, settings = {}) {
         getCurrentDirectory: () => graph("getCurrentDirectory"),
         getSourceFileByPath: path => program.getSourceFiles().find(file => (file.resolvedPath ?? file.fileName) === path),
         getMissingFilePaths: () => new Map(graph("getMissingFilePaths")),
+        getImpliedNodeFormatForEmit: file => graph("getImpliedNodeFormatForEmit", { fileName: file.fileName }) ?? undefined,
+        getEmitModuleFormatOfFile: file => graph("getEmitModuleFormatOfFile", { fileName: file.fileName }) ?? undefined,
+        getDefaultResolutionModeForFile: file => graph("getDefaultResolutionModeForFile", { fileName: file.fileName }) ?? undefined,
+        getModeForUsageLocation: (file, usage) => graph("getModeForUsageLocation", { fileName: file.fileName, location: nodeHandle(usage) }) ?? undefined,
         getProjectReferences: () => undefined,
         getResolvedProjectReferences: () => undefined,
         resolvedLibReferences: undefined,
@@ -92,4 +100,12 @@ export function createProgramGraph(channel, handle, settings = {}) {
     };
     cache.set(handle, new WeakRef(program));
     return program;
+}
+
+/**
+ * Releases a program of a channel without a releaser of its own (the private host bridge,
+ * whose host does not reach its programs). Module scope keeps the program's context out.
+ */
+function programReleaser(channel, handle) {
+    return () => channel.releaseProgram(handle);
 }

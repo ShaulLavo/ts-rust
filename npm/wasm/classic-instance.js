@@ -89,6 +89,8 @@ function createInstance(module) {
         send,
         call,
         isAlive: () => failure === undefined,
+        /** The size of the instance's linear memory, for diagnostics. */
+        memoryBytes: () => exports?.memory.buffer.byteLength,
         inCallback: () => depth > 0,
         isRunning: session => running.includes(session),
         failure: () => failure,

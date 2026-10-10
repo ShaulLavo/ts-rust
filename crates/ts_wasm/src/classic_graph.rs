@@ -90,6 +90,10 @@ impl Graphs {
                     .collect::<Vec<_>>()
             )),
             "getCurrentDirectory" => Ok(json!(program.get_current_directory())),
+            "getImpliedNodeFormatForEmit"
+            | "getEmitModuleFormatOfFile"
+            | "getDefaultResolutionModeForFile"
+            | "getModeForUsageLocation" => resolution_mode(program, method, request),
             "getMissingFilePaths" => Ok(json!(
                 program
                     .processed_files
@@ -217,6 +221,33 @@ impl Graphs {
         result["externalLibrary"] = json!(program.is_source_file_from_external_library(&file));
         Ok(result)
     }
+}
+
+/// A program's resolution mode for a file, or for a usage location in it.
+fn resolution_mode(program: &NewProgram, method: &str, request: &Value) -> Result<Value, String> {
+    let name = request["fileName"]
+        .as_str()
+        .ok_or("fileName must be a string")?;
+    let file = program
+        .get_source_file(name)
+        .ok_or("file is not part of the program")?;
+    let mode = match method {
+        "getImpliedNodeFormatForEmit" => program.get_implied_node_format_for_emit(&*file),
+        "getEmitModuleFormatOfFile" => program.get_emit_module_format_of_file(&*file),
+        "getDefaultResolutionModeForFile" => program.get_default_resolution_mode_for_file(&*file),
+        _ => {
+            let location = crate::classic_sources::with_sources(|sources| {
+                sources.resolve(&request["location"])
+            })?;
+            program.get_mode_for_usage_location(&*file, location)
+        }
+    };
+    // Classic `ResolutionMode` is undefined where the port has `None`.
+    Ok(if mode.0 == 0 {
+        Value::Null
+    } else {
+        json!(mode.0)
+    })
 }
 
 fn diagnostics(

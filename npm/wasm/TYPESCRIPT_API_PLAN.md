@@ -149,6 +149,36 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Upstream baseline and next work (units 3 and 4)
+
+First complete injected run of the unchanged upstream suites against the candidate
+(`classic.js`, head after "Release programs whose service holds them", WASM sha256 prefix
+782080b622cc4c56, runner `/work/tmp/tsrust-ls-probes/u2/run-classic-candidate-v2.cjs` with the
+json-stream reporter, via `watch-run.sh`): **2,453 of 7,853** pass (fourslash 1,472 of 6,322;
+services units 981 of 1,531), against the reference's 7,853. Two runs on the same source match
+name for name (`full5-passes.txt`, `full6-passes.txt` in that directory). The roster takes about
+three minutes; memory stays flat (RSS about 2.8 GiB, WASM memory 463 MiB) with ordinary GC.
+
+Largest failure groups, the queue for units 3 and 4 (counts are failing tests by first error):
+
+| Count | First error | Owner |
+| --- | --- | --- |
+| 538 | compiler host returned a source file this compiler does not own | foreign `SourceFile` adoption (registry objects from classic `createSourceFile` callers, harness caches across a trap) |
+| 490 | `Cannot read properties of undefined` | per-case diagnosis |
+| 461, 145 | `isUnknownSymbol`, `isUndefinedSymbol` | checker identity members |
+| 426 | `getSymbolsInScope` | completions family |
+| 327, 86 | `getAmbientModules` | completions and imports |
+| 163 | `tryGetThisTypeAt` | completions |
+| 149 | `resolveName` | checker |
+| 136 | `runWithCancellationToken` | cancellation (unit 5) |
+| 135 | Node is not backed by this compiler | synthetic or foreign nodes passed to the checker |
+| 133 | `getResolvedSignatureForSignatureHelp` | signature help |
+| 126 | `name must be a string` | per-case diagnosis |
+| 115, 108, 104, 94, 91, 54 | `getPromisedTypeOfPromise`, `typeToTypeNode`, `containsArgumentsReference`, `getDiagnostics`, `getIndexInfoOfType`, `createArrayType` | checker internals by family |
+| 80 | `program.getResolvedModuleFromModuleSpecifier` | Program members (unit 3) |
+| 71 | native AST kind `FirstJSDocTagNode` has no classic kind | decoder |
+| 64, 63 | `Debug Failure` (token end, false expression) | per-case diagnosis |
+
 ## Classic dispatch on Rust (unit 2, second part)
 
 `scripts/generate-classic-services.mjs` turns the published `typescript@6.0.3`
@@ -165,7 +195,9 @@ Classic compiler hosts read the old program while a build asks them for files, s
 callback may now send requests to other sessions; only a running session cannot be reentered,
 and Rust borrows each session on its own.
 
-Program members added for the dispatch: `getMissingFilePaths` (Rust's missing files),
+Program members added for the dispatch: `getImpliedNodeFormatForEmit`,
+`getEmitModuleFormatOfFile`, `getDefaultResolutionModeForFile` and `getModeForUsageLocation`
+(Rust's answers, `None` as `undefined`), `getMissingFilePaths` (Rust's missing files),
 `getSourceFileByPath`, `getProjectReferences` (from `createProgram`), `getResolvedProjectReferences`
 and `resolvedLibReferences` (none yet). A bundled library's `version` is `undefined`, as a
 classic host's version is for a file it does not own, so `isProgramUptoDate` holds.
@@ -268,7 +300,8 @@ Remaining units, in order. Each ends with its narrow checks and then the injecte
    - [ ] Public `createLanguageService` and `createDocumentRegistry` exports with the module
      ready at load in every supported runtime (unit 6 decides browser loading).
 3. Classic `Program` members the dispatch reads (`getSourceFileByPath`, `getMissingFilePaths`,
-   resolved modules and references, `structureIsReused`, emit).
+   resolved modules and references, `structureIsReused`, emit). Started: the members above;
+   the baseline table orders the rest.
 4. `TypeChecker` members and symbol/type internals each service family reads, by family.
 5. `getEmitOutput` through Rust emit, including custom transformers; cancellation tokens;
    host module and type-reference resolution; project references.

@@ -30,5 +30,18 @@ export function createServiceChannel(module, options) {
         }
     }
 
-    return { call, dispose, instance, isAlive: () => session !== undefined && instance.isAlive() };
+    return {
+        call, dispose, instance,
+        isAlive: () => session !== undefined && instance.isAlive(),
+        /** A function that releases `program` and closes this session, holding neither the channel nor its host. */
+        closingReleaser: program => closingReleaser(instance, session, program),
+    };
+}
+
+function closingReleaser(instance, session, program) {
+    return () => {
+        if (!instance.isAlive() || instance.isRunning(session)) return;
+        instance.call({ action: "releaseProgram", session, program });
+        instance.call({ action: "close", session });
+    };
 }

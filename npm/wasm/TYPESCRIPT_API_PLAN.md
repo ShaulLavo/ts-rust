@@ -149,6 +149,30 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Checker members (unit 4, first batch)
+
+Injected run: **2,773 of 7,853** (fourslash 1,792, services 981), none lost against the
+previous batch (`r5` in `/work/tmp/tsrust-ls-probes/u3/`, WASM 158de632aace2541).
+
+Added in Rust's checker bridge with classic arguments and answers: `isUnknownSymbol`,
+`isUndefinedSymbol`, `isArgumentsSymbol` (false for a symbol of another checker),
+`getSymbolsInScope` (`[]` for a missing location), `getAmbientModules` (one array per checker),
+`tryGetThisTypeAt` (with `includeGlobalThis` and `container`), `resolveName` (with classic's
+`isUse` false, so no symbol is marked referenced), `getResolvedSignatureForSignatureHelp` (fills
+`candidatesOutArray`), `containsArgumentsReference`, `getPromisedTypeOfPromise`,
+`createArrayType`, `getElementTypeOfArrayType`, `getIndexInfoOfType` and `getIndexInfosOfType`
+(classic `IndexInfo` records, one object per index info) and `getUnmatchedProperties`. Symbol
+`meaning` flags translate from classic bits by name. `tryGetThisTypeAt` uses the port's exported
+form, which maps JSDoc nodes to their reparsed nodes.
+
+Deviation: `getUnmatchedProperties` returns an iterator over an eager list; classic's generator
+computes lazily.
+
+Next by failing count (`r5`): `runWithCancellationToken` (840, unit 5's cancellation),
+`program.useCaseSensitiveFileNames` (576), symbols another checker owns (512, per-case),
+`isValidPropertyAccessForCompletions`, `typeToTypeNode`, `getUnionType`, `getDiagnostics`,
+`createPromiseType`, `isDeclarationVisible`, `isImplementationOfOverload`.
+
 ## Program members and host libraries (unit 3, first batch)
 
 Injected upstream run after this batch: **2,506 of 7,853** (fourslash 1,525, services 981),

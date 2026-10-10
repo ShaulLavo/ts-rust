@@ -86,3 +86,40 @@ test("programs read libraries from the host and expose classic resolutions", { s
         assert.deepEqual(program.getAutomaticTypeDirectiveNames(), []);
     } finally { service.dispose(); }
 });
+
+test("checker members answer as TypeScript 6.0.3 does", { skip }, async () => {
+    const { default: ts } = await import("../classic.js");
+    const text = 'declare module "ambient" { export const x: number; }\nclass C { m() { return this; } }\nfunction f(a: number) { return arguments.length + a; }\nconst arr: string[] = []; f(1);\ninterface I { [k: string]: number; readonly [n: number]: 1 }';
+    const host = {
+        getCompilationSettings: () => ({ noLib: true }), getScriptFileNames: () => ["/a.ts"], getScriptVersion: () => "1",
+        getScriptSnapshot: path => path === "/a.ts" ? ts.ScriptSnapshot.fromString(text) : undefined,
+        getCurrentDirectory: () => "/", getDefaultLibFileName: () => "/lib.d.ts", useCaseSensitiveFileNames: () => true,
+        readFile: path => path === "/a.ts" ? text : undefined, fileExists: path => path === "/a.ts",
+    };
+    const service = ts.createLanguageService(host);
+    try {
+        // Expected values were read from typescript@6.0.3 on the same input.
+        const program = service.getProgram();
+        const checker = program.getTypeChecker();
+        const file = program.getSourceFile("/a.ts");
+        assert.deepEqual(checker.getAmbientModules().map(symbol => symbol.name), ['"ambient"']);
+        assert.equal(checker.getAmbientModules(), checker.getAmbientModules());
+        const method = file.statements[1].members[0];
+        const thisExpression = method.body.statements[0].expression;
+        assert.equal(checker.typeToString(checker.tryGetThisTypeAt(thisExpression)), "this");
+        assert.equal(checker.getSymbolsInScope(method.body, ts.SymbolFlags.Value).map(symbol => symbol.name).sort().join(","), '"ambient",C,arguments,arr,f,globalThis,undefined');
+        const f = checker.resolveName("f", thisExpression, ts.SymbolFlags.Value, false);
+        assert.equal(f.name, "f");
+        assert.equal(checker.resolveName("nope", thisExpression, ts.SymbolFlags.Value, false), undefined);
+        assert.deepEqual([checker.isUnknownSymbol(f), checker.isUndefinedSymbol(f)], [false, false]);
+        assert.equal(checker.isUndefinedSymbol(checker.resolveName("undefined", thisExpression, ts.SymbolFlags.Value, false)), true);
+        assert.deepEqual([checker.containsArgumentsReference(file.statements[2]), checker.containsArgumentsReference(method)], [true, false]);
+        const candidates = [];
+        const signature = checker.getResolvedSignatureForSignatureHelp(file.statements[4].expression, candidates, 1);
+        assert.deepEqual([checker.signatureToString(signature), candidates.length], ["(a: number): any", 1]);
+        const infos = checker.getIndexInfosOfType(checker.getTypeAtLocation(file.statements[5].name));
+        assert.deepEqual(infos.map(info => [checker.typeToString(info.keyType), checker.typeToString(info.type), info.isReadonly, info.declaration.kind]),
+            [["string", "number", false, ts.SyntaxKind.IndexSignature], ["number", "1", true, ts.SyntaxKind.IndexSignature]]);
+        assert.equal(checker.getIndexInfoOfType(checker.getTypeAtLocation(file.statements[5].name), ts.IndexKind.String), infos[0]);
+    } finally { service.dispose(); }
+});

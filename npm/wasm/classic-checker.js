@@ -51,7 +51,25 @@ export function createTypeChecker(lease, resolveNode) {
         if (value.$symbol) return symbol(value.$symbol, value.origin);
         if (value.$signature) return signature(value.$signature, value.origin);
         if (value.$node) return resolveNode(value.$node);
+        if (value.$indexInfo) return indexInfo(value);
         return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, decode(item)]));
+    }
+
+    const indexInfos = new Map();
+    function indexInfo(value) {
+        const key = String(value.$indexInfo);
+        let info = indexInfos.get(key);
+        if (info) return info;
+        info = { keyType: decode(value.keyType), type: decode(value.type), isReadonly: value.isReadonly, declaration: decode(value.declaration) };
+        if (value.components) info.components = decode(value.components);
+        indexInfos.set(key, info);
+        return info;
+    }
+
+    /** The checker's id of `object`, or undefined for an object it does not own. */
+    function ownedHandle(object, kind) {
+        const reference = object && objectHandles.get(object);
+        return reference?.kind === kind ? reference.id : undefined;
     }
 
     function handle(object, kind) {
@@ -169,6 +187,36 @@ export function createTypeChecker(lease, resolveNode) {
     for (const method of ["getPropertiesOfType", "getAugmentedPropertiesOfType", "getBaseTypes", "getTypeArguments", "getApparentType", "getNonNullableType", "getNonOptionalType", "isNullableType", "getWidenedType", "getBaseTypeOfLiteralType", "getBaseConstraintOfType", "getDefaultFromTypeParameter", "getConstraintOfTypeParameter", "getAwaitedType", "isArrayType", "isTupleType", "isArrayLikeType"]) {
         checker[method] = object => query(method, { type: handle(object, "type"), origin: objectHandles.get(object)?.origin });
     }
+    // Classic compares with its own unknown, undefined and arguments symbols.
+    for (const method of ["isUnknownSymbol", "isUndefinedSymbol", "isArgumentsSymbol"]) {
+        checker[method] = object => {
+            const id = ownedHandle(object, "symbol");
+            return id !== undefined && query(method, { symbol: id });
+        };
+    }
+    const meaning = flags => translateBits(flags, SymbolFlags, nativeSymbolFlags);
+    checker.getSymbolsInScope = (node, flags) => node === undefined ? [] : query("getSymbolsInScope", { location: location(node), meaning: meaning(flags) });
+    let ambientModules;
+    checker.getAmbientModules = () => ambientModules ??= query("getAmbientModules");
+    checker.tryGetThisTypeAt = (node, includeGlobalThis, container) => node === undefined ? undefined
+        : query("tryGetThisTypeAt", { location: location(node), includeGlobalThis, container: container === undefined ? undefined : location(container) });
+    checker.resolveName = (name, node, flags, excludeGlobals) => query("resolveName", { name, location: node === undefined ? undefined : location(node), meaning: meaning(flags), excludeGlobals });
+    checker.getResolvedSignatureForSignatureHelp = (node, candidatesOutArray, argumentCount) => {
+        const { signature, candidates } = query("getResolvedSignatureForSignatureHelp", { location: location(node), argumentCount });
+        if (candidatesOutArray) candidatesOutArray.push(...candidates);
+        return signature;
+    };
+    checker.containsArgumentsReference = declaration => query("containsArgumentsReference", { location: location(declaration) });
+    checker.getPromisedTypeOfPromise = (type, errorNode) => query("getPromisedTypeOfPromise", { type: handle(type, "type"), errorNode: errorNode === undefined ? undefined : location(errorNode), origin: objectHandles.get(type)?.origin });
+    checker.createArrayType = (elementType, readonly) => query("createArrayType", { type: handle(elementType, "type"), readonly, origin: objectHandles.get(elementType)?.origin });
+    for (const method of ["getElementTypeOfArrayType", "getIndexInfosOfType"]) {
+        checker[method] = object => query(method, { type: handle(object, "type"), origin: objectHandles.get(object)?.origin });
+    }
+    checker.getIndexInfoOfType = (type, kind) => query("getIndexInfoOfType", { type: handle(type, "type"), kind, origin: objectHandles.get(type)?.origin });
+    // Classic answers with a generator; this iterator reads the same properties eagerly.
+    checker.getUnmatchedProperties = (source, target, requireOptionalProperties, matchDiscriminantProperties) => query("getUnmatchedProperties", {
+        type: handle(source, "type"), target: handle(target, "type"), requireOptionalProperties, matchDiscriminantProperties, origin: objectHandles.get(source)?.origin,
+    }).values();
     checker.getReturnTypeOfSignature = signature => query("getReturnTypeOfSignature", { signature: handle(signature, "signature"), origin: objectHandles.get(signature)?.origin });
     checker.getTypeOfSymbolAtLocation = (symbol, node) => query("getTypeOfSymbolAtLocation", { symbol: handle(symbol, "symbol"), location: location(node) });
     checker.getPropertyOfType = (type, name) => query("getPropertyOfType", { type: handle(type, "type"), name, origin: objectHandles.get(type)?.origin });

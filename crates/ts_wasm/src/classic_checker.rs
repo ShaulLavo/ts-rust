@@ -8,8 +8,8 @@ use ts_goport::ast::{escape_symbol_name, get_source_file_of_node, is_part_of_typ
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::binder::go_symbol_name;
 use ts_goport::checker::Checker;
-use ts_goport::core::{Node, SignatureId, SymbolId, TypeId};
-use ts_goport::flags::{ContextFlags, SignatureKind, TypeFlags};
+use ts_goport::core::{IndexInfoId, Node, SignatureId, SymbolId, TypeId};
+use ts_goport::flags::{ContextFlags, SignatureKind, SymbolFlags, TypeFlags};
 use ts_goport::frontend::compiler::NewProgram;
 use ts_goport::gostd::Context;
 use ts_goport::program::ls_program;
@@ -104,6 +104,46 @@ impl ClassicChecker {
             "symbolToString" => Ok(json!(checker.symbol_to_string_exported(symbol))),
             "signatureToString" => Ok(json!(checker.signature_to_string(signature))),
             "getFullyQualifiedName" => Ok(json!(checker.get_fully_qualified_name_exported(symbol))),
+            "isUnknownSymbol" => Ok(json!(checker.is_unknown_symbol(symbol))),
+            "isUndefinedSymbol" => Ok(json!(checker.is_undefined_symbol(symbol))),
+            "isArgumentsSymbol" => Ok(json!(checker.is_arguments_symbol(symbol))),
+            "getSymbolsInScope" => Ok(self.symbol_refs(
+                &checker.get_symbols_in_scope_exported(location, symbol_flags(request)?),
+            )),
+            "getAmbientModules" => Ok(self.symbol_refs(&checker.get_ambient_modules())),
+            "tryGetThisTypeAt" => {
+                let container = node(request, "container")?;
+                let include_global_this = request["includeGlobalThis"].as_bool().unwrap_or(true);
+                Ok(self.type_ref(checker.try_get_this_type_at_ex_exported(
+                    location,
+                    include_global_this,
+                    container,
+                )))
+            }
+            // Classic `resolveName` resolves with `isUse` false, so no symbol counts as referenced.
+            "resolveName" => Ok(self.symbol_ref(checker.resolve_name(
+                location,
+                string(request, "name")?,
+                symbol_flags(request)?,
+                None,
+                false,
+                request["excludeGlobals"].as_bool().unwrap_or(false),
+            ))),
+            "getResolvedSignatureForSignatureHelp" => {
+                let count = request["argumentCount"]
+                    .as_i64()
+                    .map_or(Ok(-1), i32::try_from);
+                let (signature, candidates) = checker.get_resolved_signature_for_signature_help(
+                    location,
+                    count.map_err(|error| error.to_string())?,
+                );
+                Ok(
+                    json!({"signature": self.signature_ref(signature), "candidates": self.signature_refs(&candidates)}),
+                )
+            }
+            "containsArgumentsReference" => {
+                Ok(json!(checker.contains_arguments_reference(location)))
+            }
             _ => self.type_request(&mut checker, method, t, request),
         }
     }
@@ -152,8 +192,65 @@ impl ClassicChecker {
             "isArrayType" => Ok(json!(checker.is_array_type_exported(t))),
             "isTupleType" => Ok(json!(checker.is_tuple_type_exported(t))),
             "isArrayLikeType" => Ok(json!(checker.is_array_like_type_exported(t))),
+            "getPromisedTypeOfPromise" => {
+                let error_node = node(request, "errorNode")?;
+                Ok(self.type_ref(checker.get_promised_type_of_promise_ex(t, error_node, None)))
+            }
+            "createArrayType" => Ok(self.type_ref(
+                checker.create_array_type_ex(t, request["readonly"].as_bool().unwrap_or(false)),
+            )),
+            "getElementTypeOfArrayType" => {
+                Ok(self.type_ref(checker.get_element_type_of_array_type_exported(t)))
+            }
+            "getIndexInfoOfType" => {
+                let key_type = match number(request, "kind")? {
+                    0 => checker.get_string_type(),
+                    1 => checker.get_number_type(),
+                    _ => return Err("index kind must be String or Number".into()),
+                };
+                let info = checker.get_index_info_of_type_exported(t, key_type);
+                Ok(self.index_info(checker, info))
+            }
+            "getIndexInfosOfType" => Ok(Value::Array(
+                checker
+                    .get_index_infos_of_type_exported(t)
+                    .into_iter()
+                    .map(|info| self.index_info(checker, info))
+                    .collect(),
+            )),
+            "getUnmatchedProperties" => {
+                let target = TypeId(Self::handle(request, "target", &self.types)?);
+                Ok(self.symbol_refs(
+                    &checker.get_unmatched_properties(
+                        t,
+                        target,
+                        request["requireOptionalProperties"]
+                            .as_bool()
+                            .unwrap_or(false),
+                        request["matchDiscriminantProperties"]
+                            .as_bool()
+                            .unwrap_or(false),
+                    ),
+                ))
+            }
             _ => self.intrinsic_type(checker, method),
         }
+    }
+
+    /// Classic `IndexInfo`; `id` keeps one object per index info of the checker.
+    fn index_info(&self, checker: &Checker, info: IndexInfoId) -> Value {
+        if info.is_nil() {
+            return Value::Null;
+        }
+        let data = checker.index_info(info);
+        let mut result = json!({"$indexInfo": info.0, "keyType": self.type_ref(data.key_type),
+            "type": self.type_ref(data.value_type), "isReadonly": data.is_readonly,
+            "declaration": node_ref(data.declaration)});
+        if !data.components.is_empty() {
+            result["components"] =
+                Value::Array(data.components.iter().copied().map(node_ref).collect());
+        }
+        result
     }
 
     fn handle(request: &Value, key: &str, issued: &RefCell<HashSet<u32>>) -> Result<u32, String> {
@@ -336,6 +433,16 @@ fn string<'a>(request: &'a Value, key: &str) -> Result<&'a str, String> {
     request[key]
         .as_str()
         .ok_or_else(|| format!("{key} must be a string"))
+}
+
+/// A node the request names beside its location, or nil.
+fn node(request: &Value, key: &str) -> Result<Node, String> {
+    crate::classic_sources::with_sources(|sources| sources.resolve(&request[key]))
+}
+
+/// Symbol flags the facade translated to the port's bits.
+fn symbol_flags(request: &Value) -> Result<SymbolFlags, String> {
+    number(request, "meaning").map(SymbolFlags)
 }
 
 fn signature_kind(request: &Value) -> Result<SignatureKind, String> {

@@ -114,9 +114,11 @@ export function prepareRun(module, options) {
         diagnosticsJson = false,
         caseInsensitive = false,
         tty = false,
+        holdHostExceptions = false,
     } = options;
     let memory;
     let staged;
+    let hostException;
     let stderrText = "";
     const u8 = () => new Uint8Array(memory.buffer);
     const dv = () => new DataView(memory.buffer);
@@ -217,7 +219,13 @@ export function prepareRun(module, options) {
     imports.ts_host.fs = (op, ptr, len) => {
         ptr >>>= 0;
         len >>>= 0;
-        const result = fsCall(fs, op, u8().slice(ptr, ptr + len));
+        let result;
+        try { result = fsCall(fs, op, u8().slice(ptr, ptr + len)); }
+        catch (error) {
+            if (!holdHostExceptions) throw error;
+            hostException ??= { error };
+            result = { error: "host callback failed" };
+        }
         if (result === undefined) return -1;
         if (result.error !== undefined) {
             staged = encoder.encode(result.error);
@@ -245,6 +253,12 @@ export function prepareRun(module, options) {
             memory = undefined;
         },
         stderrText: () => stderrText,
+        /** The first exception a host callback threw since the last call, held by `holdHostExceptions`. */
+        takeHostException() {
+            const held = hostException;
+            hostException = undefined;
+            return held;
+        },
         /** Writes the request into `instance` and returns its `ts_run`. */
         start(instance) {
             exports = instance.exports;

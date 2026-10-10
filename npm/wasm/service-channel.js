@@ -6,7 +6,7 @@ const decoder = new TextDecoder();
 
 /** Internal synchronous transport for the classic TypeScript facade. */
 export function createServiceChannel(module, options) {
-    const run = prepareRun(module, options);
+    const run = prepareRun(module, { ...options, holdHostExceptions: true });
     let exports = run.attach(new WebAssembly.Instance(module, run.imports));
     let busy = false;
     let failure;
@@ -29,6 +29,11 @@ export function createServiceChannel(module, options) {
             failure = Object.assign(error, { stderr: run.stderrText() });
             throw failure;
         } finally { busy = false; }
+        const held = run.takeHostException();
+        if (held) {
+            if (request.action !== "invalidate") call({ action: "invalidate" });
+            throw held.error;
+        }
         if (response.error) throw Object.assign(new Error(response.error.message), {
             code: response.error.code, data: response.error.data,
         });

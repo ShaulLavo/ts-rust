@@ -8,7 +8,7 @@ export function fixture() {
     let roots = ["/a.ts"];
     let settings = { strict: true };
     let failSnapshot = false;
-    let projectVersion = "1";
+    let projectVersion;
     const host = {
         getCompilationSettings: () => settings,
         getProjectVersion: () => projectVersion,

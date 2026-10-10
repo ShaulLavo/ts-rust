@@ -29,19 +29,19 @@ use ts_goport::frontend::vfs::{Fs, OsOverride, install_os_override};
 use ts_goport::gostd::context;
 use ts_goport::scanner_util::go_string_from_utf8;
 
-pub mod host;
 #[cfg(target_family = "wasm")]
-mod editor_host;
+mod classic_checker;
 #[cfg(target_family = "wasm")]
 mod classic_graph;
 #[cfg(target_family = "wasm")]
-mod classic_checker;
+mod classic_metadata;
 #[cfg(target_family = "wasm")]
 mod classic_sources;
 #[cfg(target_family = "wasm")]
 mod classic_strings;
 #[cfg(target_family = "wasm")]
-mod classic_metadata;
+mod editor_host;
+pub mod host;
 #[cfg(target_family = "wasm")]
 mod language_service;
 

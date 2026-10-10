@@ -40,6 +40,17 @@ pub enum Op {
     SourceMetadata = 8,
 }
 
+thread_local! {
+    static READ_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a read operation reported an explicit host error since the last call.
+/// Such an error means a host callback failed, not that the file is missing.
+#[must_use]
+pub fn take_read_failure() -> bool {
+    READ_FAILED.with(|failed| failed.replace(false))
+}
+
 /// Runs `op` on `request` in the host.
 ///
 /// # Errors
@@ -64,7 +75,15 @@ pub fn call(op: Op, request: &[u8]) -> Result<Vec<u8>, String> {
     };
     match status {
         -1 => Err(String::new()),
-        ..-1 => Err(String::from_utf8_lossy(&take(-2 - status)).into_owned()),
+        ..-1 => {
+            if matches!(
+                op,
+                Op::Read | Op::Stat | Op::ReadDir | Op::Realpath | Op::SourceMetadata
+            ) {
+                READ_FAILED.with(|failed| failed.set(true));
+            }
+            Err(String::from_utf8_lossy(&take(-2 - status)).into_owned())
+        }
         _ => Ok(take(status)),
     }
 }

@@ -15,7 +15,12 @@ pub fn from_any(value: LspAny) -> Value {
         LspAny::Number(value) => json!(value),
         LspAny::String(value) => string_value(&value),
         LspAny::Array(values) => Value::Array(values.into_iter().map(from_any).collect()),
-        LspAny::Object(values) => Value::Object(values.into_iter().map(|(key, value)| (key, from_any(value))).collect()),
+        LspAny::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, from_any(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -30,7 +35,9 @@ pub fn string_value(value: &str) -> Value {
         offset += size;
         match unit {
             GoUnit::Char(character) => units.extend_from_slice(character.encode_utf16(&mut [0; 2])),
-            GoUnit::Surrogate(point) => units.push(u16::try_from(point).expect("GoUnit surrogate must fit in a UTF-16 code unit")),
+            GoUnit::Surrogate(point) => units.push(
+                u16::try_from(point).expect("GoUnit surrogate must fit in a UTF-16 code unit"),
+            ),
             GoUnit::InvalidByte(_) => units.push(0xfffd),
         }
     }

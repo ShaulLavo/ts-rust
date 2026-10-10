@@ -51,10 +51,11 @@ impl SourceMetadata {
             return Ok(Self::default());
         }
         let bytes = ts_goport::scanner_util::go_string_bytes(path);
-        let Ok(data) = crate::host::call(crate::host::Op::SourceMetadata, &bytes) else {
-            return Ok(Self::default());
-        };
-        serde_json::from_slice(&data).map_err(|error| error.to_string())
+        match crate::host::call(crate::host::Op::SourceMetadata, &bytes) {
+            Ok(data) => serde_json::from_slice(&data).map_err(|error| error.to_string()),
+            Err(error) if error.is_empty() => Ok(Self::default()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -65,8 +66,14 @@ pub struct ParsePools {
 
 impl ParsePools {
     pub fn get(&mut self, target: i32, snapshot: u32) -> Rc<ParseCache> {
-        self.caches.entry((target, snapshot)).or_insert_with(||
-            project::new_parse_cache(project::RefCountCacheOptions { disable_deletion: true })).clone()
+        self.caches
+            .entry((target, snapshot))
+            .or_insert_with(|| {
+                project::new_parse_cache(project::RefCountCacheOptions {
+                    disable_deletion: false,
+                })
+            })
+            .clone()
     }
 
     pub fn prune(&mut self) {

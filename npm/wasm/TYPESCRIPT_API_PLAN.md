@@ -90,9 +90,26 @@ It refreshes roots and configuration through an internal compiler-argument trans
 classic compiler-option translation and public method facade remain to be implemented. The shared
 WASI bridge lives in `runtime.js`; the existing asynchronous compiler and editor entries use it too.
 
+Synchronization uses the decisions of TypeScript 6.0.3's `synchronizeHostDataWorker` and
+`isProgramUptoDate`. A truthy, unchanged `getProjectVersion()` returns before any other host
+callback unless `hasChangedAutomaticTypeDirectiveNames()` is true. Otherwise the bridge rebuilds
+when options, roots or `getTypeRootsVersion()` change, a loaded file's script version or kind
+changes, `hasInvalidatedResolutions(path)` is true, `hasChangedAutomaticTypeDirectiveNames()` is
+true, or a file the last build could not load now exists. A rebuild reads every loaded file's snapshot again; an
+undefined snapshot makes the file missing, and an unchanged version keeps its earlier text and
+parse. Non-root files exist when `fileExists` says so, and a host without `directoryExists` has
+every directory. A host exception inside a build reaches the caller, and the next call rebuilds.
+
+Known deviations: callback order and counts follow the Rust module resolver, not the reference.
+A root with a snapshot exists even when `fileExists` denies it, so an import of such a root
+resolves. A rebuild resolves every import again, while the reference reuses resolutions of
+unchanged files. A `/// <reference path>` target that is created later with an unchanged
+referencing file stays missing: the Rust loader rejects it before loading, so it never enters
+the program's missing files, which the reference checks again. After a host exception the next call retries even when the project version is
+unchanged, where the reference keeps its earlier program.
+
 The private unit checks synchronous returns, dependency edits, unchanged snapshot reuse, option
-and root changes, newly created dependencies after a project-version change, isolation, disposal
-and callback failures. These checks operate on private LSP results and retained host snapshots.
+and root changes, the project-version fast path, isolation, disposal and callback failures. These checks operate on private LSP results and retained host snapshots.
 They do not establish TypeScript result objects, `Diagnostic.file`, or `getProgram` compatibility.
 
 With Rust 1.93's size profile and no Binaryen optimization, the module is 7,376,814 bytes. The basic
@@ -116,3 +133,32 @@ tests and is not a claim of runtime equivalence.
 Pass the reference package's `lib/typescript.js` as a second argument for a positive control.
 The reference passes its own declarations. This checks that a failed replacement result comes
 from the replacement contract rather than a broken declaration-check harness.
+
+## Factory architecture
+
+The public factory runs the pinned classic `createLanguageService` dispatch from
+`src/services/services.ts`, bundled with explicit source provenance. Its compiler entry points
+are replaced: `createProgram` builds a Rust program, `createLanguageServiceSourceFile` and
+`updateLanguageServiceSourceFile` decode Rust parses, and `getTypeChecker` returns the
+Rust-backed checker. The classic parser, binder, checker and emitter stay guarded and throw if
+reached. Each classic service algorithm then works exactly as far as the Rust-backed program,
+source-file, symbol, type and signature objects satisfy its dependencies. A dependency that
+cannot be bridged moves its algorithm into Rust.
+
+A `DocumentRegistry` owns one WASM instance, and every service created with that registry lives
+in it. A shared registry therefore shares Rust parses, so `SourceFile` and node identity hold
+across services. The runtime currently allows one service per instance (`Service::new` rejects a
+second OS override), so the host override must become per-service state first.
+
+Remaining units, in order. Each ends with its narrow checks and then the injected upstream run
+(`run-classic-candidate.cjs`: the reference passes 6,322 fourslash and 1,531 services tests):
+
+1. Per-service host state in one instance; registry-owned instances; public `createDocumentRegistry`.
+2. Classic dispatch bundle with guarded compiler entries and the Rust `createProgram` bridge.
+3. Classic `Program` members the dispatch reads (`getSourceFileByPath`, `getMissingFilePaths`,
+   resolved modules and references, `structureIsReused`, emit).
+4. `TypeChecker` members and symbol/type internals each service family reads, by family.
+5. `getEmitOutput` through Rust emit, including custom transformers; cancellation tokens;
+   host module and type-reference resolution; project references.
+6. Node 22, Chromium and WebKit main-thread and worker runs; before/after timing and reads.
+

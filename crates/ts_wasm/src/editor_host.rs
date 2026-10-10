@@ -88,8 +88,12 @@ impl CompilerHost for EditorHost {
         let cache = self.pools.borrow_mut().get(self.target, metadata.snapshot);
         let parsed = cache.acquire(key.clone(), file);
         let source = parsed.file.clone();
-        self.metadata.borrow_mut().insert(options.file_name.clone(), metadata);
-        self.acquired.borrow_mut().insert(key, ParsedLease { cache, parsed });
+        self.metadata
+            .borrow_mut()
+            .insert(options.file_name.clone(), metadata);
+        self.acquired
+            .borrow_mut()
+            .insert(key, ParsedLease { cache, parsed });
         Some(source)
     }
 

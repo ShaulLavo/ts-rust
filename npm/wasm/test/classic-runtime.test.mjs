@@ -32,6 +32,13 @@ test("private classic host bridge reads snapshots and synchronizes versions with
         assert.equal(oldSnapshot.getText(0, oldSnapshot.getLength()), "export const value = 1;");
         project.text.set("/b.ts", "export const value = 1;");
         project.setProjectVersion("2");
+        assert.ok(diagnostics(service).items.some(item => item.code === 2322), "an unchanged script version keeps its snapshot, as in TypeScript 6.0.3");
+        assert.equal(project.reads.get("/b.ts"), reads + 1);
+        project.text.set("/b.ts", "export const value = 3;");
+        assert.ok(diagnostics(service).items.some(item => item.code === 2322), "an unchanged project version skips host polling");
+        project.versions.set("/b.ts", "3");
+        assert.ok(diagnostics(service).items.some(item => item.code === 2322), "an unchanged project version skips script versions");
+        project.setProjectVersion("3");
         assert.ok(!diagnostics(service).items.some(item => item.code === 2322));
         assert.equal(service.dispose(), undefined);
         assert.equal(service.dispose(), undefined);
@@ -63,10 +70,11 @@ test("private classic host bridge refreshes options and roots and preserves snap
         assert.ok(diagnostics(service).items.some(item => item.code === 2307));
         project.text.set("/b.ts", "export const value = 1;");
         project.setProjectVersion("4");
-        assert.ok(!diagnostics(service).items.some(item => item.code === 2307));
+        assert.ok(diagnostics(service).items.some(item => item.code === 2307), "an unchanged importer keeps its failed resolution, as in TypeScript 6.0.3");
         const unicode = 'const emoji = "🌊"; export const result: number = "wrong";';
         project.text.set("/a.ts", unicode);
         project.versions.set("/a.ts", "4");
+        project.setProjectVersion("5");
         const error = diagnostics(service).items.find(item => item.code === 2322);
         assert.equal(error.range.start.character, unicode.indexOf("result"));
     } finally { service.dispose(); }

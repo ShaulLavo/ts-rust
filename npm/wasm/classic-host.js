@@ -10,6 +10,10 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
     const files = new Map();
     const memory = memoryFileSystem(files);
     let argsKey;
+    let currentArgs;
+    let lastTypeRootsVersion = 0;
+    let previousSnapshots = new Map();
+    let absentFiles = new Set();
     let projectVersion;
     let disposed = false;
     let synchronizing = false;
@@ -20,40 +24,50 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
     const sources = new Set();
     let filesystemFacts = { stats: new Map(), directories: new Map(), realpaths: new Map() };
 
-    function capture(path, previous) {
+    function metadata(path) {
         const version = host.getScriptVersion(path);
         const scriptKind = host.getScriptKind?.(path) ?? ScriptKind.Unknown;
         if (typeof version !== "string" || typeof ScriptKind[scriptKind] !== "string") throw new TypeError("script metadata must have a version string and a known script kind");
-        if (previous && previous.version === version && previous.scriptKind === scriptKind) return previous;
+        return { version, scriptKind };
+    }
+
+    function unchanged(record, current) {
+        return record.version === current.version && record.scriptKind === current.scriptKind;
+    }
+
+    /** TypeScript reads every loaded file's snapshot on each build and keeps the old parse for an unchanged version. */
+    function capture(path) {
+        const current = metadata(path);
         const snapshot = host.getScriptSnapshot(path);
-        const text = snapshot === undefined ? host.readFile(path) : snapshot.getText(0, snapshot.getLength());
+        if (snapshot === undefined) return { ...current, text: undefined };
+        const previous = previousSnapshots.get(path);
+        if (previous?.text !== undefined && unchanged(previous, current)) return previous;
         if (nextSnapshot === 0xffffffff) throw new RangeError("source snapshot identity exhausted");
-        return { version, snapshot, text, scriptKind, identity: ++nextSnapshot };
+        return { ...current, snapshot, text: snapshot.getText(0, snapshot.getLength()), identity: ++nextSnapshot };
+    }
+
+    function record(path) {
+        let found = snapshots.get(path);
+        if (!found) {
+            found = capture(path);
+            snapshots.set(path, found);
+            if (found.text !== undefined) files.set(path, found.text);
+        }
+        return found;
     }
 
     function readFile(path) {
         if (selectedGeneration) return selectedGeneration.files.get(path);
-        let record = snapshots.get(path);
-        if (!record) {
-            record = capture(path);
-            snapshots.set(path, record);
-            if (record.text !== undefined) files.set(path, record.text);
-        }
-        return record.text;
+        return record(path).text;
     }
 
     const fs = {
         ...memory,
         readFile,
         sourceMetadata(path) {
-            let record = selectedGeneration ? selectedGeneration.snapshots.get(path) : snapshots.get(path);
-            if (!record && !selectedGeneration) {
-                record = capture(path);
-                snapshots.set(path, record);
-                if (record.text !== undefined) files.set(path, record.text);
-            }
-            if (!record) return undefined;
-            return { snapshot: record.identity, version: Array.from({ length: record.version.length }, (_, index) => record.version.charCodeAt(index)), scriptKind: ScriptKind[record.scriptKind] };
+            const found = selectedGeneration ? selectedGeneration.snapshots.get(path) : record(path);
+            if (found?.text === undefined) return undefined;
+            return { snapshot: found.identity, version: Array.from({ length: found.version.length }, (_, index) => found.version.charCodeAt(index)), scriptKind: ScriptKind[found.scriptKind] };
         },
         stat(path) {
             if (selectedGeneration) return selectedGeneration.facts.stats.get(path) ?? selectedGeneration.memory.stat(path);
@@ -78,18 +92,23 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
     function stat(path) {
             const known = memory.stat(path);
             if (known?.isDirectory) return known;
-            if (known) return known;
-            if (host.directoryExists?.(path)) return { isDirectory: true, size: 0 };
-            if (!host.fileExists(path)) return undefined;
-            const text = readFile(path);
-            return text === undefined ? undefined : { isDirectory: false, size: encodeWtf8(text).length };
+            if (roots.has(path) || host.fileExists(path)) {
+                const text = readFile(path);
+                return text === undefined ? undefined : { isDirectory: false, size: encodeWtf8(text).length };
+            }
+            absentFiles.add(path);
+            return directoryProbablyExists(path) ? { isDirectory: true, size: 0 } : undefined;
+    }
+
+    function directoryProbablyExists(path) {
+            return !host.directoryExists || host.directoryExists(path);
     }
 
     function readDirectory(path) {
             const known = memory.readDirectory(path);
             const files = host.readDirectory?.(path);
             const directories = host.getDirectories?.(path);
-            if (!known && !files && !directories && !host.directoryExists?.(path)) return undefined;
+            if (!known && !files && !directories && !directoryProbablyExists(path)) return undefined;
             const entries = new Map((known ?? []).map(entry => [entry.name, entry]));
             const prefix = path.endsWith("/") ? path : `${path}/`;
             for (const file of files ?? []) {
@@ -114,37 +133,39 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
     }
 
     function collectChanges() {
+        if (host.getProjectVersion) {
+            const hostProjectVersion = host.getProjectVersion();
+            if (hostProjectVersion && hostProjectVersion === projectVersion && !host.hasChangedAutomaticTypeDirectiveNames?.()) return currentArgs;
+            if (hostProjectVersion) projectVersion = hostProjectVersion;
+        }
+        const typeRootsVersion = host.getTypeRootsVersion?.() ?? 0;
+        let changed = typeRootsVersion !== lastTypeRootsVersion;
+        lastTypeRootsVersion = typeRootsVersion;
         const names = host.getScriptFileNames();
         const args = argumentsForSettings(host.getCompilationSettings(), names);
         const nextKey = JSON.stringify(args);
-        const nextProjectVersion = host.getProjectVersion?.();
-        const projectChanged = nextProjectVersion !== projectVersion;
-        const nextRoots = new Set(names);
-        const nextSnapshots = new Map();
-        let changed = nextKey !== argsKey || projectChanged;
-        for (const path of snapshots.keys()) {
-            if (roots.has(path) && !nextRoots.has(path)) continue;
-            const previous = snapshots.get(path);
-            const record = capture(path, previous);
-            nextSnapshots.set(path, record);
-            if (record !== previous) changed = true;
+        changed ||= nextKey !== argsKey || names.some(path => !snapshots.has(path)) || host.hasChangedAutomaticTypeDirectiveNames?.() === true;
+        if (!changed && absentFiles.size) {
+            for (const path of channel.call({ action: "missingFiles", paths: Array.from(absentFiles) })) {
+                if (changed) break;
+                changed = host.fileExists(path);
+            }
         }
-        for (const path of names) {
-            if (nextSnapshots.has(path)) continue;
-            nextSnapshots.set(path, capture(path));
-            changed = true;
+        for (const [path, found] of snapshots) {
+            if (changed) break;
+            if (found.text === undefined) changed = host.fileExists(path);
+            else changed = !unchanged(found, metadata(path)) || host.hasInvalidatedResolutions?.(path) === true;
         }
-        if (!changed) return args;
+        if (!changed) return currentArgs = args;
         channel?.call({ action: "configure", args });
-        roots = nextRoots;
-        snapshots = nextSnapshots;
+        roots = new Set(names);
+        previousSnapshots = snapshots;
+        snapshots = new Map();
+        absentFiles = new Set();
         argsKey = nextKey;
-        projectVersion = nextProjectVersion;
+        currentArgs = args;
         files.clear();
         filesystemFacts = { stats: new Map(), directories: new Map(), realpaths: new Map() };
-        for (const [path, record] of snapshots) {
-            if (record.text !== undefined) files.set(path, record.text);
-        }
         return args;
     }
 
@@ -206,6 +227,8 @@ export function createHostServiceChannel(module, host, argumentsForSettings) {
             }
             disposed = true;
             snapshots.clear();
+            previousSnapshots.clear();
+            absentFiles.clear();
             files.clear();
             closeUnreferencedChannel();
         },

@@ -24,6 +24,9 @@ const releases = new FinalizationRegistry(({ leaseCache, programCache, release, 
     release();
 });
 
+/** The graph call and diagnostic projection of each program, kept off the public object. */
+export const programInternals = new WeakMap();
+
 /** Private retained program bridge. The classic facade owns host synchronization. */
 export function createProgramGraph(channel, handle, settings = {}) {
     let cache = programs.get(channel);
@@ -243,6 +246,7 @@ export function createProgramGraph(channel, handle, settings = {}) {
         getConfigFileParsingDiagnostics: () => diagnostics("getConfigFileParsingDiagnostics"),
         getDeclarationDiagnostics: file => diagnostics("getDeclarationDiagnostics", file),
     };
+    programInternals.set(program, { graph, diagnostic });
     const programReference = new WeakRef(program);
     cache.set(handle, programReference);
     return program;

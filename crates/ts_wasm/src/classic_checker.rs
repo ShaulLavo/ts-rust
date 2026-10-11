@@ -10,8 +10,8 @@ use ts_goport::binder::go_symbol_name;
 use ts_goport::checker::{Checker, InternalNodeBuilderFlags, LiteralValue, NodeBuilderFlags};
 use ts_goport::core::{IndexInfoId, Node, SignatureId, SymbolId, TypeId, TypePredicateId};
 use ts_goport::flags::{
-    CheckFlags, ContextFlags, SignatureKind, SymbolFlags, TokenFlags, TypeFlags, TypePredicateKind,
-    UnionReduction,
+    CheckFlags, ContextFlags, SignatureFlags, SignatureKind, SymbolFlags, TokenFlags, TypeFlags,
+    TypePredicateKind, UnionReduction,
 };
 use ts_goport::frontend::compiler::NewProgram;
 use ts_goport::gostd::Context;
@@ -345,12 +345,148 @@ impl ClassicChecker {
                     self.symbol_ref(property)
                 ]))
             }
-            "getMemberOverrideModifierStatus" => {
-                let member = node(request, "member")?;
-                Ok(json!(
+            // The member's syntax arrives as facts: code fixes pass factory nodes the compiler
+            // never parsed. The rest is Go `GetMemberOverrideModifierStatus`.
+            // Classic `isLibType` is Go `IsLibTypeForHoverVerbosity`.
+            "isLibType" => Ok(json!(checker.is_lib_type_for_hover_verbosity(t))),
+            // Classic `getExactOptionalProperties`.
+            "getExactOptionalProperties" => {
+                let properties = checker.get_properties_of_type(t).to_vec();
+                let mut result = Vec::new();
+                for property in properties {
+                    let property_type = checker.get_type_of_symbol(property);
+                    if checker.contains_missing_type(property_type) {
+                        result.push(self.symbol_ref(property));
+                    }
+                }
+                Ok(Value::Array(result))
+            }
+            // Classic `getIndexInfosAtLocation`: the index infos of a property access's object
+            // type that apply to the accessed name.
+            "getIndexInfosAtLocation" => {
+                let parent = location.parent();
+                if !(ts_goport::ast::is_identifier(location)
+                    && ts_goport::ast::is_property_access_expression(parent)
+                    && parent.name() == location)
+                {
+                    return Ok(Value::Null);
+                }
+                let key_type = checker.get_literal_type_from_property_name(location);
+                let object_type = checker.get_type_of_expression(parent.expression());
+                let object_types = if checker.ty(object_type).flags.intersects(TypeFlags::UNION) {
+                    checker.ty(object_type).types().to_vec()
+                } else {
+                    vec![object_type]
+                };
+                let mut result = Vec::new();
+                for object in object_types {
+                    for info in checker.get_index_infos_of_type(object).to_vec() {
+                        let info_key = checker.index_info(info).key_type;
+                        if checker.is_applicable_index_type(key_type, info_key) {
+                            result.push(self.index_info(&checker, info));
+                        }
+                    }
+                }
+                Ok(Value::Array(result))
+            }
+            // Classic's synthetic checker objects, which code fixes build: a transient symbol
+            // with the type its `links.type` held when it reached the checker, and anonymous
+            // types, signatures and index infos over issued objects.
+            "createSymbol" => {
+                let flags = SymbolFlags(number(request, "flags")?);
+                let name = request["name"]
+                    .as_str()
+                    .ok_or("symbol name must be a string")?;
+                let created = checker.new_symbol(flags, name);
+                checker.sym_mut(created).check_flags = CheckFlags(number(request, "checkFlags")?);
+                if t.is_some() {
+                    let checker = &mut *checker;
                     checker
-                        .get_member_override_modifier_status_exported(location, member, symbol)
-                        .0
+                        .value_symbol_links
+                        .get_by_id(&checker.symbols, created)
+                        .resolved_type = t;
+                }
+                Ok(self.symbol_ref(created))
+            }
+            "createAnonymousType" => {
+                let members: Vec<SymbolId> = Self::ids(request, "members", &self.symbols)?
+                    .into_iter()
+                    .map(SymbolId)
+                    .collect();
+                let members = checker.create_symbol_table(&members);
+                let call: Vec<SignatureId> =
+                    Self::ids(request, "callSignatures", &self.signatures)?
+                        .into_iter()
+                        .map(SignatureId)
+                        .collect();
+                let construct: Vec<SignatureId> =
+                    Self::ids(request, "constructSignatures", &self.signatures)?
+                        .into_iter()
+                        .map(SignatureId)
+                        .collect();
+                let infos = request["indexInfos"]
+                    .as_array()
+                    .ok_or("indexInfos must be an array")?
+                    .iter()
+                    .map(|id| {
+                        id.as_u64()
+                            .and_then(|id| u32::try_from(id).ok())
+                            .map(IndexInfoId)
+                            .ok_or_else(|| "indexInfos must hold index infos".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let created =
+                    checker.new_anonymous_type(symbol, members, &call, &construct, &infos);
+                Ok(self.type_ref(created))
+            }
+            "createSignature" => {
+                let type_parameters: Vec<TypeId> =
+                    Self::ids(request, "typeParameters", &self.types)?
+                        .into_iter()
+                        .map(TypeId)
+                        .collect();
+                let parameters: Vec<SymbolId> = Self::ids(request, "parameters", &self.symbols)?
+                    .into_iter()
+                    .map(SymbolId)
+                    .collect();
+                let this_parameter =
+                    SymbolId(Self::handle(request, "thisParameter", &self.symbols)?);
+                let min_argument_count = i32::try_from(number(request, "minArgumentCount")?)
+                    .map_err(|error| error.to_string())?;
+                let created = checker.new_signature(
+                    SignatureFlags(number(request, "signatureFlags")?),
+                    location,
+                    &type_parameters,
+                    this_parameter,
+                    &parameters,
+                    t,
+                    TypePredicateId(number(request, "typePredicate")?),
+                    min_argument_count,
+                );
+                Ok(self.signature_ref(created))
+            }
+            "createIndexInfo" => {
+                let value_type = TypeId(Self::handle(request, "valueType", &self.types)?);
+                let readonly = request["isReadonly"].as_bool().unwrap_or(false);
+                let created = checker.new_index_info(t, value_type, readonly, location, &[]);
+                Ok(self.index_info(&checker, created))
+            }
+            "getMemberOverrideModifierStatus" => {
+                let member = &request["member"];
+                let fact = |name: &str| member[name].as_bool().unwrap_or(false);
+                if !fact("hasName") || symbol.is_nil() {
+                    return Ok(json!(0));
+                }
+                Ok(json!(
+                    member_override_modifier_status(
+                        &mut checker,
+                        location,
+                        symbol,
+                        fact("hasOverride"),
+                        fact("isAbstract"),
+                        fact("isStatic"),
+                    )
+                    .0
                 ))
             }
             "resolveExternalModuleName" => Ok(self
@@ -751,6 +887,27 @@ impl ClassicChecker {
             .collect()
     }
 
+    /// A list of handles this checker issued.
+    fn ids(request: &Value, key: &str, issued: &RefCell<HashSet<u32>>) -> Result<Vec<u32>, String> {
+        let values = request[key]
+            .as_array()
+            .ok_or_else(|| format!("{key} must be an array"))?;
+        values
+            .iter()
+            .map(|value| {
+                let id = value
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .ok_or_else(|| format!("{key} must hold handles"))?;
+                if issued.borrow().contains(&id) {
+                    Ok(id)
+                } else {
+                    Err(format!("{key} handle was not issued by this checker"))
+                }
+            })
+            .collect()
+    }
+
     fn handle(request: &Value, key: &str, issued: &RefCell<HashSet<u32>>) -> Result<u32, String> {
         let id = number(request, key)?;
         if id == 0 || issued.borrow().contains(&id) {
@@ -1038,6 +1195,47 @@ fn classic_type_at_location(checker: &mut Checker, node: Node) -> TypeId {
         return classic_type_from_type_node(checker, node);
     }
     checker.get_type_at_location(node)
+}
+
+/// Go `GetMemberOverrideModifierStatus` (checker.go) after its member reads.
+fn member_override_modifier_status(
+    checker: &mut Checker,
+    node: Node,
+    member_symbol: SymbolId,
+    has_override: bool,
+    is_abstract: bool,
+    is_static: bool,
+) -> ts_goport::flags::MemberOverrideStatus {
+    let class_symbol = checker.get_symbol_of_declaration(node);
+    if class_symbol.is_nil() {
+        return ts_goport::flags::MemberOverrideStatus::NONE;
+    }
+    let t = checker.get_declared_type_of_symbol(class_symbol);
+    let type_with_this = checker.get_type_with_this_argument(t, TypeId::NIL, false);
+    let static_type = checker.get_type_of_symbol(class_symbol);
+    let mut base_with_this = TypeId::NIL;
+    if ts_goport::ast::get_class_extends_heritage_element(node).is_some() {
+        let base_types = checker.get_base_types(t);
+        if !base_types.is_empty() {
+            let this_type = checker.ty(t).as_interface_type().this_type;
+            base_with_this = checker.get_type_with_this_argument(base_types[0], this_type, false);
+        }
+    }
+    let base_static_type = checker.get_base_constructor_type_of_class(t);
+    checker.check_member_for_override_modifier_worker(
+        node,
+        static_type,
+        base_static_type,
+        base_with_this,
+        t,
+        type_with_this,
+        has_override,
+        is_abstract,
+        is_static,
+        false, /*memberIsParameterProperty*/
+        member_symbol,
+        Node::NIL, /*errorNode*/
+    )
 }
 
 fn node_ref(node: Node) -> Value {

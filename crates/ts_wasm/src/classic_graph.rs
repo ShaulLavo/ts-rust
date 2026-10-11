@@ -81,6 +81,7 @@ impl Graphs {
                 }
                 Ok(Value::Null)
             }
+            "emit" => emit(program, request),
             "getRootFileNames" => Ok(json!(program.command_line().file_names())),
             "getSourceFileNames" => Ok(json!(
                 program
@@ -336,6 +337,57 @@ fn resolution_mode(program: &NewProgram, method: &str, request: &Value) -> Resul
     } else {
         json!(mode.0)
     })
+}
+
+/// Classic `Program.emit` on the Rust emitter: the writes in order, each with the source file it
+/// came from, for the caller's `writeFile`, and the emit result.
+fn emit(program: &NewProgram, request: &Value) -> Result<Value, String> {
+    use std::sync::{Arc, Mutex, PoisonError};
+    use ts_goport::emitter::emitter::EmitOnly;
+    use ts_goport::emitter::program_emit::{self, EmitOptions, WriteFile, WriteFileData};
+
+    let target_source_files = match request["fileName"].as_str() {
+        Some(name) => Some(vec![
+            program
+                .get_source_file(name)
+                .ok_or("file is not part of the program")?
+                .root,
+        ]),
+        None => None,
+    };
+    let writes: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let pending = Arc::clone(&writes);
+    let write_file: WriteFile = Arc::new(
+        move |file_name: &str, text: &str, data: &mut WriteFileData| {
+            let source = if data.source_file.is_some() {
+                json!(ts_goport::ast::source_file_info(data.source_file).file_name)
+            } else {
+                Value::Null
+            };
+            pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(json!([file_name, text, source]));
+            Ok(())
+        },
+    );
+    let result = program_emit::emit(EmitOptions {
+        target_source_files,
+        emit_only: if request["emitOnlyDts"].as_bool() == Some(true) {
+            EmitOnly::Dts
+        } else {
+            EmitOnly::All
+        },
+        force_emit: request["forceDtsEmit"].as_bool() == Some(true),
+        write_file: Some(write_file),
+    });
+    let writes = std::mem::take(&mut *writes.lock().unwrap_or_else(PoisonError::into_inner));
+    Ok(json!({
+        "emitSkipped": result.emit_skipped,
+        "diagnostics": result.diagnostics.iter().map(diagnostic).collect::<Vec<_>>(),
+        "emittedFiles": result.emitted_files,
+        "writes": writes,
+    }))
 }
 
 fn diagnostics(

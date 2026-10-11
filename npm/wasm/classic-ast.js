@@ -257,6 +257,9 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         const keys = () => Reflect.isExtensible(overrides) ? Array.from(new Set(fields.filter(field => !deleted.has(field)).concat(Reflect.ownKeys(overrides)))) : Reflect.ownKeys(overrides);
         const get = property => {
             if (Object.hasOwn(overrides, property)) return Reflect.get(overrides, property, node);
+            // Builder output has positions only once textChanges assigns them; classic's own node
+            // methods then scan its tokens (`createChildren`) from those positions.
+            if (synthetic && syntheticChildMethods.has(property)) return classicNodePrototype(translateKind(valueNode.kind))[property];
             if ((property === "symbol" || property === "localSymbol") && !synthetic && !deleted.has(property)) return nodeSymbol(node, property);
             if (deleted.has(property) || !allowed.has(property)) return Reflect.get(overrides, property, node);
             const value = read(valueNode, overrides, property);
@@ -489,6 +492,15 @@ function parenthesizeChildren(node, overrides) {
         const result = rules[rule](child);
         if (result !== child) overrides[property] = result;
     }
+}
+
+const syntheticChildMethods = new Set(["getChildren", "getChildCount", "getChildAt", "getFirstToken", "getLastToken", "assertHasRealPosition"]);
+function classicNodePrototype(kind) {
+    const allocator = classicNamespaceOrUndefined().objectAllocator;
+    if (kind >= SyntaxKind.FirstNode) return allocator.getNodeConstructor().prototype;
+    if (kind === SyntaxKind.Identifier) return allocator.getIdentifierConstructor().prototype;
+    if (kind === SyntaxKind.PrivateIdentifier) return allocator.getPrivateIdentifierConstructor().prototype;
+    return allocator.getTokenConstructor().prototype;
 }
 
 // Classic `TransformFlags.ContainsJsx`, the one transform flag services read (moving JSX

@@ -149,6 +149,50 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Synthetic checker objects and program emit (unit 4 sixth batch, unit 5 start)
+
+Injected run: **7,240 of 7,853** (fourslash 5,729, services 1,511), none lost against `r16`
+or any run since (`r19` to `r23` in `/work/tmp/tsrust-ls-probes/u3/`). No `ts_goport` source
+changed: each member below is bridge code over existing port checker functions.
+
+- `getSymbolOfExpando`: classic's algorithm over classic's syntax utilities and the binder's
+  symbols (`getMergedSymbol(decl.symbol)`).
+- `getMemberOverrideModifierStatus` takes the member's syntax as facts computed with classic's
+  utilities (effective modifiers for a parsed member, syntactic ones for a factory node), so
+  code-fix members that the compiler never parsed work; the rest is Go's function.
+- `createSymbol` returns a classic transient symbol that becomes a Rust transient symbol when it
+  first reaches the checker, with the `links.type` and `flags` it has then, and keeps its object
+  identity. `createSignature`, `createAnonymousType` and `createIndexInfo` build port objects
+  from issued handles.
+- `isLibType` (Go `IsLibTypeForHoverVerbosity`, the same rule), `getExactOptionalProperties`
+  and `getIndexInfosAtLocation` (classic's algorithms over port functions).
+- `typeToTypeNode` of an undefined type answers as classic's builder does.
+- Builder nodes with positions textChanges assigned answer `getChildren`, `getChildCount`,
+  `getChildAt`, `getFirstToken` and `getLastToken` with classic's own `NodeObject` methods
+  (`createChildren` scanning the printed text).
+- `program.emit` runs the Rust emitter for the target file or the program and replays its writes,
+  in order, through the caller's `writeFile` (or the compiler host's) with classic's arguments;
+  output names under a relative `outDir` or `declarationDir` keep classic's relative form.
+
+Deviations: a created symbol's type and flags are read once, when the checker first receives it;
+`writeFile` gets the one source file the port records per output, and `{ diagnostics: [] }` as
+its data; custom transformers are refused with an error (they transform classic syntax trees,
+which the Rust emitter never builds), so `getEmitOutput` with transformers fails; the
+cancellation token passed to `emit` is not polled.
+
+Classified, not changed (TypeScript-Go semantics): no `outFile` concatenation and no AMD
+output (12 emit cases); constructor functions get no `this`/`prototype` members, so
+`convertFunctionToEs6Class` finds nothing to convert (22 cases).
+
+Not done: classic's cancellation polls sit in the node builder and checker functions
+(`typeToTypeNodeWorker`, `checkSourceElement`); matching the counts the services cancellation
+unit asserts needs poll sites in `ts_goport` (5 cases). Hover verbosity needs the builder's
+verbosity level and `getEmitResolver().symbolToDeclarations` (11 cases).
+
+Next by failing count (`r23`): code fixes not found (29), assertion `true` (29), quick info
+text (28), range text (14), completions not found (13), node kind mismatches (13),
+`getClassifiableNames` (12), `getSymbolWalker` (11), `getEmitResolver` (11).
+
 ## Builder output, signatures and JSDoc nodes (unit 4, fifth batch)
 
 Injected run: **7,023 of 7,853** (fourslash 5,530, services 1,493), none lost against `r16` or

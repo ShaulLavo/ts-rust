@@ -97,22 +97,55 @@ export function createTypeChecker(lease, resolveNode) {
     }
 
     const typePredicates = new Map();
+    const typePredicateIds = new WeakMap();
     function typePredicate(value) {
         const key = String(value.$typePredicate);
         let predicate = typePredicates.get(key);
         if (predicate) return predicate;
         predicate = { kind: value.kind, parameterName: value.parameterName, parameterIndex: value.parameterIndex, type: decode(value.type) };
+        typePredicateIds.set(predicate, value.$typePredicate);
         typePredicates.set(key, predicate);
         return predicate;
     }
 
+    // Classic `createSymbol`: code fixes assign `links.type` (and adjust `flags`) after creating
+    // a symbol, so it becomes a Rust transient symbol when it first reaches the checker, with the
+    // type and flags it has then, and keeps its object identity.
+    const pendingSymbols = new WeakSet();
+    function createPendingSymbol(flags, escapedName, checkFlags) {
+        const pending = {
+            flags: flags | SymbolFlags.Transient, escapedName, links: { checkFlags: checkFlags ?? 0 }, declarations: undefined,
+            get name() { return symbolName(pending); },
+            getName: () => symbolName(pending),
+            getFlags: () => pending.flags,
+            getEscapedName: () => pending.escapedName,
+            getDeclarations: () => pending.declarations,
+            members: undefined, exports: undefined,
+        };
+        Object.assign(pending, symbolDocumentationMembers(pending));
+        pendingSymbols.add(pending);
+        return pending;
+    }
+    function materializeSymbol(pending) {
+        pendingSymbols.delete(pending);
+        const name = pending.escapedName.startsWith("___") ? pending.escapedName.slice(1) : pending.escapedName;
+        const id = lease.channel.graph(lease.handle, "createSymbol", {
+            flags: translateBits(pending.flags, SymbolFlags, nativeSymbolFlags), name, checkFlags: 0,
+            type: pending.links.type === undefined ? 0 : handle(pending.links.type, "type"),
+        }).$symbol;
+        symbols.set(String(id), pending);
+        objectHandles.set(pending, { id, kind: "symbol", origin: undefined });
+    }
+
     /** The checker's id of `object`, or undefined for an object it does not own. */
     function ownedHandle(object, kind) {
+        if (kind === "symbol" && pendingSymbols.has(object)) materializeSymbol(object);
         const reference = object && objectHandles.get(object);
         return reference?.kind === kind ? reference.id : undefined;
     }
 
     function handle(object, kind) {
+        if (kind === "symbol" && pendingSymbols.has(object)) materializeSymbol(object);
         const reference = objectHandles.get(object);
         if (!reference || reference.kind !== kind) throw new TypeError(`${kind} is not owned by this checker`);
         return reference.id;
@@ -278,6 +311,71 @@ export function createTypeChecker(lease, resolveNode) {
         if (tag?.kind !== SyntaxKind.JSDocParameterTag || node !== tag.tagName) return symbolAtLocation(nodeIn);
         return tag.name.kind === SyntaxKind.Identifier ? symbolAtLocation(tag.name) : undefined;
     };
+    checker.isLibType = type => query("isLibType", typeOf(type));
+    checker.getExactOptionalProperties = type => query("getExactOptionalProperties", typeOf(type));
+    checker.getIndexInfosAtLocation = nodeIn => {
+        const node = parseTree(nodeIn);
+        return node ? query("getIndexInfosAtLocation", { location: location(node) }) : undefined;
+    };
+    checker.createSymbol = (flags, escapedName, checkFlags) => createPendingSymbol(flags, escapedName, checkFlags);
+    checker.createSignature = (declaration, typeParameters, thisParameter, parameters, resolvedReturnType, typePredicate, minArgumentCount, flags) => {
+        const node = declaration && parseTree(declaration);
+        const predicate = typePredicate === undefined ? 0 : typePredicateIds.get(typePredicate);
+        if (predicate === undefined) throw new TypeError("type predicate is not owned by this checker");
+        return query("createSignature", {
+            location: node && location(node), typeParameters: (typeParameters ?? []).map(type => handle(type, "type")),
+            thisParameter: thisParameter ? handle(thisParameter, "symbol") : 0, parameters: parameters.map(parameter => handle(parameter, "symbol")),
+            type: resolvedReturnType ? handle(resolvedReturnType, "type") : 0, typePredicate: predicate, minArgumentCount,
+            signatureFlags: translateBits(flags, SignatureFlags, nativeSignatureFlags),
+        });
+    };
+    checker.createAnonymousType = (symbol, members, callSignatures, constructSignatures, indexInfos) => query("createAnonymousType", {
+        symbol: symbol ? handle(symbol, "symbol") : 0, members: Array.from(members.values(), member => handle(member, "symbol")),
+        callSignatures: callSignatures.map(signature => handle(signature, "signature")),
+        constructSignatures: constructSignatures.map(signature => handle(signature, "signature")),
+        indexInfos: indexInfos.map(info => {
+            const id = indexInfoIds.get(info);
+            if (id === undefined) throw new TypeError("index info is not owned by this checker");
+            return id;
+        }),
+    });
+    checker.createIndexInfo = (keyType, type, isReadonly, declaration) => {
+        const node = declaration && parseTree(declaration);
+        return query("createIndexInfo", { location: node && location(node), type: handle(keyType, "type"), valueType: handle(type, "type"), isReadonly });
+    };
+    // Classic `getSymbolOfExpando`, over classic's syntax utilities and the binder's symbols.
+    checker.getSymbolOfExpando = (node, allowDeclaration) => {
+        const ts = classicNamespace();
+        if (!node.parent) return undefined;
+        let name;
+        let decl;
+        if (ts.isVariableDeclaration(node.parent) && node.parent.initializer === node) {
+            if (!ts.isInJSFile(node) && !(ts.isVarConstLike(node.parent) && ts.isFunctionLikeDeclaration(node))) return undefined;
+            name = node.parent.name;
+            decl = node.parent;
+        } else if (ts.isBinaryExpression(node.parent)) {
+            const parent = node.parent;
+            const operator = parent.operatorToken.kind;
+            if (operator === SyntaxKind.EqualsToken && (allowDeclaration || parent.right === node)) {
+                name = parent.left;
+                decl = name;
+            } else if (operator === SyntaxKind.BarBarToken || operator === SyntaxKind.QuestionQuestionToken) {
+                if (ts.isVariableDeclaration(parent.parent) && parent.parent.initializer === parent) {
+                    name = parent.parent.name;
+                    decl = parent.parent;
+                } else if (ts.isBinaryExpression(parent.parent) && parent.parent.operatorToken.kind === SyntaxKind.EqualsToken && (allowDeclaration || parent.parent.right === parent)) {
+                    name = parent.parent.left;
+                    decl = name;
+                }
+                if (!name || !ts.isBindableStaticNameExpression(name) || !ts.isSameEntityName(name, parent.left)) return undefined;
+            }
+        } else if (allowDeclaration && ts.isFunctionDeclaration(node)) {
+            name = node.name;
+            decl = node;
+        }
+        if (!decl || !name || (!allowDeclaration && !ts.getExpandoInitializer(node, ts.isPrototypeAccess(name)))) return undefined;
+        return decl.symbol && checker.getMergedSymbol(decl.symbol);
+    };
     for (const method of ["getDeclaredTypeOfSymbol", "getTypeOfSymbol", "getAliasedSymbol", "getImmediateAliasedSymbol", "getMergedSymbol", "getRootSymbols", "getExportsOfModule", "getFullyQualifiedName"]) {
         checker[method] = object => query(method, { symbol: handle(object, "symbol"), origin: objectHandles.get(object)?.origin });
     }
@@ -423,8 +521,14 @@ export function createTypeChecker(lease, resolveNode) {
         if (parameter === undefined) throw new Error("Debug Failure. Cannot get symbols of a synthetic parameter that cannot be resolved to a parse-tree node.");
         return query("getSymbolsOfParameterPropertyDeclaration", { location: location(parameter), name: parameterName });
     };
-    checker.getMemberOverrideModifierStatus = (node, member, memberSymbol) => query("getMemberOverrideModifierStatus",
-        Object.assign(symbolOf(memberSymbol), { location: location(node), member: location(member) }));
+    // Classic reads only the member's syntax: effective modifiers for a parsed member, syntactic
+    // ones for a factory node (no parent).
+    checker.getMemberOverrideModifierStatus = (node, member, memberSymbol) => {
+        const ts = classicNamespace();
+        const facts = { hasName: !!member.name, hasOverride: member.parent ? ts.hasOverrideModifier(member) : ts.hasSyntacticModifier(member, ts.ModifierFlags.Override),
+            isAbstract: ts.hasAbstractModifier(member), isStatic: ts.isStatic(member) };
+        return query("getMemberOverrideModifierStatus", Object.assign(symbolOf(memberSymbol), { location: location(node), member: facts }));
+    };
     checker.resolveExternalModuleName = moduleSpecifierIn => {
         const moduleSpecifier = parseTree(moduleSpecifierIn, "isExpression");
         return moduleSpecifier && query("resolveExternalModuleName", { location: location(moduleSpecifier) });
@@ -447,7 +551,8 @@ export function createTypeChecker(lease, resolveNode) {
     }
     const typeParams = type => ({ type: handle(type, "type"), origin: objectHandles.get(type)?.origin });
     const symbolParams = (symbol, flags) => ({ symbol: handle(symbol, "symbol"), meaning: meaning(flags ?? 0) });
-    checker.typeToTypeNode = (type, enclosing, flags, internalFlags) => build("typeToTypeNode", typeParams(type), enclosing, flags, internalFlags)[0];
+    // An undefined type builds as classic's does: no node, or `any` under `AllowEmptyUnionOrIntersection`.
+    checker.typeToTypeNode = (type, enclosing, flags, internalFlags) => build("typeToTypeNode", type === undefined ? { type: 0 } : typeParams(type), enclosing, flags, internalFlags)[0];
     checker.typeParameterToDeclaration = (parameter, enclosing, flags, internalFlags) => build("typeParameterToDeclaration", typeParams(parameter), enclosing, flags, internalFlags)[0];
     for (const operation of ["symbolToEntityName", "symbolToExpression", "symbolToNode"]) {
         checker[operation] = (symbol, symbolMeaning, enclosing, flags, internalFlags) => build(operation, symbolParams(symbol, symbolMeaning), enclosing, flags, internalFlags)[0];

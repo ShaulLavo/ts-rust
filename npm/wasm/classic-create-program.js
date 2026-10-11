@@ -1,6 +1,6 @@
 import { classicNamespace, compiledModule } from "./classic-module.js";
 import { createServiceChannel } from "./service-channel.js";
-import { createProgramGraph } from "./classic-program.js";
+import { createProgramGraph, programInternals } from "./classic-program.js";
 import { sourceFileLease } from "./classic-source-files.js";
 import { compilerOptionsToJson } from "./classic-compiler-options.js";
 import { createGetCanonicalFileName, getDirectoryPath } from "./classic-paths.js";
@@ -105,6 +105,34 @@ function addHostMembers(program, host, options) {
     const getCanonicalFileName = createGetCanonicalFileName(host.useCaseSensitiveFileNames());
     let symlinks;
     Object.assign(program, {
+        // Classic `Program.emit` on the Rust emitter. Custom transformers work on classic syntax
+        // trees, which the Rust emitter never builds, so a call with any is refused.
+        emit(targetSourceFile, writeFile, _cancellationToken, emitOnlyDtsFiles, customTransformers, forceDtsEmit) {
+            if (customTransformers && ["before", "after", "afterDeclarations"].some(phase => customTransformers[phase]?.length)) {
+                throw new Error("Custom transformers are not supported: the Rust emitter does not build classic syntax trees for them to transform.");
+            }
+            const { graph, diagnostic } = programInternals.get(program);
+            const result = graph("emit", { fileName: targetSourceFile?.fileName, emitOnlyDts: !!emitOnlyDtsFiles, forceDtsEmit: !!forceDtsEmit });
+            const write = writeFile ?? host.writeFile?.bind(host);
+            const diagnostics = result.diagnostics.map(diagnostic);
+            // Classic combines a relative `outDir` or `declarationDir` with the output's path as
+            // written; the port resolves them against the current directory first.
+            const ts = classicNamespace();
+            const relativeDirectories = [options.outDir, options.declarationDir].filter(directory => directory && !ts.isRootedDiskPath(directory))
+                .map(directory => [ts.ensureTrailingDirectorySeparator(ts.getNormalizedAbsolutePath(directory, currentDirectory)), directory]);
+            const classicName = fileName => {
+                const match = relativeDirectories.find(([absolute]) => fileName.startsWith(absolute));
+                return match ? ts.combinePaths(match[1], fileName.slice(match[0].length)) : fileName;
+            };
+            for (const [outputName, text, sourceFileName] of result.writes) {
+                const fileName = classicName(outputName);
+                const sourceFiles = sourceFileName === null ? [] : [program.getSourceFile(sourceFileName)].filter(file => file !== undefined);
+                write?.(fileName, text, !!options.emitBOM, message => {
+                    diagnostics.push(classicNamespace().createCompilerDiagnostic(classicNamespace().Diagnostics.Could_not_write_file_0_Colon_1, fileName, message));
+                }, sourceFiles, { diagnostics: [] });
+            }
+            return { emitSkipped: result.emitSkipped, diagnostics, emittedFiles: options.listEmittedFiles ? result.emittedFiles.map(classicName) : undefined };
+        },
         useCaseSensitiveFileNames: () => host.useCaseSensitiveFileNames(),
         getCanonicalFileName,
         // Classic's `fileExists` without project references; it then has no `directoryExists`.

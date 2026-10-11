@@ -119,6 +119,10 @@ function heritageView(raw) {
 }
 
 function viewKind(raw) {
+    // Go represents an array-binding hole with a nameless BindingElement; classic uses OmittedExpression.
+    if (raw.kind === nativeSyntaxKind.BindingElement && !raw.name && raw.parent?.kind === nativeSyntaxKind.ArrayBindingPattern) {
+        return nativeSyntaxKind.OmittedExpression;
+    }
     return heritageView(raw)?.kind ?? raw.kind;
 }
 

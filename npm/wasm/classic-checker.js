@@ -392,7 +392,7 @@ export function createTypeChecker(lease, resolveNode) {
         if (!decl || !name || (!allowDeclaration && !ts.getExpandoInitializer(node, ts.isPrototypeAccess(name)))) return undefined;
         return decl.symbol && checker.getMergedSymbol(decl.symbol);
     };
-    for (const method of ["getDeclaredTypeOfSymbol", "getTypeOfSymbol", "getAliasedSymbol", "getImmediateAliasedSymbol", "getMergedSymbol", "getRootSymbols", "getExportsOfModule", "getFullyQualifiedName"]) {
+    for (const method of ["getDeclaredTypeOfSymbol", "getTypeOfSymbol", "getAliasedSymbol", "getImmediateAliasedSymbol", "getMergedSymbol", "getRootSymbols", "getExportsOfModule", "getFullyQualifiedName", "getIndexInfosOfIndexSymbol"]) {
         checker[method] = object => query(method, { symbol: handle(object, "symbol"), origin: objectHandles.get(object)?.origin });
     }
     // Classic `getMergedSymbol` answers a missing symbol (a script file's) with itself.
@@ -563,16 +563,23 @@ export function createTypeChecker(lease, resolveNode) {
     checker.getWidenedLiteralType = type => query("getWidenedLiteralType", typeOf(type));
     checker.getDiagnostics = sourceFile => query("getDiagnostics", { location: sourceFile === undefined ? undefined : location(sourceFile) }).map(lease.diagnostic);
     checker.getGlobalDiagnostics = () => query("getGlobalDiagnostics").map(lease.diagnostic);
-    // Classic `nodeBuilder`: Rust's node builder answers with synthesized nodes. The builder
-    // takes no symbol tracker, maximum length or verbosity level.
-    function build(operation, params, enclosing, flags, internalFlags) {
-        return query("nodeBuilder", Object.assign({ operation, location: enclosing === undefined ? undefined : location(enclosing), flags: flags ?? 0, internalFlags: internalFlags ?? 0 }, params));
+    // Classic `nodeBuilder`: Rust's node builder answers with synthesized nodes. It takes no symbol
+    // tracker; a maximum length, verbosity level or `out` record goes to Go's verbosity context.
+    function build(operation, params, enclosing, flags, internalFlags, maximumLength, verbosityLevel, out) {
+        const verbosity = maximumLength || verbosityLevel !== undefined || out ? { maximumLength: maximumLength || 0, level: verbosityLevel ?? -1 } : undefined;
+        const result = query("nodeBuilder", Object.assign({ operation, location: enclosing === undefined ? undefined : location(enclosing), flags: flags ?? 0, internalFlags: internalFlags ?? 0, verbosity }, params));
+        if (!verbosity) return result;
+        if (out) {
+            out.canIncreaseExpansionDepth = result.canIncreaseExpansionDepth;
+            out.truncated = result.truncated;
+        }
+        return result.nodes;
     }
     const typeParams = type => ({ type: handle(type, "type"), origin: objectHandles.get(type)?.origin });
     const symbolParams = (symbol, flags) => ({ symbol: handle(symbol, "symbol"), meaning: meaning(flags ?? 0) });
     // An undefined type builds as classic's does: no node, or `any` under `AllowEmptyUnionOrIntersection`.
-    checker.typeToTypeNode = (type, enclosing, flags, internalFlags) => build("typeToTypeNode", type === undefined ? { type: 0 } : typeParams(type), enclosing, flags, internalFlags)[0];
-    checker.typeParameterToDeclaration = (parameter, enclosing, flags, internalFlags) => build("typeParameterToDeclaration", typeParams(parameter), enclosing, flags, internalFlags)[0];
+    checker.typeToTypeNode = (type, enclosing, flags, internalFlags, tracker, maximumLength, verbosityLevel, out) => build("typeToTypeNode", type === undefined ? { type: 0 } : typeParams(type), enclosing, flags, internalFlags, maximumLength, verbosityLevel, out)[0];
+    checker.typeParameterToDeclaration = (parameter, enclosing, flags, internalFlags, tracker, maximumLength, verbosityLevel, out) => build("typeParameterToDeclaration", typeParams(parameter), enclosing, flags, internalFlags, maximumLength, verbosityLevel, out)[0];
     for (const operation of ["symbolToEntityName", "symbolToExpression", "symbolToNode"]) {
         checker[operation] = (symbol, symbolMeaning, enclosing, flags, internalFlags) => build(operation, symbolParams(symbol, symbolMeaning), enclosing, flags, internalFlags)[0];
     }
@@ -581,9 +588,15 @@ export function createTypeChecker(lease, resolveNode) {
         const nodes = build("symbolToTypeParameterDeclarations", symbolParams(symbol), enclosing, flags, internalFlags);
         return nodes && classicNamespace().factory.createNodeArray(nodes);
     };
-    checker.signatureToSignatureDeclaration = (signature, kind, enclosing, flags, internalFlags) => build("signatureToSignatureDeclaration", {
+    checker.signatureToSignatureDeclaration = (signature, kind, enclosing, flags, internalFlags, tracker, maximumLength, verbosityLevel, out) => build("signatureToSignatureDeclaration", {
         signature: handle(signature, "signature"), kind: nativeSyntaxKind[SyntaxKind[kind]], origin: objectHandles.get(signature)?.origin,
-    }, enclosing, flags, internalFlags)[0];
+    }, enclosing, flags, internalFlags, maximumLength, verbosityLevel, out)[0];
+    // Classic's emit resolver answers services only through `symbolToDeclarations` (expandable
+    // hover); Go's hover expansion builds the same declarations. Go fixes the builder flags.
+    const emitResolver = {
+        symbolToDeclarations: (symbol, symbolMeaning, flags, maximumLength, verbosityLevel, out) => build("symbolToDeclarations", symbolParams(symbol, symbolMeaning), undefined, flags, 0, maximumLength, verbosityLevel, out ?? {}),
+    };
+    checker.getEmitResolver = () => emitResolver;
     checker.indexInfoToIndexSignatureDeclaration = (info, enclosing, flags, internalFlags) => {
         const id = indexInfoIds.get(info);
         if (id === undefined) throw new TypeError("index info is not owned by this checker");
@@ -607,32 +620,32 @@ export function createTypeChecker(lease, resolveNode) {
     }
 
     /** Classic `typeToString` with a writer. */
-    function writeType(type, enclosing, flags = TypeFormatFlags.AllowUniqueESSymbolType | TypeFormatFlags.UseAliasDefinedOutsideCurrentScope, writer, maximumLength) {
+    function writeType(type, enclosing, flags = TypeFormatFlags.AllowUniqueESSymbolType | TypeFormatFlags.UseAliasDefinedOutsideCurrentScope, writer, maximumLength, verbosityLevel, out) {
         const ts = classicNamespace();
         const noTruncation = !maximumLength && lease.settings.noErrorTruncation || flags & TypeFormatFlags.NoTruncation;
-        const typeNode = checker.typeToTypeNode(type, enclosing, (flags & TypeFormatFlags.NodeBuilderFlagsMask) | NodeBuilderFlags.IgnoreErrors | (noTruncation ? NodeBuilderFlags.NoTruncation : 0));
+        const typeNode = checker.typeToTypeNode(type, enclosing, (flags & TypeFormatFlags.NodeBuilderFlagsMask) | NodeBuilderFlags.IgnoreErrors | (noTruncation ? NodeBuilderFlags.NoTruncation : 0), undefined, undefined, maximumLength, verbosityLevel, out);
         if (typeNode === undefined) throw new Error("Debug Failure. should always get typenode");
         ts.createPrinterWithRemoveComments().writeNode(EmitHint.Unspecified, typeNode, enclosing && ts.getSourceFileOfNode(enclosing), writer);
         const result = writer.getText();
-        const maxLength = noTruncation ? ts.noTruncationMaximumTruncationLength * 2 : ts.defaultMaximumTruncationLength * 2;
+        const maxLength = maximumLength || (noTruncation ? ts.noTruncationMaximumTruncationLength * 2 : ts.defaultMaximumTruncationLength * 2);
         if (maxLength && result && result.length >= maxLength) return result.substr(0, maxLength - "...".length) + "...";
         return result;
     }
 
     /** Classic `signatureToString` with a writer. */
-    function writeSignature(signature, enclosing, flags = TypeFormatFlags.None, kind, writer) {
+    function writeSignature(signature, enclosing, flags = TypeFormatFlags.None, kind, writer, maximumLength, verbosityLevel, out) {
         const ts = classicNamespace();
         const output = flags & TypeFormatFlags.WriteArrowStyleSignature
             ? (kind === SignatureKind.Construct ? SyntaxKind.ConstructorType : SyntaxKind.FunctionType)
             : (kind === SignatureKind.Construct ? SyntaxKind.ConstructSignature : SyntaxKind.CallSignature);
-        const declaration = checker.signatureToSignatureDeclaration(signature, output, enclosing, (flags & TypeFormatFlags.NodeBuilderFlagsMask) | NodeBuilderFlags.IgnoreErrors | NodeBuilderFlags.WriteTypeParametersInQualifiedName);
+        const declaration = checker.signatureToSignatureDeclaration(signature, output, enclosing, (flags & TypeFormatFlags.NodeBuilderFlagsMask) | NodeBuilderFlags.IgnoreErrors | NodeBuilderFlags.WriteTypeParametersInQualifiedName, undefined, undefined, maximumLength, verbosityLevel, out);
         ts.createPrinterWithRemoveCommentsOmitTrailingSemicolon().writeNode(EmitHint.Unspecified, declaration, enclosing && ts.getSourceFileOfNode(enclosing), ts.getTrailingSemicolonDeferringWriter(writer));
         return writer;
     }
 
     checker.writeSymbol = (symbol, enclosing, symbolMeaning, flags, writer) => writeSymbol(symbol, parseTree(enclosing), symbolMeaning, flags, writer).getText();
-    checker.writeType = (type, enclosing, flags, writer, maximumLength) => writeType(type, parseTree(enclosing), flags, writer, maximumLength);
-    checker.writeSignature = (signature, enclosing, flags, kind, writer) => writeSignature(signature, parseTree(enclosing), flags, kind, writer).getText();
+    checker.writeType = (type, enclosing, flags, writer, maximumLength, verbosityLevel, out) => writeType(type, parseTree(enclosing), flags, writer, maximumLength, verbosityLevel, out);
+    checker.writeSignature = (signature, enclosing, flags, kind, writer, maximumLength, verbosityLevel, out) => writeSignature(signature, parseTree(enclosing), flags, kind, writer, maximumLength, verbosityLevel, out).getText();
     checker.getReturnTypeOfSignature = signature => query("getReturnTypeOfSignature", { signature: handle(signature, "signature"), origin: objectHandles.get(signature)?.origin });
     checker.getTypeOfSymbolAtLocation = (symbol, locationIn) => {
         const node = parseTree(locationIn);
@@ -644,9 +657,37 @@ export function createTypeChecker(lease, resolveNode) {
     checker.getIndexTypeOfType = (type, kind) => query("getIndexTypeOfType", { type: handle(type, "type"), kind, origin: objectHandles.get(type)?.origin });
     checker.getContextualType = (nodeIn, contextFlags = 0) => {
         const node = parseTree(nodeIn, "isExpression");
-        return node ? query("getContextualType", { location: location(node), contextFlags }) : undefined;
+        if (!node) return undefined;
+        if (node.parent?.kind === SyntaxKind.ArrayLiteralExpression && !node.parent.elements.includes(node)) {
+            return query("getContextualTypeOfArrayLiteralToken", { location: location(node.parent), contextFlags });
+        }
+        return query("getContextualType", { location: location(node), contextFlags });
     };
     checker.getResolvedSignature = node => query("getResolvedSignature", { location: location(node) });
+    // Classic `getSymbolWalker`: Rust walks with the symbols `accept` rejected so far; a symbol
+    // with no verdict yet gets one, in visit order, and a new rejection walks again.
+    checker.getSymbolWalker = (accept = () => true) => {
+        const walk = (method, params) => {
+            const verdicts = new Map();
+            const rejected = [];
+            for (;;) {
+                const result = query(method, { ...params, rejected: rejected.map(symbol => handle(symbol, "symbol")) });
+                let again = false;
+                for (const symbol of result.order) {
+                    if (!verdicts.has(symbol)) verdicts.set(symbol, !!accept(symbol));
+                    if (verdicts.get(symbol) || rejected.includes(symbol)) continue;
+                    rejected.push(symbol);
+                    again = true;
+                    break;
+                }
+                if (!again) return { visitedTypes: result.types, visitedSymbols: result.symbols };
+            }
+        };
+        return {
+            walkType: type => type ? walk("walkType", { type: handle(type, "type"), origin: objectHandles.get(type)?.origin }) : { visitedTypes: [], visitedSymbols: [] },
+            walkSymbol: symbol => symbol ? walk("walkSymbol", { symbol: handle(symbol, "symbol"), origin: objectHandles.get(symbol)?.origin }) : { visitedTypes: [], visitedSymbols: [] },
+        };
+    };
     checker.typeToString = (type, enclosingIn) => {
         const enclosing = parseTree(enclosingIn);
         return query("typeToString", { type: handle(type, "type"), location: enclosing && location(enclosing), origin: objectHandles.get(type)?.origin });

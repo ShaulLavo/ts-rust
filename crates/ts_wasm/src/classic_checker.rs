@@ -7,11 +7,12 @@ use ts_goport::api::{encoder, proto};
 use ts_goport::ast::{escape_symbol_name, get_source_file_of_node, is_part_of_type_node};
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::binder::go_symbol_name;
+use ts_goport::checker::printer_impl::VerbosityContext;
 use ts_goport::checker::{Checker, InternalNodeBuilderFlags, LiteralValue, NodeBuilderFlags};
 use ts_goport::core::{IndexInfoId, Node, SignatureId, SymbolId, TypeId, TypePredicateId};
 use ts_goport::flags::{
-    CheckFlags, ContextFlags, SignatureFlags, SignatureKind, SymbolFlags, TokenFlags, TypeFlags,
-    TypePredicateKind, UnionReduction,
+    CheckFlags, ContextFlags, IterationUse, SignatureFlags, SignatureKind, SymbolFlags, TokenFlags,
+    TypeFlags, TypePredicateKind, UnionReduction,
 };
 use ts_goport::frontend::compiler::NewProgram;
 use ts_goport::gostd::Context;
@@ -93,6 +94,22 @@ impl ClassicChecker {
         ts_goport::program::catch_up_checker(&mut checker.symbols);
         match method {
             "getTypeData" => self.type_data(&checker, t),
+            // Classic `getSymbolWalker().walkType` / `walkSymbol` with the symbols `accept` rejected.
+            "walkType" | "walkSymbol" => {
+                let rejected = Self::symbol_ids(request, "rejected", &self.symbols)?;
+                let mut walk = crate::classic_symbol_walker::SymbolWalk::new(
+                    rejected.into_iter().map(SymbolId),
+                );
+                if method == "walkType" {
+                    walk.visit_type(&mut checker, t);
+                } else {
+                    walk.visit_symbol(&mut checker, symbol);
+                }
+                Ok(
+                    json!({"types": self.type_refs(&walk.types()), "symbols": self.symbol_refs(&walk.symbols()),
+                    "order": self.symbol_refs(&walk.symbol_order)}),
+                )
+            }
             "getSymbolData" => Ok(self.symbol_data(&checker, symbol)),
             "getSignatureData" => Ok(self.signature_data(&checker, signature)),
             "getTypeAtLocation" => {
@@ -145,10 +162,64 @@ impl ClassicChecker {
                         .collect(),
                 ))
             }
+            // Classic `getIndexInfosOfIndexSymbol`: the infos of the index symbol's declarations,
+            // with the members of its parent as the siblings that computed names contribute.
+            "getIndexInfosOfIndexSymbol" => {
+                let parent = checker.sym(symbol).parent;
+                let siblings = if parent.is_nil() {
+                    Vec::new()
+                } else {
+                    let members = checker.get_members_of_symbol(parent);
+                    checker.symbols.values(members)
+                };
+                Ok(Value::Array(
+                    checker
+                        .get_index_infos_of_index_symbol(symbol, &siblings)
+                        .into_iter()
+                        .map(|info| self.index_info(&checker, info))
+                        .collect(),
+                ))
+            }
             "getExportsOfModule" => {
                 Ok(self.symbol_refs(&checker.get_exports_of_module_exported(symbol)))
             }
             "isOptionalParameter" => Ok(json!(checker.is_optional_parameter(location))),
+            // Classic `getContextualType` of a token in an array literal (completions pass the
+            // token before the position): `getContextualTypeForElementExpression` at index -1,
+            // where Go's `getContextualType` answers only an element.
+            "getContextualTypeOfArrayLiteralToken" => {
+                let flags = ContextFlags(number(request, "contextFlags")?);
+                let element = |c: &mut Checker| {
+                    let t = c.get_apparent_type_of_contextual_type(location, flags);
+                    if t.is_nil() {
+                        return TypeId::NIL;
+                    }
+                    let undefined_type = c.undefined_type;
+                    c.map_type(t, &mut |c: &mut Checker, t: TypeId| {
+                        if c.is_tuple_type(t) {
+                            return TypeId::NIL;
+                        }
+                        let property = c.get_type_of_property_of_contextual_type(t, "-1");
+                        if property.is_some() {
+                            return property;
+                        }
+                        c.get_iterated_type_or_element_type(
+                            IterationUse::ELEMENT,
+                            t,
+                            undefined_type,
+                            Node::NIL,
+                            false,
+                        )
+                    })
+                };
+                // Classic's public `getContextualType`, as `get_contextual_type_exported`.
+                let result = if flags.intersects(ContextFlags::IGNORE_NODE_INFERENCES) {
+                    checker.run_with_inference_blocked_from_source_node(location, element)
+                } else {
+                    element(&mut checker)
+                };
+                Ok(self.type_ref(result))
+            }
             "getContextualType" => Ok(self.type_ref(checker.get_contextual_type_exported(
                 location,
                 ContextFlags(number(request, "contextFlags")?),
@@ -759,7 +830,30 @@ impl ClassicChecker {
         );
         let meaning = symbol_flags(request)?;
         let builder = checker.get_node_builder_ex(None);
+        // Classic's `maximumLength`, `verbosityLevel` and `out` arguments: Go's hover
+        // `VerbosityContext`, whose output cells the node builder sets.
+        let verbosity = request
+            .get("verbosity")
+            .filter(|value| !value.is_null())
+            .map(|value| -> Result<VerbosityContext, String> {
+                let integer = |key: &str, missing: i64| {
+                    i32::try_from(value[key].as_i64().unwrap_or(missing))
+                        .map_err(|error| error.to_string())
+                };
+                Ok(VerbosityContext {
+                    level: integer("level", -1)?,
+                    max_truncation_length: integer("maximumLength", 0)?,
+                    ..Default::default()
+                })
+            })
+            .transpose()?;
+        builder.borrow_mut().verbosity = verbosity.clone();
         let nodes = match string(request, "operation")? {
+            // Classic `getEmitResolver().symbolToDeclarations`: Go's hover expansion of a class,
+            // enum, namespace or interface into declarations, with classic's modifier simplification.
+            "symbolToDeclarations" => {
+                checker.node_builder_expand_symbol_for_hover(&builder, symbol, meaning)
+            }
             "typeToTypeNode" => vec![
                 checker
                     .node_builder_type_to_type_node(&builder, t, enclosing, flags, internal, None),
@@ -822,6 +916,7 @@ impl ClassicChecker {
             }
             operation => return Err(format!("unknown node builder operation: {operation}")),
         };
+        builder.borrow_mut().verbosity = None;
         let identifiers = builder.borrow().impl_.borrow().id_to_symbol.clone();
         let emit_context = builder.borrow().impl_.borrow().e.clone();
         let mut results = Vec::with_capacity(nodes.len());
@@ -833,10 +928,21 @@ impl ClassicChecker {
             let (bytes, table) =
                 encoder::encode_node(node, Node::NIL).map_err(|error| error.to_string())?;
             let (offset, length) = crate::exports::push_payload(&bytes);
+            // Classic's builder names declarations with bare identifiers
+            // (`getPropertyNameNodeForSymbol`, `symbolTableToDeclarationStatements`); only entity
+            // names and type parameter names carry the symbol the printer writes.
+            let declaration_names: HashSet<Node> = table
+                .nodes
+                .iter()
+                .filter(|node| node.is_some() && is_bare_named_declaration(node.kind()))
+                .map(|node| node.name())
+                .filter(|name| name.is_some())
+                .collect();
             let symbols = table
                 .nodes
                 .iter()
                 .enumerate()
+                .filter(|(_, node)| !declaration_names.contains(*node))
                 .filter_map(|(index, node)| {
                     let symbol = identifiers.get(node)?;
                     Some(json!([index, self.symbol_ref(*symbol)]))
@@ -899,7 +1005,13 @@ impl ClassicChecker {
                 .collect::<Vec<_>>();
             results.push(json!({"$synthetic": {"$payload": [offset, length]}, "symbols": symbols, "emitFlags": emit_flags, "singleQuotes": single_quotes, "comments": comments}));
         }
-        Ok(Value::Array(results))
+        Ok(match verbosity {
+            Some(verbosity) => {
+                json!({"nodes": results, "canIncreaseExpansionDepth": verbosity.can_increase_verbosity.get(),
+                "truncated": verbosity.truncated.get()})
+            }
+            None => Value::Array(results),
+        })
     }
 
     /// Classic `TypePredicate`, or none for the checker's no-predicate sentinel.
@@ -1156,15 +1268,34 @@ impl ClassicChecker {
         let data = checker.sym(symbol);
         let mut links = Value::Null;
         if data.flags.intersects(SymbolFlags::TRANSIENT) {
-            let target = checker
+            let (target, name_type) = checker
                 .value_symbol_links
                 .try_get_by_id(&checker.symbols, symbol)
-                .map_or(SymbolId::NIL, |links| links.target);
+                .map_or((SymbolId::NIL, TypeId::NIL), |links| {
+                    (links.target, links.name_type)
+                });
             links = json!({"checkFlags": classic_check_flags(data.check_flags), "target": self.symbol_ref(target)});
+            // Classic `links.nameType`: a mapped or late-bound member's property name type.
+            if name_type.is_some() {
+                links["nameType"] = self.type_ref(name_type);
+            }
         }
-        json!({"id": symbol.0, "flags": data.flags.0, "links": links,
+        // The port's index symbol is a transient property; classic's is a `Signature` symbol
+        // (`getApplicableIndexSymbol`) without a value declaration.
+        let index_symbol = data.check_flags.intersects(CheckFlags::INDEX_SYMBOL);
+        let flags = if index_symbol {
+            SymbolFlags::TRANSIENT | SymbolFlags::SIGNATURE
+        } else {
+            data.flags
+        };
+        let value_declaration = if index_symbol {
+            Node::NIL
+        } else {
+            data.value_declaration
+        };
+        json!({"id": symbol.0, "flags": flags.0, "links": links,
             "hasMembers": data.members.is_some(), "hasExports": data.exports.is_some(), "escapedName": crate::classic_strings::string_value(&escape_symbol_name(&go_symbol_name(&checker.symbols, symbol))),
-            "declarations": data.declarations.iter().copied().map(node_ref).collect::<Vec<_>>(), "valueDeclaration": node_ref(data.value_declaration),
+            "declarations": data.declarations.iter().copied().map(node_ref).collect::<Vec<_>>(), "valueDeclaration": node_ref(value_declaration),
             "parent": self.symbol_ref(data.parent), "exportSymbol": self.symbol_ref(data.export_symbol)})
     }
 
@@ -1224,6 +1355,28 @@ fn signature_kind(request: &Value) -> Result<SignatureKind, String> {
         1 => Ok(SignatureKind::CONSTRUCT),
         _ => Err("signature kind must be Call or Construct".into()),
     }
+}
+
+/// Declarations whose names classic's node builder makes without a symbol.
+fn is_bare_named_declaration(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::PropertySignature
+            | SyntaxKind::PropertyDeclaration
+            | SyntaxKind::MethodSignature
+            | SyntaxKind::MethodDeclaration
+            | SyntaxKind::GetAccessor
+            | SyntaxKind::SetAccessor
+            | SyntaxKind::PropertyAssignment
+            | SyntaxKind::EnumMember
+            | SyntaxKind::Parameter
+            | SyntaxKind::ClassDeclaration
+            | SyntaxKind::InterfaceDeclaration
+            | SyntaxKind::EnumDeclaration
+            | SyntaxKind::TypeAliasDeclaration
+            | SyntaxKind::FunctionDeclaration
+            | SyntaxKind::VariableDeclaration
+    )
 }
 
 /// Classic `CheckFlags` for the port's: the same flags by name; the port's own flags

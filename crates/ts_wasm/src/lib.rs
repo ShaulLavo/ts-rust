@@ -44,6 +44,8 @@ mod classic_sources;
 #[cfg(target_family = "wasm")]
 mod classic_strings;
 #[cfg(target_family = "wasm")]
+mod classic_symbol_walker;
+#[cfg(target_family = "wasm")]
 mod editor_host;
 pub mod host;
 #[cfg(target_family = "wasm")]

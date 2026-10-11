@@ -98,11 +98,55 @@ const renamedFields = new Map(Object.entries({
 }).map(([kind, names]) => [nativeSyntaxKind[kind], names]));
 const nativeFieldNames = new Map(Array.from(renamedFields, ([kind, names]) => [kind, new Map(Object.entries(names).map(([classic, native]) => [native, classic]))]));
 
+// Go parses the types of `implements` and of an interface's `extends` as type references; classic
+// parses them as expressions with type arguments, with a dotted name as property accesses.
+const heritageViews = {
+    expression: { kind: nativeSyntaxKind.ExpressionWithTypeArguments, fields: { expression: "typeName", typeArguments: "typeArguments" } },
+    access: { kind: nativeSyntaxKind.PropertyAccessExpression, fields: { expression: "left", name: "right", questionDotToken: undefined } },
+};
+
+function isHeritageTypeReference(raw) {
+    return raw?.kind === nativeSyntaxKind.TypeReference && raw.parent?.kind === nativeSyntaxKind.HeritageClause;
+}
+
+function heritageView(raw) {
+    if (raw.kind === nativeSyntaxKind.TypeReference) return isHeritageTypeReference(raw) ? heritageViews.expression : undefined;
+    if (raw.kind !== nativeSyntaxKind.QualifiedName) return undefined;
+    let top = raw;
+    while (top.parent?.kind === nativeSyntaxKind.QualifiedName && top.parent.left?.index === top.index) top = top.parent;
+    return isHeritageTypeReference(top.parent) && top.parent.typeName?.index === top.index ? heritageViews.access : undefined;
+}
+
+function viewKind(raw) {
+    return heritageView(raw)?.kind ?? raw.kind;
+}
+
 function publicFields(raw) {
     const renamed = nativeFieldNames.get(raw.kind);
-    const children = (childFields.get(raw.kind) ?? []).flatMap(field => field === "postfixToken" ? ["questionToken", "exclamationToken"]
+    const children = (childFields.get(viewKind(raw)) ?? []).flatMap(field => field === "postfixToken" ? ["questionToken", "exclamationToken"]
         : renamed?.has(field) ? [renamed.get(field)] : field ? [field] : []);
-    return Array.from(new Set(["pos", "end", "kind", "id", "flags", "modifierFlagsCache", "transformFlags", "parent", "original", "emitNode"].concat(children, extraProperties.get(raw.kind) ?? [], ["jsDoc"])));
+    return Array.from(new Set(["pos", "end", "kind", "id", "flags", "modifierFlagsCache", "transformFlags", "parent", "original", "emitNode"].concat(children, extraProperties.get(raw.kind) ?? [], literalFields(raw), ["jsDoc"])));
+}
+
+const literalKinds = new Set([nativeSyntaxKind.StringLiteral, nativeSyntaxKind.NumericLiteral, nativeSyntaxKind.BigIntLiteral,
+    nativeSyntaxKind.RegularExpressionLiteral, nativeSyntaxKind.NoSubstitutionTemplateLiteral, nativeSyntaxKind.TemplateHead,
+    nativeSyntaxKind.TemplateMiddle, nativeSyntaxKind.TemplateTail]);
+
+/** The scanner flags a literal was parsed with. */
+function literalTokenFlags(raw) {
+    if (!literalKinds.has(raw.kind)) return 0;
+    if (raw.kind === nativeSyntaxKind.StringLiteral || raw.kind === nativeSyntaxKind.NumericLiteral
+        || raw.kind === nativeSyntaxKind.BigIntLiteral || raw.kind === nativeSyntaxKind.RegularExpressionLiteral) return raw.tokenFlags ?? 0;
+    return templateFlags(raw);
+}
+
+/** Classic `parseLiteralLikeNode` sets `isUnterminated` and `hasExtendedUnicodeEscape` only when true;
+ * a string literal always has `hasExtendedUnicodeEscape` (`createStringLiteral`'s parameter). */
+function literalFields(raw) {
+    if (!literalKinds.has(raw.kind)) return [];
+    const flags = literalTokenFlags(raw);
+    return (raw.kind === nativeSyntaxKind.StringLiteral || (flags & nativeTokenFlags.ExtendedUnicodeEscape) !== 0 ? ["hasExtendedUnicodeEscape"] : [])
+        .concat((flags & nativeTokenFlags.Unterminated) !== 0 ? ["isUnterminated"] : []);
 }
 
 function jsDocProperties(raw) {
@@ -155,12 +199,36 @@ function translateNodeFlags(raw) {
         result |= raw.kind === nativeSyntaxKind.ModuleDeclaration ? NodeFlags.NestedNamespace : NodeFlags.OptionalChain;
     }
     if (raw.kind === nativeSyntaxKind.ModuleDeclaration && raw.keyword === nativeSyntaxKind.NamespaceKeyword) result |= NodeFlags.Namespace;
+    if (isGlobalAugmentation(raw)) result |= NodeFlags.GlobalAugmentation;
     if (isNestedNamespace(raw)) result |= NodeFlags.NestedNamespace;
     return result;
 }
 
+/** Classic flags `global { }` (the name directly after the modifiers) with `GlobalAugmentation`; the
+ * native encoding records only `namespace` or `module`. */
+function isGlobalAugmentation(raw) {
+    if (raw.kind !== nativeSyntaxKind.ModuleDeclaration || raw.keyword === nativeSyntaxKind.NamespaceKeyword) return false;
+    const name = raw.name;
+    if (name?.kind !== nativeSyntaxKind.Identifier || name.text !== "global" || !classicNamespaceOrUndefined()) return false;
+    const modifiers = raw.modifiers;
+    const start = modifiers?.length ? modifiers[modifiers.length - 1].end : raw.pos;
+    return classicNamespaceOrUndefined().skipTrivia(raw.sourceFile.text, start) === name.getStart();
+}
+
 function isNestedNamespace(raw) {
     return raw.kind === nativeSyntaxKind.ModuleDeclaration && raw.parent?.kind === nativeSyntaxKind.ModuleDeclaration && raw.parent.body === raw;
+}
+
+/** Go's reparser puts an `as`/`satisfies` expression with the JSDoc type between a parenthesized
+ * expression (or initializer, return value) and its operand; classic's tree has the operand there. */
+function isReparsedCast(raw) {
+    return (raw.kind === nativeSyntaxKind.AsExpression || raw.kind === nativeSyntaxKind.SatisfiesExpression)
+        && (raw.type?.flags & nativeNodeFlags.Reparsed) !== 0;
+}
+
+function throughReparsedCasts(raw) {
+    while (raw && typeof raw.kind === "number" && isReparsedCast(raw)) raw = raw.expression;
+    return raw;
 }
 
 function isClassicChild(raw) {
@@ -314,7 +382,7 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
     function wrapArray(value) {
         let result = arrays.get(value);
         if (result) return result;
-        result = Array.from(value).filter(isChild).map(wrap);
+        result = Array.from(value, child => synthetic ? child : throughReparsedCasts(child)).filter(isChild).map(wrap);
         arrays.set(value, result);
         for (const property of ["pos", "end", "hasTrailingComma", "transformFlags"]) {
             if (value[property] !== undefined) result[property] = value[property];
@@ -325,7 +393,9 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
 
     function read(raw, overrides, property) {
         if (Object.hasOwn(overrides, property)) return overrides[property];
-        if (property === "kind") return isUnknownJSDocType(raw) ? SyntaxKind.JSDocUnknownType : translateKind(raw.kind);
+        if (property === "kind") return isUnknownJSDocType(raw) ? SyntaxKind.JSDocUnknownType : translateKind(viewKind(raw));
+        const view = heritageView(raw);
+        if (view && Object.hasOwn(view.fields, property)) return view.fields[property] === undefined ? undefined : wrap(raw[view.fields[property]]);
         if (property === "type" && isUnknownJSDocType(raw)) return undefined;
         // Builder output is synthesized, as classic factory nodes are: no position, no parent.
         if (synthetic && (property === "pos" || property === "end")) return -1;
@@ -340,13 +410,25 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         if (property === "templateFlags") return translateFlags(templateFlags(raw), tokenFlagBits) & TokenFlags.TemplateLiteralLikeFlags;
         if (property === "modifierFlags") return translateFlags(raw.modifierFlags ?? 0, modifierFlagBits);
         if (property === "id") return 0;
+        // Classic services read `modifierFlagsCache` directly, after the classic checker has filled it
+        // (`getModifierFlagsWorker`); a parsed node answers with the value that computation stores.
+        if (property === "modifierFlagsCache") {
+            if (synthetic || (raw.kind >= nativeSyntaxKind.FirstToken && raw.kind <= nativeSyntaxKind.LastToken)) return 0;
+            return overrides.modifierFlagsCache = classicNamespaceOrUndefined().getSyntacticModifierFlagsNoCache(wrap(raw)) | ModifierFlags.HasComputedFlags;
+        }
         if (property === "transformFlags") return !synthetic && containsJsx(raw) ? transformFlagsContainsJsx : 0;
         if (property === "escapedText") return escapedText(raw);
         if (property === "numericLiteralFlags") return translateFlags(raw.tokenFlags, tokenFlagBits);
+        if (property === "isUnterminated") return synthetic ? undefined : true;
+        if (property === "hasExtendedUnicodeEscape") return synthetic ? undefined : (literalTokenFlags(raw) & nativeTokenFlags.ExtendedUnicodeEscape) !== 0;
         if (property === "rawText" && raw.kind === nativeSyntaxKind.NoSubstitutionTemplateLiteral) {
             const delimiter = (templateFlags(raw) & nativeTokenFlags.Unterminated) !== 0 ? 0 : 1;
             return raw.sourceFile.text.slice(raw.getStart() + 1, raw.end - delimiter);
         }
+        // Classic's factory leaves a template part's `rawText` undefined unless given; the port's
+        // builder passes an empty one, which the printer would print in place of `text`.
+        if (property === "rawText" && synthetic) return raw.rawText || undefined;
+        if (property === "typeParameters" && raw.kind === nativeSyntaxKind.JSDocTemplateTag) return templateTagTypeParameters(raw);
         if (property === "questionToken" || property === "exclamationToken") return postfixToken(raw, property);
         if (property === "jsDocPropertyTags" && raw.kind === nativeSyntaxKind.JSDocTypeLiteral) return propertyTags(raw);
         const native = renamedFields.get(raw.kind)?.[property];
@@ -381,7 +463,11 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         if (property === "getChildren") return source => classicChildren(raw, source);
         if (property === "getChildCount") return source => classicChildren(raw, source).length;
         if (property === "getChildAt") return (index, source) => classicChildren(raw, source)[index];
-        const value = raw[property];
+        let value = raw[property];
+        if (!synthetic && typeof value?.kind === "number") {
+            if (property === "parent") while (value && isReparsedCast(value)) value = value.parent;
+            else value = throughReparsedCasts(value);
+        }
         if (typeof value === "function") return (...args) => wrap(value.apply(raw, args.map(unwrapNode)));
         if (typeof value?.kind === "number" && !isChild(value)) return undefined;
         if (property === "modifiers" && value?.length && !Array.from(value).some(isChild)) return undefined;
@@ -399,9 +485,33 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         }
         result = raw.getChildren(unwrapNode(source)).filter(child => !isUnknownJSDocType(raw) || child !== raw.type).flatMap(child => child.kind === nativeSyntaxKind.LessThanSlashToken
             ? [syntheticToken(child, nativeSyntaxKind.LessThanToken, child.pos, child.end - 1), syntheticToken(child, nativeSyntaxKind.SlashToken, child.end - 1, child.end)]
-            : isChild(child) ? [wrap(child)] : []);
+            : isChild(child = synthetic ? child : throughReparsedCasts(child)) ? [wrap(child)] : []);
         children.set(raw, result);
         return result;
+    }
+
+    // Go's parser gives a template tag's type parameter list an empty range; classic's list starts
+    // after the constraint, or where `skipWhitespaceOrAsterisk` stops after the tag name, and ends
+    // where it stops after the last parameter.
+    function templateTagTypeParameters(raw) {
+        const list = raw.typeParameters;
+        const result = wrapArray(list);
+        if (!list || list.length === 0 || list.pos !== 0 || list.end !== 0) return result;
+        result.pos = raw.constraint ? raw.constraint.end : skipJSDocWhitespaceOrAsterisk(raw.tagName.end, raw.end);
+        result.end = skipJSDocWhitespaceOrAsterisk(list[list.length - 1].end, raw.end);
+        return result;
+    }
+
+    function skipJSDocWhitespaceOrAsterisk(position, limit) {
+        const text = root.text;
+        let lineBreak = false;
+        for (; position < limit; position++) {
+            const char = text[position];
+            if (char === "\n" || char === "\r") lineBreak = true;
+            else if (char === "*" && lineBreak) lineBreak = false;
+            else if (char !== " " && char !== "\t") break;
+        }
+        return position;
     }
 
     function comment(parts) {
@@ -414,7 +524,7 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
     function visitChildren(raw, visit, visitArray) {
         if (isUnknownJSDocType(raw)) return undefined;
         if (isCommentContainer(raw.kind)) return visitFields(jsDocProperties(raw), raw, visit, visitArray);
-        return raw.forEachChild(child => isChild(child) ? visit(wrap(child)) : undefined,
+        return raw.forEachChild(child => isChild(child = synthetic ? child : throughReparsedCasts(child)) ? visit(wrap(child)) : undefined,
             visitArray && (children => Array.from(children).some(isChild) || children.length === 0 ? visitArray(wrapArray(children)) : undefined));
     }
 

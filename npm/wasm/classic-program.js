@@ -170,6 +170,7 @@ export function createProgramGraph(channel, handle, settings = {}) {
         return graph(method, { fileName: typeof file === "string" ? file : file?.fileName }).map(diagnostic);
     }
 
+    const semanticDiagnostics = new Map();
     const program = {
         getRootFileNames: () => graph("getRootFileNames"),
         getClassifiableNames: () => lease.classifiableNames ??= new Set(graph("getClassifiableNames")),
@@ -244,7 +245,13 @@ export function createProgramGraph(channel, handle, settings = {}) {
         isSourceFileDefaultLibrary: file => metadata.get(file)?.defaultLibrary ?? false,
         isSourceFileFromExternalLibrary: file => metadata.get(file)?.externalLibrary ?? false,
         getSyntacticDiagnostics: file => diagnostics("getSyntacticDiagnostics", file),
-        getSemanticDiagnostics: file => diagnostics("getSemanticDiagnostics", file),
+        getSemanticDiagnostics(file, cancellationToken, nodesToCheck) {
+            const result = diagnostics("getSemanticDiagnostics", file);
+            if (file && !nodesToCheck) semanticDiagnostics.set(typeof file === "string" ? file : file.fileName, result);
+            return result;
+        },
+        // Classic's cache of a file's bind and check diagnostics, filled by a whole-file request.
+        getCachedSemanticDiagnostics: file => semanticDiagnostics.get(file.fileName),
         getSuggestionDiagnostics: file => diagnostics("getSuggestionDiagnostics", file),
         getGlobalDiagnostics: () => diagnostics("getGlobalDiagnostics"),
         getOptionsDiagnostics: () => diagnostics("getOptionsDiagnostics"),

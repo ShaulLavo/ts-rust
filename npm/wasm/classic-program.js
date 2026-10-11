@@ -201,6 +201,8 @@ export function createProgramGraph(channel, handle, settings = {}) {
         typesPackageExists: packageName => getPackagesMap().has(classicNamespace().getTypesPackageName(packageName)),
         packageBundlesTypes: packageName => !!getPackagesMap().get(packageName),
         getCommonSourceDirectory: () => facts().commonSourceDirectory,
+        // Classic makes a module resolution cache only for its own resolver; the Rust resolver keeps its own.
+        getModuleResolutionCache: () => undefined,
         getFileIncludeReasons() {
             if (lease.includeReasons) return lease.includeReasons;
             const reasons = classicNamespace().createMultiMap();

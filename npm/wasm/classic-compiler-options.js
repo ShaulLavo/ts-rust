@@ -15,15 +15,22 @@ function convert(declaration, value) {
 
 /**
  * A classic `CompilerOptions` object as tsconfig `compilerOptions`: enum values by their
- * declared names, `lib` entries by their option names. Fields that are no compiler option
- * (`configFilePath`, `pathsBasePath`, `configFile`) are left out.
+ * declared names, `lib` entries by their option names, and the internal options the port reads.
+ * Fields that are no compiler option (`configFilePath`, `pathsBasePath`, `configFile`) are left out.
  */
 export function compilerOptionsToJson(options) {
     const result = {};
     for (const [name, value] of Object.entries(options ?? {})) {
         const declaration = declarations.get(name);
-        if (value === undefined || !declaration) continue;
+        if (value === undefined) continue;
+        if (!declaration) {
+            if (internalOptions.has(name)) result[name] = value;
+            continue;
+        }
         result[name] = convert(declaration, value);
     }
     return result;
 }
+
+// Internal classic options that have no declaration but that the port reads by name.
+const internalOptions = new Set(["allowNonTsExtensions"]);

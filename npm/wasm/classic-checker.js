@@ -375,6 +375,7 @@ export function createTypeChecker(lease, resolveNode) {
     checker.getTypePredicateOfSignature = signature => query("getTypePredicateOfSignature", signatureOf(signature));
     checker.isDeclarationVisible = node => query("isDeclarationVisible", { location: location(node) });
     checker.getExpandedParameters = (signature, skipUnionExpanding) => query("getExpandedParameters", Object.assign(signatureOf(signature), { skipUnionExpanding }));
+    checker.getParameterIdentifierInfoAtPosition = (signature, position) => query("getParameterIdentifierInfoAtPosition", Object.assign(signatureOf(signature), { position }));
     checker.hasEffectiveRestParameter = signature => query("hasEffectiveRestParameter", signatureOf(signature));
     checker.getJsxFragmentFactory = node => query("getJsxFragmentFactory", { location: location(node) });
     checker.getJsxIntrinsicTagNamesAt = node => query("getJsxIntrinsicTagNamesAt", { location: location(node) });

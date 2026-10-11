@@ -558,14 +558,25 @@ fn program_command_line(
     config: &ProgramConfig,
 ) -> Result<ParsedCommandLine, ServiceError> {
     let mut options = ts_goport::options::CompilerOptions::default();
+    // Classic's internal `allowNonTsExtensions` has no declaration, so the converter does not
+    // know it; the program reads it as Go's option of the same name.
+    let mut json = config.options.clone();
+    let allow_non_ts_extensions = json
+        .as_object_mut()
+        .and_then(|options| options.remove("allowNonTsExtensions"));
     let (_, errors) = convert_options_from_json(
         &COMMAND_LINE_COMPILER_OPTIONS_MAP,
-        &options_value(&config.options),
+        &options_value(&json),
         cwd,
         CompilerOptionsParser {
             compiler_options: &mut options,
         },
     );
+    match allow_non_ts_extensions {
+        Some(Value::Bool(true)) => options.allow_non_ts_extensions = Tristate::True,
+        Some(Value::Bool(false)) => options.allow_non_ts_extensions = Tristate::False,
+        _ => {}
+    }
     // An option this compiler does not know is a configuration diagnostic of the program,
     // as classic programs report removed options, so the program still builds.
     let mut command_line = new_parsed_command_line(

@@ -262,6 +262,22 @@ impl ClassicChecker {
                     .map(|parameters| self.symbol_refs(parameters))
                     .collect(),
             )),
+            "getParameterIdentifierInfoAtPosition" => {
+                let position = usize::try_from(number(request, "position")?)
+                    .map_err(|error| error.to_string())?;
+                Ok(
+                    match crate::classic_parameters::parameter_identifier_info(
+                        &mut checker,
+                        signature,
+                        position,
+                    ) {
+                        Some(info) => json!({"parameter": node_ref(info.parameter),
+                            "parameterName": crate::classic_strings::string_value(&info.parameter_name),
+                            "isRestParameter": info.is_rest_parameter}),
+                        None => Value::Null,
+                    },
+                )
+            }
             "hasEffectiveRestParameter" => Ok(json!(
                 checker.has_effective_rest_parameter_exported(signature)
             )),

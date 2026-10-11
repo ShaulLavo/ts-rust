@@ -582,7 +582,26 @@ all seven original-JavaScript boundary routes remain **STOP**.
 
 Timing is blocked by host load 11–20, above the required 2. Do not disturb other workloads or
 accept overlapping timings. After correctness gates, obtain six fresh processes per arm on a quiet
-host, re-profile edits, repair the next demonstrated edit cause, then continue the completion unit.
+host, repair the next demonstrated edit cause, then continue the completion unit. Six-process timing
+remains unrun; diagnostic stack samples below are not elapsed-time evidence.
+
+After the correctness checkpoint, a fresh name-retaining Rust 1.98.1 WASM diagnostic build
+(`profile-debug`, same crates tree; WASM SHA-256
+`5fd43e1c8c4af08d85093950efad738686c093c4def745aec51639acf128709f`) ran the unchanged
+59,844-byte fixture with clock measurements removed and bridge-count instrumentation. The job
+ended `DONE`; neither its module nor its results replace the distributable correctness evidence.
+Of **1,983 edit samples**, **947** include `parse_source_file` and **439** include `encode_tree`.
+The largest exclusive leaf is `sbrk` (**148 samples**); 53 of these follow
+`FileStore::push_record_into_full_column` reallocation and 20 follow `NodeKids` growth in
+`push_build_columns`. Counts overlap and cannot be added or compared as latency deltas with u10.
+`FileStore::new` reserves `text.len()/12+1`; investigate repeated column growth without blindly
+changing this native-corpus heuristic, adding a pathname-global cache, or weakening immutable-version
+ownership. The next edit repair and its measurements are pending.
+
+The distributable's separate `count-only/counts.json` confirms exactly **30 `parseDocument`
+requests for 30 edits**, carrying **15,023,120 binary response bytes** in total; it does not expose
+a duplicate-parse route. Completion makes **900 graph requests**, including 210 `getSymbolData`
+and 60 `getTypeData` calls. Both count-only probes omit clock measurements and make no speedup claim.
 
 Read-only completion investigation identifies two separate costs for the next verified unit:
 `NodeIndexTable::get_index` lazily sorts indices using repeated global `get_node_id` map access.
@@ -594,7 +613,15 @@ a matching midpoint, and changing distinct-key order can select another duplicat
 slots can have distinct JS wrappers and encoded parents even when they resolve to the same Rust
 node. Add old-versus-candidate controls for duplicate ranks, preassigned IDs, synthetic/foreign
 aliases and per-slot JS identity. Prove every lookup against the old result and retain old versions
-across edits before measuring. Of 303 exclusive diagnostic
+across edits before measuring. An additional lifetime constraint blocks an unconditional raw-handle
+switch: `get_node_id` also rejects released nodes on cache misses, while cache hits return directly.
+A raw search can turn that target failure into zero and also skip cold-sort checks on foreign table
+members. Preserve these guards, including their cache-hit behavior; ordinary program/source leases
+are insufficient evidence for every public table/foreign alias. A potentially safer bounded candidate
+memoizes per-slot IDs lazily inside the existing comparator, preserving original evaluation and ID
+assignment order, then uses those IDs for binary comparisons while retaining one target ID lookup.
+It requires an extra ID vector and explicit duplicate/stale-target/stale-member tests; no candidate
+or measurement has been implemented. Of 303 exclusive diagnostic
 `wrap` samples, 257 follow token navigation through `classicChildren`, 18 follow semicolon detection,
 and six follow checker declaration decoding. A separate token-position optimization must retain
 public child-array semantics. Eager symbol loads are per newly interned object; disabling eager
@@ -602,7 +629,8 @@ loads alone has no demonstrated saving and must not be presented as a repair.
 
 Read-only preparation for later units (no candidate changes or closure claimed):
 
-- TypeScript 6.0.3 package-scope probe: **360 observations / 720 passing assertions**. Ordinary
+- TypeScript 6.0.3 package-scope probe: **360 observations / 720 passing assertions**, freshly
+  confirmed under Node 22.23.3 in `u11-preparation/host-scope-20261011-node22-confirmation.json`. Ordinary
   `.ts`/`.d.ts` outside `node_modules` perform implied-format scope lookup only under Node16/NodeNext;
   inside `node_modules`, Classic/Node10/Bundler also lookup. Fixed `.mts`/`.cts` retain their fixed
   format without that lookup. Apply an explicit classic policy before parse-cache access, in serial

@@ -2534,10 +2534,14 @@ impl Node {
 
     // Go: ast.go:209 SubtreeFacts
     /// Go `node.SubtreeFacts()`: cached for a `CompositeBase` kind, computed
-    /// on each call for any other kind (`subtree_facts_with_data`).
+    /// on each call for any other kind (`run_subtree_facts`).
     #[must_use]
     pub fn subtree_facts(self) -> SubtreeFacts {
-        with_data!(self, |d| subtree_facts_with_data(self, d))
+        run_subtree_facts(
+            self,
+            #[cfg(test)]
+            None,
+        )
     }
 
     // Go: ast.go:229 Decorators
@@ -4593,46 +4597,6 @@ fn propagate_eraseable(child: Node) -> SubtreeFacts {
     facts_if(child.is_some(), TS)
 }
 
-// Go: subtreefacts.go:97 propagateObjectBindingElementSubtreeFacts
-fn propagate_object_binding_element(child: Node) -> SubtreeFacts {
-    let mut facts = propagate_subtree_facts(child);
-    if facts.intersects(SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD) {
-        facts = facts.without(SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD);
-        facts |= SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD
-            | SubtreeFacts::SUBTREE_CONTAINS_ES_OBJECT_REST_OR_SPREAD;
-    }
-    facts
-}
-
-// Go: subtreefacts.go:106 propagateBindingElementSubtreeFacts
-fn propagate_binding_element(child: Node) -> SubtreeFacts {
-    propagate_subtree_facts(child).without(SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD)
-}
-
-// Go: subtreefacts.go:110 propagateSubtreeFacts
-/// The facts a child adds to its parent. None for a nil child.
-fn propagate_subtree_facts(child: Node) -> SubtreeFacts {
-    if child.is_nil() {
-        return NONE_FACTS;
-    }
-    propagate_node_facts(child)
-}
-
-// Go: subtreefacts.go:117 propagateNodeListSubtreeFacts
-// Go: subtreefacts.go:128 propagateModifierListSubtreeFacts (with
-// `propagate_subtree_facts`)
-// PORT: the list is read in place from the node data (`DataList`).
-fn propagate_node_list(
-    children: DataList<'_>,
-    propagate: fn(Node) -> SubtreeFacts,
-) -> SubtreeFacts {
-    let mut facts = NONE_FACTS;
-    for child in children.nodes() {
-        facts |= propagate(child);
-    }
-    facts
-}
-
 /// True for Go node types that embed `CompositeBase` (directly, or through
 /// `ClassLikeBase` or `AccessorDeclarationBase`), on the data `d` of node
 /// `n`. Go caches `SubtreeFacts()` only for these types (`ast.go:1602`).
@@ -4773,139 +4737,335 @@ fn is_type_syntax_data(n: Node, d: &NodeData) -> bool {
     }
 }
 
-// Go: ast.go:1246 (*NodeDefault).propagateSubtreeFacts and the per-type
-// propagateSubtreeFacts overrides in ast.go.
-// PORT: the Go overrides are merged into one match on the node data.
-// PERF: emitast1 F2. One data read per child: the type syntax test, the
-// facts of a child that has none cached yet and the exclusion all use it.
-fn propagate_node_facts(n: Node) -> SubtreeFacts {
-    with_data!(n, |d| propagate_node_facts_of_data(n, d))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FactsMode {
+    Raw,
+    Propagated,
+    ObjectBindingElement,
+    ArrayBindingElement,
+    MetaPropertyName,
 }
 
-/// `propagate_node_facts` over the data `d` of `n`, read in place.
-fn propagate_node_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
-    // Go: ast.go:1621 (*TypeSyntaxBase).propagateSubtreeFacts
-    if is_type_syntax_data(n, d) {
-        return TS;
-    }
-    let facts = non_type_subtree_facts(n, d);
-    let f = n.file_index();
-    match d {
-        NodeData::CatchClause(_) => facts.without(EXCL_CATCH_CLAUSE),
-        NodeData::VariableDeclarationList(_) => facts.without(EXCL_VARIABLE_DECLARATION_LIST),
-        NodeData::BindingPattern(_) => facts.without(EXCL_BINDING_PATTERN),
-        NodeData::FunctionDeclaration(_) | NodeData::FunctionExpression(_) => {
-            facts.without(EXCL_FUNCTION)
+impl FactsMode {
+    fn apply(self, facts: SubtreeFacts) -> SubtreeFacts {
+        match self {
+            Self::ObjectBindingElement
+                if facts.intersects(SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD) =>
+            {
+                facts.without(SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD)
+                    | SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD
+                    | SubtreeFacts::SUBTREE_CONTAINS_ES_OBJECT_REST_OR_SPREAD
+            }
+            Self::ArrayBindingElement => {
+                facts.without(SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD)
+            }
+            Self::MetaPropertyName => facts.without(SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER),
+            _ => facts,
         }
-        NodeData::ModuleDeclaration(_) => facts.without(EXCL_MODULE),
-        NodeData::ConstructorDeclaration(_) => facts.without(EXCL_CONSTRUCTOR),
-        // `req(f, d.name)` is `n.name()` (the name column of a store node
-        // holds the same child).
-        NodeData::GetAccessorDeclaration(d) => {
-            facts.without(EXCL_ACCESSOR) | propagate_subtree_facts(req(f, d.name))
-        }
-        NodeData::SetAccessorDeclaration(d) => {
-            facts.without(EXCL_ACCESSOR) | propagate_subtree_facts(req(f, d.name))
-        }
-        NodeData::MethodDeclaration(d) => {
-            facts.without(EXCL_METHOD) | propagate_subtree_facts(req(f, d.name))
-        }
-        NodeData::PropertyDeclaration(d) => {
-            facts.without(EXCL_PROPERTY) | propagate_subtree_facts(req(f, d.name))
-        }
-        NodeData::ArrowFunction(_) => facts.without(EXCL_ARROW_FUNCTION),
-        NodeData::ObjectLiteralExpression(_) => facts.without(EXCL_OBJECT_LITERAL),
-        // Parameter, Class, OuterExpression, PropertyAccess, ElementAccess,
-        // Call, New and ArrayLiteral exclusions all equal the Node exclusion.
-        _ => facts.without(EXCL_NODE),
     }
 }
 
-// Go: ast.go:1602 (*CompositeBase).subtreeFactsWorker and ast.go:1234
-// (*NodeDefault).subtreeFactsWorker
-/// Go `n.SubtreeFacts()` for node `n` whose data `d` the caller loaded. A
-/// node of a `CompositeBase` kind gets the cached facts, or the facts
-/// computed from `d` (and cached). Any other node (a token, an identifier,
-/// a literal, type syntax) gets the facts computed from `d`, not cached.
-fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
-    if is_type_syntax_data(n, d) {
-        // Go: ast.go:1619 (*TypeSyntaxBase).computeSubtreeFacts
-        return TS;
-    }
-    non_type_subtree_facts(n, d)
+#[derive(Clone, Copy)]
+enum FactsCache {
+    None,
+    Static(&'static std::sync::atomic::AtomicU32),
+    Unpublished(Node),
 }
 
-/// `subtree_facts_with_data` for a node that is not type syntax
-/// (`is_type_syntax_data`), which the caller checked.
-// PERF: factscol1a. Caching every node cost 2 thread-local map accesses per
-// node (4.9x Go's instructions in the facts walk of a 5 MB JS file).
-// PERF: factscol1b. A node of a static publish reads and writes one atomic
-// word of the facts column of its file, as Go does. Two threads can both
-// compute the facts of a node; Go's `computeSubtreeFacts` is idempotent, so
-// they write the same word. The type syntax test is made once per node,
-// not once more here: in a deep chain of nodes that Go does not cache
-// (`await await ... x`), each step was 2 tests.
-#[inline]
-fn non_type_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
-    debug_assert!(!is_type_syntax_data(n, d), "{:?} is type syntax", n.kind());
-    if !is_composite_data(n, d) {
-        return subtree_facts_of_data(n, d);
-    }
-    composite_subtree_facts(n, d)
-}
-
-/// `non_type_subtree_facts` for a node of a `CompositeBase` kind: the
-/// cached facts, or the facts computed from `d`, cached.
-#[inline(never)]
-fn composite_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
-    if let Some(word) = super::store::static_facts_word(n) {
-        if let Some(facts) = computed_facts(SubtreeFacts(word.load(Ordering::Relaxed))) {
-            return facts;
+impl FactsCache {
+    fn read(self) -> Option<SubtreeFacts> {
+        match self {
+            Self::None => None,
+            Self::Static(word) => computed_facts(SubtreeFacts(word.load(Ordering::Relaxed))),
+            Self::Unpublished(node) => cached_unpublished_subtree_facts(node),
         }
-        let facts = subtree_facts_of_data(n, d).without(SubtreeFacts::COMPUTED);
-        word.store((facts | SubtreeFacts::COMPUTED).0, Ordering::Relaxed);
-        return facts;
     }
-    if let Some(facts) = cached_unpublished_subtree_facts(n) {
-        return facts;
+
+    fn write(self, facts: SubtreeFacts) {
+        match self {
+            Self::None => {}
+            Self::Static(word) => {
+                word.store((facts | SubtreeFacts::COMPUTED).0, Ordering::Relaxed);
+            }
+            Self::Unpublished(node) => cache_unpublished_subtree_facts(node, facts),
+        }
     }
-    let facts = subtree_facts_of_data(n, d).without(SubtreeFacts::COMPUTED);
-    cache_unpublished_subtree_facts(n, facts);
-    facts
+}
+
+#[derive(Clone, Copy)]
+struct FactsPropagation {
+    exclude: SubtreeFacts,
+    name: Node,
+}
+
+struct FactsFrame {
+    #[cfg(test)]
+    node: Node,
+    value_start: usize,
+    facts: SubtreeFacts,
+    cache: FactsCache,
+    propagation: FactsPropagation,
+    mode: FactsMode,
+    assignment_pattern: Node,
+}
+
+enum FactsTask {
+    Evaluate(Node, FactsMode),
+    Finish(FactsFrame),
+    FinishName(SubtreeFacts, FactsMode),
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum FactsEvent {
+    Evaluate(Node, FactsMode),
+    Cached(Node),
+    Published(Node),
+}
+
+// Go: NodeDefault/CompositeBase.subtreeFactsWorker and the per-type
+// propagateSubtreeFacts overrides. Only completed raw facts enter a cache.
+fn run_subtree_facts(
+    root: Node,
+    #[cfg(test)] mut trace: Option<&mut Vec<FactsEvent>>,
+) -> SubtreeFacts {
+    let mut tasks = Vec::new();
+    let mut values = Vec::new();
+    let mut first = Some(FactsTask::Evaluate(root, FactsMode::Raw));
+    while let Some(task) = first.take().or_else(|| tasks.pop()) {
+        match task {
+            FactsTask::Evaluate(node, mode) => {
+                #[cfg(test)]
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.push(FactsEvent::Evaluate(node, mode));
+                }
+                if node.is_nil() && mode != FactsMode::Raw {
+                    values.push(NONE_FACTS);
+                    continue;
+                }
+                let task_start = tasks.len();
+                let value_start = values.len();
+                // No data reference or store borrow survives this scope.
+                let (frame, cached) = with_data!(node, |data| {
+                    let type_syntax = is_type_syntax_data(node, data);
+                    let propagation = facts_propagation(node, data, mode, type_syntax);
+                    let cache = if type_syntax || !is_composite_data(node, data) {
+                        FactsCache::None
+                    } else {
+                        match super::store::static_facts_word(node) {
+                            Some(word) => FactsCache::Static(word),
+                            None => FactsCache::Unpublished(node),
+                        }
+                    };
+                    let cached = cache.read();
+                    let mut assignment_pattern = Node::NIL;
+                    let facts = match cached {
+                        Some(facts) => facts,
+                        None if type_syntax => TS,
+                        None => {
+                            schedule_subtree_facts(node, data, &mut tasks, &mut assignment_pattern)
+                        }
+                    };
+                    (
+                        FactsFrame {
+                            #[cfg(test)]
+                            node,
+                            value_start,
+                            facts,
+                            cache,
+                            propagation,
+                            mode,
+                            assignment_pattern,
+                        },
+                        cached.is_some(),
+                    )
+                });
+                if cached {
+                    #[cfg(test)]
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.push(FactsEvent::Cached(node));
+                    }
+                    if mode == FactsMode::Raw {
+                        return frame.facts;
+                    }
+                    finish_facts_propagation(
+                        frame.facts,
+                        frame.propagation,
+                        mode,
+                        &mut tasks,
+                        &mut values,
+                    );
+                    continue;
+                }
+                if mode == FactsMode::Raw && task_start == tasks.len() {
+                    debug_assert!(tasks.is_empty());
+                    first = Some(FactsTask::Finish(frame));
+                    continue;
+                }
+                tasks.push(FactsTask::Finish(frame));
+                // Dependencies were recorded in Go order; LIFO executes them
+                // in that order and finishes the parent after its children.
+                tasks[task_start..].reverse();
+            }
+            FactsTask::Finish(frame) => {
+                let mut facts = frame.facts;
+                for child_facts in values.drain(frame.value_start..) {
+                    facts |= child_facts;
+                }
+                // This helper still recursively examines nested destructuring.
+                // It runs after dependencies, outside the node-data read scope.
+                if frame.assignment_pattern.is_some()
+                    && contains_object_rest_or_spread(frame.assignment_pattern)
+                {
+                    facts |= SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD;
+                }
+                facts = facts.without(SubtreeFacts::COMPUTED);
+                frame.cache.write(facts);
+                #[cfg(test)]
+                if !matches!(frame.cache, FactsCache::None) {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.push(FactsEvent::Published(frame.node));
+                    }
+                }
+                if frame.mode == FactsMode::Raw {
+                    debug_assert!(tasks.is_empty() && values.is_empty());
+                    return facts;
+                }
+                finish_facts_propagation(
+                    facts,
+                    frame.propagation,
+                    frame.mode,
+                    &mut tasks,
+                    &mut values,
+                );
+            }
+            FactsTask::FinishName(facts, mode) => {
+                let name_facts = values.pop().expect("the name returned its facts");
+                values.push(mode.apply(facts | name_facts));
+            }
+        }
+    }
+    debug_assert_eq!(values.len(), 1);
+    values.pop().expect("the root returned its facts")
+}
+
+fn finish_facts_propagation(
+    facts: SubtreeFacts,
+    propagation: FactsPropagation,
+    mode: FactsMode,
+    tasks: &mut Vec<FactsTask>,
+    values: &mut Vec<SubtreeFacts>,
+) {
+    let facts = facts.without(propagation.exclude);
+    if propagation.name.is_nil() {
+        values.push(mode.apply(facts));
+        return;
+    }
+    // Go publishes the member's raw facts before propagating its name again.
+    tasks.push(FactsTask::FinishName(facts, mode));
+    tasks.push(FactsTask::Evaluate(propagation.name, FactsMode::Propagated));
+}
+
+fn facts_propagation(
+    node: Node,
+    data: &NodeData,
+    mode: FactsMode,
+    type_syntax: bool,
+) -> FactsPropagation {
+    if mode == FactsMode::Raw || type_syntax {
+        return FactsPropagation {
+            exclude: NONE_FACTS,
+            name: Node::NIL,
+        };
+    }
+    let mut name = Node::NIL;
+    let file = node.file_index();
+    let exclude = match data {
+        NodeData::CatchClause(_) => EXCL_CATCH_CLAUSE,
+        NodeData::VariableDeclarationList(_) => EXCL_VARIABLE_DECLARATION_LIST,
+        NodeData::BindingPattern(_) => EXCL_BINDING_PATTERN,
+        NodeData::FunctionDeclaration(_) | NodeData::FunctionExpression(_) => EXCL_FUNCTION,
+        NodeData::ModuleDeclaration(_) => EXCL_MODULE,
+        NodeData::ConstructorDeclaration(_) => EXCL_CONSTRUCTOR,
+        NodeData::GetAccessorDeclaration(data) => {
+            name = req(file, data.name);
+            EXCL_ACCESSOR
+        }
+        NodeData::SetAccessorDeclaration(data) => {
+            name = req(file, data.name);
+            EXCL_ACCESSOR
+        }
+        NodeData::MethodDeclaration(data) => {
+            name = req(file, data.name);
+            EXCL_METHOD
+        }
+        NodeData::PropertyDeclaration(data) => {
+            name = req(file, data.name);
+            EXCL_PROPERTY
+        }
+        NodeData::ArrowFunction(_) => EXCL_ARROW_FUNCTION,
+        NodeData::ObjectLiteralExpression(_) => EXCL_OBJECT_LITERAL,
+        _ => EXCL_NODE,
+    };
+    FactsPropagation { exclude, name }
+}
+
+/// Records an edge; its facts will be ORed by the parent's finish task.
+fn schedule_facts(tasks: &mut Vec<FactsTask>, child: Node, mode: FactsMode) -> SubtreeFacts {
+    if child.is_some() {
+        tasks.push(FactsTask::Evaluate(child, mode));
+    }
+    NONE_FACTS
+}
+
+fn schedule_list_facts(
+    tasks: &mut Vec<FactsTask>,
+    children: DataList<'_>,
+    mode: FactsMode,
+) -> SubtreeFacts {
+    for child in children.nodes() {
+        schedule_facts(tasks, child, mode);
+    }
+    NONE_FACTS
 }
 
 // Go: ast.go computeSubtreeFacts overrides (ast.go:1619 to ast.go:2689) and
 // ast_generated.go computeSubtreeFacts methods.
 // PORT: the Go per-type methods are merged into one match. Types without an
 // override use Go `(*NodeDefault).computeSubtreeFacts`, which is None.
-// `(*TypeSyntaxBase).computeSubtreeFacts` is in `subtree_facts_with_data`.
-/// Go `computeSubtreeFacts` over the data `d` of `n`, read in place, for a
-/// node that is not type syntax (`non_type_subtree_facts`).
-fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
+// TypeSyntaxBase is handled before scheduling dependencies.
+/// Records Go computeSubtreeFacts dependencies in order and returns its
+/// local facts. Child facts are supplied by the explicit value stack.
+fn schedule_subtree_facts(
+    n: Node,
+    d: &NodeData,
+    tasks: &mut Vec<FactsTask>,
+    assignment_pattern: &mut Node,
+) -> SubtreeFacts {
     let f = n.file_index();
     macro_rules! p {
         ($x:expr) => {
-            propagate_subtree_facts(req(f, $x))
+            schedule_facts(tasks, req(f, $x), FactsMode::Propagated)
         };
     }
     macro_rules! po {
         ($x:expr) => {
-            propagate_subtree_facts(opt(f, $x))
+            schedule_facts(tasks, opt(f, $x), FactsMode::Propagated)
         };
     }
     macro_rules! pl {
         ($x:expr) => {
-            propagate_node_list(DataList::req(f, &$x), propagate_subtree_facts)
+            schedule_list_facts(tasks, DataList::req(f, &$x), FactsMode::Propagated)
         };
     }
     macro_rules! pol {
         ($x:expr) => {
-            propagate_node_list(DataList::opt(f, &$x), propagate_subtree_facts)
+            schedule_list_facts(tasks, DataList::opt(f, &$x), FactsMode::Propagated)
         };
     }
     macro_rules! pm {
         ($x:expr) => {
-            propagate_node_list(DataList::mods(f, &$x), propagate_subtree_facts)
+            schedule_list_facts(tasks, DataList::mods(f, &$x), FactsMode::Propagated)
         };
     }
     macro_rules! el {
@@ -5013,13 +5173,16 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
         }
         // Go: ast.go:1734 (*BindingPattern).computeSubtreeFacts
         NodeData::BindingPattern(d) => match n.kind() {
-            SyntaxKind::ObjectBindingPattern => propagate_node_list(
+            SyntaxKind::ObjectBindingPattern => schedule_list_facts(
+                tasks,
                 DataList::req(f, &d.elements),
-                propagate_object_binding_element,
+                FactsMode::ObjectBindingElement,
             ),
-            SyntaxKind::ArrayBindingPattern => {
-                propagate_node_list(DataList::req(f, &d.elements), propagate_binding_element)
-            }
+            SyntaxKind::ArrayBindingPattern => schedule_list_facts(
+                tasks,
+                DataList::req(f, &d.elements),
+                FactsMode::ArrayBindingElement,
+            ),
             _ => NONE_FACTS,
         },
         // Go: ast.go:1749 (*ParameterDeclaration).computeSubtreeFacts
@@ -5029,7 +5192,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
                 TS
             } else {
                 pm!(d.modifiers)
-                    | propagate_subtree_facts(name)
+                    | schedule_facts(tasks, name, FactsMode::Propagated)
                     | e!(d.question_token)
                     | e!(d.type_)
                     | po!(d.initializer)
@@ -5261,8 +5424,8 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
         NodeData::BinaryExpression(d) => {
             let left = req(f, d.left);
             let operator_kind = req(f, d.operator_token).kind();
-            let mut facts = pm!(d.modifiers)
-                | propagate_subtree_facts(left)
+            let facts = pm!(d.modifiers)
+                | schedule_facts(tasks, left, FactsMode::Propagated)
                 | po!(d.type_)
                 | p!(d.operator_token)
                 | p!(d.right)
@@ -5273,9 +5436,8 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
                 );
             if operator_kind == SyntaxKind::EqualsToken
                 && (is_object_literal_expression(left) || is_array_literal_expression(left))
-                && contains_object_rest_or_spread(left)
             {
-                facts |= SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD;
+                *assignment_pattern = left;
             }
             facts
         }
@@ -5326,7 +5488,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
             let name = req(f, d.name);
             p!(d.expression)
                 | po!(d.question_dot_token)
-                | propagate_subtree_facts(name)
+                | schedule_facts(tasks, name, FactsMode::Propagated)
                 | facts_if(
                     !is_identifier(name),
                     SubtreeFacts::SUBTREE_CONTAINS_PRIVATE_IDENTIFIER_IN_EXPRESSION,
@@ -5346,7 +5508,9 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
         // Go: ast.go:2144 (*NewExpression).computeSubtreeFacts
         NodeData::NewExpression(d) => p!(d.expression) | el!(d.type_arguments) | pol!(d.arguments),
         // Go: ast.go:2154 (*MetaProperty).computeSubtreeFacts
-        NodeData::MetaProperty(d) => p!(d.name).without(SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER),
+        NodeData::MetaProperty(d) => {
+            schedule_facts(tasks, req(f, d.name), FactsMode::MetaPropertyName)
+        }
         // Go: ast.go:2158 (*NonNullExpression).computeSubtreeFacts
         NodeData::NonNullExpression(d) => p!(d.expression) | TS,
         // Go: ast.go:2162 (*SpreadElement).computeSubtreeFacts
@@ -5443,7 +5607,11 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
         NodeData::SwitchStatement(d) => p!(d.expression) | p!(d.case_block),
         NodeData::CaseBlock(d) => pl!(d.clauses),
         NodeData::CaseOrDefaultClause(d) => {
-            propagate_subtree_facts(case_expression(n, f, d.expression)) | pl!(d.statements)
+            schedule_facts(
+                tasks,
+                case_expression(n, f, d.expression),
+                FactsMode::Propagated,
+            ) | pl!(d.statements)
         }
         NodeData::ThrowStatement(d) => p!(d.expression),
         NodeData::TryStatement(d) => p!(d.try_block) | po!(d.catch_clause) | po!(d.finally_block),
@@ -6753,5 +6921,579 @@ mod tests {
             }
         }
         assert!(cached > 10 && computed > 10, "{cached} {computed}");
+    }
+
+    #[test]
+    fn subtree_facts_deep_factory_chains_are_iterative() {
+        let factory = NodeFactory::new();
+        let identifier = factory.new_identifier("leaf");
+        let identifier_facts = SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER;
+        let await_facts = identifier_facts
+            | SubtreeFacts::SUBTREE_CONTAINS_AWAIT
+            | SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT
+            | SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR;
+        for kind in [
+            SyntaxKind::AwaitExpression,
+            SyntaxKind::ParenthesizedExpression,
+            SyntaxKind::NonNullExpression,
+            SyntaxKind::BinaryExpression,
+        ] {
+            let operator = factory.new_token(SyntaxKind::PlusToken);
+            let right = factory.new_numeric_literal("1", TokenFlags::NONE);
+            let mut root = identifier;
+            let mut nodes = Vec::new();
+            for _ in 0..10_000 {
+                root = match kind {
+                    SyntaxKind::AwaitExpression => factory.new_await_expression(root),
+                    SyntaxKind::ParenthesizedExpression => {
+                        factory.new_parenthesized_expression(root)
+                    }
+                    SyntaxKind::NonNullExpression => {
+                        factory.new_non_null_expression(root, NodeFlags::NONE)
+                    }
+                    SyntaxKind::BinaryExpression => factory.new_binary_expression(
+                        ModifierList::NIL,
+                        root,
+                        Node::NIL,
+                        operator,
+                        right,
+                    ),
+                    _ => unreachable!(),
+                };
+                nodes.push(root);
+            }
+            let expected = match kind {
+                SyntaxKind::AwaitExpression => await_facts,
+                SyntaxKind::NonNullExpression => identifier_facts | TS,
+                _ => identifier_facts,
+            };
+            assert_eq!(root.subtree_facts(), expected, "{kind:?}");
+            assert_eq!(root.subtree_facts(), expected, "warm {kind:?}");
+            for node in nodes {
+                let expected_cache = (kind == SyntaxKind::BinaryExpression).then_some(expected);
+                assert_eq!(cached_subtree_facts(node), expected_cache, "{kind:?}");
+            }
+        }
+        assert_eq!(cached_subtree_facts(identifier), None);
+    }
+
+    #[test]
+    fn subtree_facts_binary_dependencies_keep_go_order() {
+        let factory = NodeFactory::new();
+        let modifier = factory.new_token(SyntaxKind::ExportKeyword);
+        let left_leaf = factory.new_keyword_expression(SyntaxKind::ThisKeyword);
+        let left = factory.new_computed_property_name(left_leaf);
+        let type_leaf = factory.new_identifier("type");
+        let type_node = factory.new_computed_property_name(type_leaf);
+        let operator = factory.new_token(SyntaxKind::PlusToken);
+        let right = factory.new_keyword_expression(SyntaxKind::SuperKeyword);
+        let root = factory.new_binary_expression(
+            factory.new_modifier_list(&[modifier]),
+            left,
+            type_node,
+            operator,
+            right,
+        );
+        let mut trace = Vec::new();
+        let expected = TS
+            | SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER
+            | SubtreeFacts::SUBTREE_CONTAINS_LEXICAL_THIS
+            | SubtreeFacts::SUBTREE_CONTAINS_LEXICAL_SUPER;
+        assert_eq!(run_subtree_facts(root, Some(&mut trace)), expected);
+        assert_eq!(
+            trace,
+            vec![
+                FactsEvent::Evaluate(root, FactsMode::Raw),
+                FactsEvent::Evaluate(modifier, FactsMode::Propagated),
+                FactsEvent::Evaluate(left, FactsMode::Propagated),
+                FactsEvent::Evaluate(left_leaf, FactsMode::Propagated),
+                FactsEvent::Published(left),
+                FactsEvent::Evaluate(type_node, FactsMode::Propagated),
+                FactsEvent::Evaluate(type_leaf, FactsMode::Propagated),
+                FactsEvent::Published(type_node),
+                FactsEvent::Evaluate(operator, FactsMode::Propagated),
+                FactsEvent::Evaluate(right, FactsMode::Propagated),
+                FactsEvent::Published(root),
+            ]
+        );
+        trace.clear();
+        assert_eq!(run_subtree_facts(root, Some(&mut trace)), expected);
+        assert_eq!(
+            trace,
+            vec![
+                FactsEvent::Evaluate(root, FactsMode::Raw),
+                FactsEvent::Cached(root),
+            ]
+        );
+    }
+
+    #[test]
+    fn subtree_facts_member_names_follow_raw_publication_and_scope_masks() {
+        let factory = NodeFactory::new();
+        let lexical_this = SubtreeFacts::SUBTREE_CONTAINS_LEXICAL_THIS;
+        let lexical_super = SubtreeFacts::SUBTREE_CONTAINS_LEXICAL_SUPER;
+        let await_fact = SubtreeFacts::SUBTREE_CONTAINS_AWAIT;
+        for kind in [
+            SyntaxKind::MethodDeclaration,
+            SyntaxKind::GetAccessor,
+            SyntaxKind::SetAccessor,
+            SyntaxKind::PropertyDeclaration,
+        ] {
+            let this_node = factory.new_keyword_expression(SyntaxKind::ThisKeyword);
+            let awaited = factory.new_await_expression(this_node);
+            let name = factory.new_computed_property_name(awaited);
+            let body = factory.new_keyword_expression(SyntaxKind::SuperKeyword);
+            let member = match kind {
+                SyntaxKind::MethodDeclaration => factory.new_method_declaration(
+                    ModifierList::NIL,
+                    Node::NIL,
+                    name,
+                    Node::NIL,
+                    NodeList::NIL,
+                    NodeList::NIL,
+                    Node::NIL,
+                    Node::NIL,
+                    body,
+                ),
+                SyntaxKind::GetAccessor => factory.new_get_accessor_declaration(
+                    ModifierList::NIL,
+                    name,
+                    NodeList::NIL,
+                    NodeList::NIL,
+                    Node::NIL,
+                    Node::NIL,
+                    body,
+                ),
+                SyntaxKind::SetAccessor => factory.new_set_accessor_declaration(
+                    ModifierList::NIL,
+                    name,
+                    NodeList::NIL,
+                    NodeList::NIL,
+                    Node::NIL,
+                    Node::NIL,
+                    body,
+                ),
+                SyntaxKind::PropertyDeclaration => factory.new_property_declaration(
+                    ModifierList::NIL,
+                    name,
+                    Node::NIL,
+                    Node::NIL,
+                    body,
+                ),
+                _ => unreachable!(),
+            };
+            let root = factory.new_parenthesized_expression(member);
+            let mut trace = Vec::new();
+            let propagated = run_subtree_facts(root, Some(&mut trace));
+            assert!(propagated.contains(lexical_this | await_fact), "{kind:?}");
+            assert!(!propagated.intersects(lexical_super), "{kind:?}");
+            let raw = member.subtree_facts();
+            assert!(
+                raw.contains(lexical_this | lexical_super | await_fact),
+                "{kind:?}"
+            );
+            assert_eq!(cached_subtree_facts(member), Some(raw));
+            let name_visits: Vec<_> = trace
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    (*event == FactsEvent::Evaluate(name, FactsMode::Propagated)).then_some(index)
+                })
+                .collect();
+            assert_eq!(name_visits.len(), 2, "{kind:?} {trace:?}");
+            let published = trace
+                .iter()
+                .position(|event| *event == FactsEvent::Published(member))
+                .unwrap();
+            assert!(
+                name_visits[0] < published && published < name_visits[1],
+                "{trace:?}"
+            );
+            trace.clear();
+            assert_eq!(run_subtree_facts(root, Some(&mut trace)), propagated);
+            assert_eq!(
+                trace,
+                vec![
+                    FactsEvent::Evaluate(root, FactsMode::Raw),
+                    FactsEvent::Evaluate(member, FactsMode::Propagated),
+                    FactsEvent::Cached(member),
+                    FactsEvent::Evaluate(name, FactsMode::Propagated),
+                    FactsEvent::Cached(name),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn subtree_facts_method_body_precedes_eraseable_signature_and_skips_types() {
+        let factory = NodeFactory::new();
+        let modifier = factory.new_token(SyntaxKind::AsyncKeyword);
+        let asterisk = factory.new_token(SyntaxKind::AsteriskToken);
+        let name = factory.new_identifier("method");
+        let parameter_name = factory.new_identifier("arg");
+        let parameter = factory.new_parameter_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            parameter_name,
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
+        let body_leaf = factory.new_keyword_expression(SyntaxKind::ThisKeyword);
+        let body = factory.new_computed_property_name(body_leaf);
+        let erased = factory
+            .new_computed_property_name(factory.new_keyword_expression(SyntaxKind::SuperKeyword));
+        let root = factory.new_method_declaration(
+            factory.new_modifier_list(&[modifier]),
+            asterisk,
+            name,
+            Node::NIL,
+            factory.new_node_list(&[erased]),
+            factory.new_node_list(&[parameter]),
+            erased,
+            erased,
+            body,
+        );
+        let mut trace = Vec::new();
+        let facts = run_subtree_facts(root, Some(&mut trace));
+        assert_eq!(
+            facts,
+            TS | SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER
+                | SubtreeFacts::SUBTREE_CONTAINS_LEXICAL_THIS
+                | SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT
+                | SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR
+        );
+        let evaluated: Vec<_> = trace
+            .iter()
+            .filter_map(|event| match event {
+                FactsEvent::Evaluate(node, _) => Some(*node),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            evaluated,
+            vec![
+                root,
+                modifier,
+                asterisk,
+                name,
+                parameter,
+                parameter_name,
+                body,
+                body_leaf
+            ]
+        );
+        assert_eq!(cached_subtree_facts(erased), None);
+    }
+
+    #[test]
+    fn subtree_facts_skips_type_syntax_ambient_bodyless_and_this_parameter_children() {
+        let factory = NodeFactory::new();
+        let skipped = factory
+            .new_computed_property_name(factory.new_keyword_expression(SyntaxKind::ThisKeyword));
+        let declared = factory.new_token(SyntaxKind::DeclareKeyword);
+        let type_syntax = factory.new_js_doc_type_expression(skipped);
+        let ambient =
+            factory.new_variable_statement(factory.new_modifier_list(&[declared]), skipped);
+        let bodyless = factory.new_function_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            skipped,
+            NodeList::NIL,
+            NodeList::NIL,
+            skipped,
+            skipped,
+            Node::NIL,
+        );
+        let this_parameter = factory.new_parameter_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            factory.new_identifier("this"),
+            Node::NIL,
+            skipped,
+            skipped,
+        );
+        for root in [type_syntax, ambient, bodyless, this_parameter] {
+            let mut trace = Vec::new();
+            assert_eq!(run_subtree_facts(root, Some(&mut trace)), TS);
+            assert_eq!(
+                trace.first(),
+                Some(&FactsEvent::Evaluate(root, FactsMode::Raw))
+            );
+            assert!(
+                !trace
+                    .iter()
+                    .any(|event| matches!(event, FactsEvent::Evaluate(node, _) if *node != root))
+            );
+            assert_eq!(root.subtree_facts(), TS);
+        }
+        assert_eq!(cached_subtree_facts(type_syntax), None);
+        assert_eq!(cached_subtree_facts(skipped), None);
+        assert_eq!(cached_subtree_facts(declared), None);
+    }
+
+    #[test]
+    fn subtree_facts_eraseable_lists_distinguish_present_empty_from_nil() {
+        let factory = NodeFactory::new();
+        let callee = factory.new_identifier("f");
+        let skipped = factory
+            .new_computed_property_name(factory.new_keyword_expression(SyntaxKind::ThisKeyword));
+        let empty = factory.new_node_list(&[]);
+        for (type_arguments, expected) in [
+            (NodeList::NIL, SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER),
+            (empty, SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER | TS),
+            (
+                factory.new_node_list(&[skipped]),
+                SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER | TS,
+            ),
+        ] {
+            let call = factory.new_call_expression(
+                callee,
+                Node::NIL,
+                type_arguments,
+                empty,
+                NodeFlags::NONE,
+            );
+            assert_eq!(call.subtree_facts(), expected);
+            assert_eq!(call.subtree_facts(), expected);
+        }
+        assert_eq!(cached_subtree_facts(skipped), None);
+    }
+
+    #[test]
+    fn subtree_facts_binding_edges_preserve_raw_rest_and_convert_each_element() {
+        let factory = NodeFactory::new();
+        let element = factory.new_binding_element(
+            factory.new_token(SyntaxKind::DotDotDotToken),
+            Node::NIL,
+            factory.new_identifier("rest"),
+            Node::NIL,
+        );
+        let elements = factory.new_node_list(&[element]);
+        let object = factory.new_binding_pattern(SyntaxKind::ObjectBindingPattern, elements);
+        let array = factory.new_binding_pattern(SyntaxKind::ArrayBindingPattern, elements);
+        let identifier = SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER;
+        let object_facts = identifier
+            | SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD
+            | SubtreeFacts::SUBTREE_CONTAINS_ES_OBJECT_REST_OR_SPREAD;
+        assert_eq!(object.subtree_facts(), object_facts);
+        assert_eq!(array.subtree_facts(), identifier);
+        assert_eq!(
+            element.subtree_facts(),
+            identifier | SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD
+        );
+        assert_eq!(
+            factory.new_parenthesized_expression(object).subtree_facts(),
+            object_facts
+        );
+        assert_eq!(object.subtree_facts(), object_facts);
+        assert_eq!(array.subtree_facts(), identifier);
+    }
+
+    #[test]
+    fn subtree_facts_meta_property_clears_only_its_name_and_caches_zero() {
+        let factory = NodeFactory::new();
+        let name = factory.new_identifier("target");
+        let meta = factory.new_meta_property(SyntaxKind::NewKeyword, name);
+        assert_eq!(meta.subtree_facts(), NONE_FACTS);
+        assert_eq!(cached_subtree_facts(meta), Some(NONE_FACTS));
+        assert_eq!(meta.subtree_facts(), NONE_FACTS);
+        let binary = factory.new_binary_expression(
+            ModifierList::NIL,
+            meta,
+            Node::NIL,
+            factory.new_token(SyntaxKind::PlusToken),
+            factory.new_identifier("sibling"),
+        );
+        assert_eq!(
+            binary.subtree_facts(),
+            SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER
+        );
+        assert_eq!(cached_subtree_facts(name), None);
+    }
+
+    #[test]
+    fn subtree_facts_binary_rest_check_uses_completed_nested_pattern_facts() {
+        let factory = NodeFactory::new();
+        let spread = factory.new_spread_assignment(factory.new_identifier("rest"));
+        let inner = factory.new_object_literal_expression(factory.new_node_list(&[spread]), false);
+        let property = factory.new_property_assignment(
+            ModifierList::NIL,
+            factory.new_identifier("x"),
+            Node::NIL,
+            Node::NIL,
+            inner,
+        );
+        let outer =
+            factory.new_object_literal_expression(factory.new_node_list(&[property]), false);
+        let right = factory.new_identifier("value");
+        let assignment = factory.new_binary_expression(
+            ModifierList::NIL,
+            outer,
+            Node::NIL,
+            factory.new_token(SyntaxKind::EqualsToken),
+            right,
+        );
+        let rest = SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD;
+        let mut trace = Vec::new();
+        let facts = run_subtree_facts(assignment, Some(&mut trace));
+        assert!(facts.intersects(rest));
+        assert!(!outer.subtree_facts().intersects(rest));
+        assert!(
+            outer
+                .subtree_facts()
+                .intersects(SubtreeFacts::SUBTREE_CONTAINS_ES_OBJECT_REST_OR_SPREAD)
+        );
+        assert!(inner.subtree_facts().intersects(rest));
+        let published: Vec<_> = trace
+            .iter()
+            .filter_map(|event| match event {
+                FactsEvent::Published(node) => Some(*node),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published, vec![inner, property, outer, assignment]);
+        assert_eq!(assignment.subtree_facts(), facts);
+        let ordinary = factory.new_binary_expression(
+            ModifierList::NIL,
+            outer,
+            Node::NIL,
+            factory.new_token(SyntaxKind::PlusToken),
+            right,
+        );
+        assert!(!ordinary.subtree_facts().intersects(rest));
+    }
+
+    #[test]
+    fn subtree_facts_function_and_arrow_exclusions_keep_distinct_lexical_scopes() {
+        let factory = NodeFactory::new();
+        let body =
+            factory.new_await_expression(factory.new_keyword_expression(SyntaxKind::ThisKeyword));
+        let function = factory.new_function_expression(
+            ModifierList::NIL,
+            Node::NIL,
+            Node::NIL,
+            NodeList::NIL,
+            NodeList::NIL,
+            Node::NIL,
+            Node::NIL,
+            body,
+        );
+        let arrow = factory.new_arrow_function(
+            ModifierList::NIL,
+            NodeList::NIL,
+            NodeList::NIL,
+            Node::NIL,
+            Node::NIL,
+            factory.new_token(SyntaxKind::EqualsGreaterThanToken),
+            body,
+        );
+        let lexical_this = SubtreeFacts::SUBTREE_CONTAINS_LEXICAL_THIS;
+        let await_fact = SubtreeFacts::SUBTREE_CONTAINS_AWAIT;
+        assert!(function.subtree_facts().contains(lexical_this | await_fact));
+        assert!(arrow.subtree_facts().contains(lexical_this | await_fact));
+        let function_facts = factory
+            .new_parenthesized_expression(function)
+            .subtree_facts();
+        let arrow_facts = factory.new_parenthesized_expression(arrow).subtree_facts();
+        assert!(!function_facts.intersects(lexical_this | await_fact));
+        assert!(arrow_facts.intersects(lexical_this));
+        assert!(!arrow_facts.intersects(await_fact));
+        assert!(function_facts.intersects(SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT));
+        assert_eq!(arrow_facts, function_facts | lexical_this);
+    }
+
+    #[test]
+    fn subtree_facts_unpublished_store_chains_release_data_borrows_between_tasks() {
+        let store = crate::ast::store::new_file_store("/unpublished-facts.ts", "");
+        let factory = NodeFactory::for_file(store);
+        let identifier = factory.new_identifier("x");
+        let operator = factory.new_token(SyntaxKind::PlusToken);
+        let mut root = identifier;
+        for _ in 0..5_000 {
+            let left = factory.new_non_null_expression(
+                factory.new_parenthesized_expression(factory.new_await_expression(root)),
+                NodeFlags::NONE,
+            );
+            root = factory.new_binary_expression(
+                ModifierList::NIL,
+                left,
+                Node::NIL,
+                operator,
+                identifier,
+            );
+        }
+        assert_eq!(cached_subtree_facts(root), None);
+        let expected = TS
+            | SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER
+            | SubtreeFacts::SUBTREE_CONTAINS_AWAIT
+            | SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT
+            | SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR;
+        assert_eq!(root.subtree_facts(), expected);
+        assert_eq!(cached_subtree_facts(root), Some(expected));
+        assert_eq!(root.subtree_facts(), expected);
+        assert_eq!(cached_subtree_facts(identifier), None);
+    }
+
+    #[test]
+    fn subtree_facts_private_in_flag_requires_both_private_name_and_in_operator() {
+        let factory = NodeFactory::new();
+        let private_name = factory.new_private_identifier("#field");
+        let ordinary_name = factory.new_identifier("field");
+        let right = factory.new_identifier("object");
+        let private_in = SubtreeFacts::SUBTREE_CONTAINS_PRIVATE_IDENTIFIER_IN_EXPRESSION;
+        for (left, operator, expected) in [
+            (private_name, SyntaxKind::InKeyword, true),
+            (private_name, SyntaxKind::PlusToken, false),
+            (ordinary_name, SyntaxKind::InKeyword, false),
+        ] {
+            let root = factory.new_binary_expression(
+                ModifierList::NIL,
+                left,
+                Node::NIL,
+                factory.new_token(operator),
+                right,
+            );
+            let facts = root.subtree_facts();
+            assert_eq!(facts.intersects(private_in), expected);
+            assert_eq!(root.subtree_facts(), facts);
+        }
+    }
+
+    #[test]
+    fn subtree_facts_bodyless_member_cache_still_repropagates_its_name() {
+        let factory = NodeFactory::new();
+        let this_node = factory.new_keyword_expression(SyntaxKind::ThisKeyword);
+        let name = factory.new_computed_property_name(this_node);
+        let member = factory.new_method_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            name,
+            Node::NIL,
+            NodeList::NIL,
+            NodeList::NIL,
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
+        assert_eq!(member.subtree_facts(), TS);
+        assert_eq!(cached_subtree_facts(name), None);
+        let root = factory.new_parenthesized_expression(member);
+        let mut trace = Vec::new();
+        let expected = TS | SubtreeFacts::SUBTREE_CONTAINS_LEXICAL_THIS;
+        assert_eq!(run_subtree_facts(root, Some(&mut trace)), expected);
+        assert_eq!(
+            trace,
+            vec![
+                FactsEvent::Evaluate(root, FactsMode::Raw),
+                FactsEvent::Evaluate(member, FactsMode::Propagated),
+                FactsEvent::Cached(member),
+                FactsEvent::Evaluate(name, FactsMode::Propagated),
+                FactsEvent::Evaluate(this_node, FactsMode::Propagated),
+                FactsEvent::Published(name),
+            ]
+        );
+        assert_eq!(cached_subtree_facts(member), Some(TS));
+        assert_eq!(root.subtree_facts(), expected);
     }
 }

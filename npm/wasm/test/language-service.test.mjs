@@ -133,7 +133,7 @@ test("raw initialization can recover and distinguishes parse errors", async () =
     assert.equal(call(JSON.stringify({ action: "initialize", cwd: "/", args: [], capabilities: {} })).error.code, -32602);
 });
 
-test("position-heavy results reuse the program's file line map", async () => {
+test("position-heavy results reuse the program's text and line maps", async () => {
     const module = await loadModule();
     await countFileReads(async reads => {
         const source = "const shared = 1;\n" + Array.from({ length: 250 }, (_, index) => `export const item${index} = shared;\n`).join("");
@@ -147,7 +147,13 @@ test("position-heavy results reuse the program's file line map", async () => {
             const result = await service.request("textDocument/semanticTokens/full", { textDocument: { uri } });
             assert.ok(result.data.length > 1_000);
             assert.ok((reads.get("/a.ts") ?? 0) <= 8, "file reads must be bounded independently of token count");
+            reads.clear();
+            const references = await service.request("textDocument/references", { textDocument: { uri }, position: { line: 0, character: 8 }, context: { includeDeclaration: true } });
+            assert.equal(references.length, 251);
+            assert.ok((reads.get("/a.ts") ?? 0) <= 8, "file reads must be bounded independently of reference count");
             await service.updateFiles({ "/a.ts": "\n" + source });
+            const shifted = await service.request("textDocument/references", { textDocument: { uri }, position: { line: 1, character: 8 }, context: { includeDeclaration: true } });
+            assert.deepEqual(shifted.map(item => item.range.start.line), references.map(item => item.range.start.line + 1));
             const moved = await service.request("textDocument/hover", { textDocument: { uri }, position: { line: 1, character: 8 } });
             assert.equal(moved.range.start.line, 1);
         } finally { await service.dispose(); }
@@ -165,4 +171,34 @@ test("the package entry isolates live editor state from ordinary compiler runs",
     } finally {
         await service.dispose();
     }
+});
+
+test("deletion input failures reject promises and preserve the service", async () => {
+    const module = await loadModule();
+    for (const create of [options => createLanguageService(options), options => createCoreLanguageService(module, options)]) {
+        const service = await create({ args: ["/a.ts"], files: { "/a.ts": "export const value = 1;" } });
+        try {
+            const broken = { [Symbol.iterator]() { throw new TypeError("iterator failed"); } };
+            for (const [paths, expected] of [[null, TypeError], [broken, TypeError], [["relative.ts"], /file paths must be absolute/], [[1], /file paths must be absolute/]]) {
+                let result;
+                assert.doesNotThrow(() => { result = service.deleteFiles(paths); });
+                assert.ok(result instanceof Promise);
+                await assert.rejects(result, expected);
+            }
+            assert.ok(await service.request("textDocument/hover", { textDocument: { uri: "file:///a.ts" }, position: { line: 0, character: 14 } }));
+        } finally { await service.dispose(); }
+    }
+});
+
+test("case-insensitive document positions use the matched source text", async () => {
+    const module = await loadModule();
+    const service = await createCoreLanguageService(module, { cwd: "/p", caseInsensitive: true, args: ["--noEmit", "--types", "", "/p/A.ts"], files: { "/p/A.ts": "export const first = 1;\nexport const second = 2;\n" } });
+    try {
+        for (const line of [0, 1]) {
+            const params = { textDocument: { uri: "file:///p/A.ts" }, position: { line, character: 14 } };
+            const canonical = await service.request("textDocument/hover", params);
+            assert.ok(canonical);
+            assert.deepEqual(await service.request("textDocument/hover", { ...params, textDocument: { uri: "file:///p/a.ts" } }), canonical);
+        }
+    } finally { await service.dispose(); }
 });

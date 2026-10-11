@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use ts_goport::api::proto::new_diagnostic_responses;
-use ts_goport::ast::FileText;
+use ts_goport::ast::{FileText, source_file_text};
 use ts_goport::core::Diagnostic;
 use ts_goport::execute::tsc::{System, SystemParseConfigHost, new_os_system};
 use ts_goport::frontend::compiler::{self, ProgramOptions};
@@ -20,6 +20,7 @@ use ts_goport::ls::{self, lsconv, lsutil};
 use ts_goport::lsp::lsproto;
 use ts_goport::options::Tristate;
 use ts_goport::program::ls_program;
+use ts_goport::project::{self, ParseCache};
 use ts_goport::sourcemap;
 
 use crate::host;
@@ -67,7 +68,10 @@ impl ServiceError {
 }
 
 fn check_config(diagnostics: &[Diagnostic]) -> Result<(), ServiceError> {
-    if diagnostics.is_empty() {
+    if !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.category() == ts_goport::diagnostics::Category::Error)
+    {
         return Ok(());
     }
     let diagnostics = new_diagnostic_responses(diagnostics);
@@ -127,6 +131,8 @@ pub struct Service {
     args: Vec<String>,
     context: Context,
     language: Option<ls::LanguageService>,
+    previous_program: Option<Rc<compiler::NewProgram>>,
+    parse_cache: Rc<ParseCache>,
 }
 
 impl Service {
@@ -161,6 +167,8 @@ impl Service {
             args,
             context,
             language: None,
+            previous_program: None,
+            parse_cache: project::new_parse_cache(project::RefCountCacheOptions::default()),
         })
     }
 
@@ -170,12 +178,16 @@ impl Service {
         };
         let program = language.program.clone();
         drop(language);
-        ls_program::release_program(&program);
+        // Keep unchanged parses leased until the replacement program acquires them.
+        self.previous_program = Some(program);
     }
 
     fn language(&mut self) -> Result<&ls::LanguageService, ServiceError> {
         if self.language.is_none() {
-            self.language = Some(build_language(&self.cwd, &self.args)?);
+            self.language = Some(build_language(&self.cwd, &self.args, &self.parse_cache)?);
+            if let Some(program) = self.previous_program.take() {
+                ls_program::release_program(&program);
+            }
         }
         self.language
             .as_ref()
@@ -197,6 +209,9 @@ impl Service {
 impl Drop for Service {
     fn drop(&mut self) {
         self.invalidate();
+        if let Some(program) = self.previous_program.take() {
+            ls_program::release_program(&program);
+        }
     }
 }
 
@@ -243,13 +258,25 @@ fn command(service: &mut Option<Service>, request: &Value) -> Result<String, Ser
     }
 }
 
-fn build_language(cwd: &str, args: &[String]) -> Result<ls::LanguageService, ServiceError> {
+fn build_language(
+    cwd: &str,
+    args: &[String],
+    cache: &Rc<ParseCache>,
+) -> Result<ls::LanguageService, ServiceError> {
     let sys = new_os_system().map_err(|status| {
         ServiceError::Internal(format!("cannot initialize host: {}", status.code()))
     })?;
-    let config = read_config(args, &sys)?;
     let host =
         compiler::new_compiler_host(cwd, sys.fs(), &sys.default_library_path(), None, None, None);
+    let host = Rc::new(crate::editor_host::EditorHost::new(host, cache.clone()));
+    let config = match read_config(args, &sys, &host) {
+        Ok(config) => config,
+        Err(error) => {
+            compiler::CompilerHost::release(&*host);
+            ts_goport::ast::release_file_version_pins();
+            return Err(error);
+        }
+    };
     let program = ls_program::new_program(
         ProgramOptions {
             host,
@@ -278,7 +305,11 @@ fn build_language(cwd: &str, args: &[String]) -> Result<ls::LanguageService, Ser
         line_maps.borrow_mut().insert(name.into(), lines.clone());
         Some(lines)
     });
-    let host = Rc::new(LanguageHost { fs, converters });
+    let host = Rc::new(LanguageHost {
+        fs,
+        converters,
+        files: RefCell::default(),
+    });
     Ok(ls::new_language_service(
         ls::autoimport::ProjectID(cwd.into()),
         program,
@@ -287,7 +318,11 @@ fn build_language(cwd: &str, args: &[String]) -> Result<ls::LanguageService, Ser
     ))
 }
 
-fn read_config(args: &[String], sys: &dyn System) -> Result<ParsedCommandLine, ServiceError> {
+fn read_config(
+    args: &[String],
+    sys: &dyn System,
+    editor: &crate::editor_host::EditorHost,
+) -> Result<ParsedCommandLine, ServiceError> {
     let host = SystemParseConfigHost(sys);
     let parsed = tsoptions::parse_command_line(args, &host);
     check_config(&parsed.get_config_file_parsing_diagnostics())?;
@@ -301,7 +336,7 @@ fn read_config(args: &[String], sys: &dyn System) -> Result<ParsedCommandLine, S
         path = tspath::combine_paths(&path, &["tsconfig.json"]);
     }
     let (config, errors) =
-        tsoptions::get_parsed_command_line_of_config_file(&path, Some(options), None, &host, None);
+        crate::editor_config::EditorConfig::new(editor).read(&path, Some(options), &host);
     check_config(&errors)?;
     let config = config.ok_or_else(|| {
         ServiceError::Internal(format!("project configuration was not returned: {path}"))
@@ -313,6 +348,7 @@ fn read_config(args: &[String], sys: &dyn System) -> Result<ParsedCommandLine, S
 struct LanguageHost {
     fs: Rc<dyn Fs>,
     converters: Rc<lsconv::Converters>,
+    files: RefCell<HashMap<String, (FileText, bool)>>,
 }
 
 impl ls::Host for LanguageHost {
@@ -320,8 +356,13 @@ impl ls::Host for LanguageHost {
         self.fs.use_case_sensitive_file_names()
     }
     fn read_file(&self, path: &str) -> (FileText, bool) {
+        if let Some(file) = self.files.borrow().get(path) {
+            return file.clone();
+        }
         let (text, found) = self.fs.read_file(path);
-        (FileText::Shared(Arc::from(text)), found)
+        let file = (FileText::Shared(Arc::from(text)), found);
+        self.files.borrow_mut().insert(path.into(), file.clone());
+        file
     }
     fn converters(&self) -> Rc<lsconv::Converters> {
         self.converters.clone()
@@ -378,7 +419,7 @@ fn normalize_document(
     if file.is_nil() {
         return Err("document is not part of the program".into());
     }
-    let text = language.program.host().fs().read_file(&uri.file_name()).0;
+    let text = source_file_text(file);
     let lines = lsconv::compute_lsp_line_starts(&text);
     if let Some(position) = params.get_mut("position") {
         normalize_position(&text, &lines, position)?;

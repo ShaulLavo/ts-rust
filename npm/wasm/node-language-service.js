@@ -56,7 +56,10 @@ export async function createWorkerLanguageService(module, options) {
             try { return request("updateFiles", [new Map(fileEntries(files))]); }
             catch (error) { return Promise.reject(error); }
         },
-        deleteFiles: paths => request("deleteFiles", [Array.from(paths)]),
+        deleteFiles(paths) {
+            try { return request("deleteFiles", [Array.from(paths)]); }
+            catch (error) { return Promise.reject(error); }
+        },
         dispose() {
             disposal ??= (failure ? Promise.resolve() : invoke("dispose", [])).finally(async () => {
                 disposed = true;

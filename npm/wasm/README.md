@@ -63,7 +63,8 @@ To try the example, run `python3 -m http.server -d npm/wasm` and open
 
 ## Editor language service
 
-`createLanguageService` keeps an in-memory project in its own WebAssembly instance. In browsers,
+`createLanguageService` exposes the language service used by native `tsgo --lsp`, with an
+in-memory project in its own WebAssembly instance. In browsers,
 call it in a module Web Worker so requests do not block the page. The Node entry owns a persistent
 worker with a 256 MB stack, configurable through `stackSizeMb`. The core entry runs on its caller's
 thread. Bun uses that calling-thread path because its workers ignore the stack-size setting.
@@ -107,10 +108,12 @@ Supported methods:
 - `textDocument/semanticTokens/full`, `textDocument/semanticTokens/range`
 
 `files` is copied on creation. `updateFiles` adds or replaces files; `deleteFiles` removes them.
-Calls are serialized per service. Changes release the old program and the next request rebuilds
-it, including its imports and configuration. Repeated reads share the current program. This first
-interface does not reuse the compiler program across changes, supply auto-import completions, or
-resolve completion/code-action items. Those operations need additional host integration.
+Calls are serialized per service. The next request after a change rebuilds the program, including
+its imports and configuration, while reusing unchanged parsed files through the native parse cache.
+The old program is released after the replacement acquires those files; superseded parses are freed.
+Repeated reads share the current program. Auto-import completions and completion/code-action item
+resolution need additional host integration. Invalid circular `extends` chains use a native error-path
+parser that retains configuration allocations until the service is disposed.
 
 The position converters keep one line map per file for the current program. File changes release
 those maps together with the program, so token, symbol and reference results use the current text.
@@ -128,7 +131,7 @@ also apply to language-service requests.
 `node bench/language-service.mjs [wasm-source]` measures position-heavy requests on two synthetic
 file sizes, reporting result counts, request time and source-file reads. Compare the same fixtures
 and build profile on the same machine. The Node tests bound source reads independently of token
-count and verify that an edit refreshes positions.
+and reference counts and verify that an edit refreshes positions.
 
 ## How it works
 
@@ -155,7 +158,8 @@ count and verify that an edit refreshes positions.
 - `scripts/wasm/diff.mjs` compares the module with the native tsgo on Query core, Hono, the
   multiprog fixtures and more, and `scripts/wasm/corpus.mjs` on the TypeScript compiler test cases.
   Exit codes, output and emitted files are byte-identical.
-- Not supported: `--watch`, `--pprofDir`, `--lsp`, `--api`, diagnostics as JSON with `--build`, and
+- The native `--lsp` service is available through `createLanguageService` above.
+- Not supported: `--watch`, `--pprofDir`, `--api`, diagnostics as JSON with `--build`, and
   plugins or content mappers that start processes. `--locale` gives English: the module has no
   message catalogs, to keep it small. With `--generateTrace`, a panic in the trace's type display
   ends the run (native recovers from it).

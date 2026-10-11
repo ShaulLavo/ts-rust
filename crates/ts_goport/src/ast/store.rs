@@ -242,8 +242,68 @@ struct FileStore {
     // PERF: one text hash per identifier node; the process-wide intern (a
     // shard `Mutex`) runs once per distinct text of the file.
     identifier_names: FxHashMap<&'static str, (Name, bool)>,
+    #[cfg(test)]
+    allocation_stats: [SlotColumnAllocation; 6],
     /// U1 (e): binder capacity hints, made with `facts`.
     bind_estimate: BindEstimate,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SlotColumnAllocation {
+    initial_capacity: usize,
+    capacity: usize,
+    length: usize,
+    address: usize,
+    growths: usize,
+    shrinks: usize,
+    moved_live_bytes: usize,
+    moved_allocation_bytes: usize,
+    maximum_bytes: usize,
+    element_bytes: usize,
+}
+
+#[cfg(test)]
+impl FileStore {
+    fn record_column_allocations(&mut self) {
+        fn state<T>(values: &Vec<T>) -> (usize, usize, usize, usize) {
+            (
+                values.len(),
+                values.capacity(),
+                values.as_ptr() as usize,
+                std::mem::size_of::<T>(),
+            )
+        }
+        let states = [
+            state(&self.records),
+            state(&self.kinds),
+            state(&self.kids),
+            state(&self.nodes),
+            state(&self.build_links),
+            self.owned
+                .as_ref()
+                .map_or((0, 0, 0, 0), |owned| state(&owned.cell_of)),
+        ];
+        for (column, (length, capacity, address, element_bytes)) in
+            self.allocation_stats.iter_mut().zip(states)
+        {
+            if column.element_bytes == 0 {
+                column.initial_capacity = capacity;
+            } else if column.capacity != capacity {
+                column.growths += usize::from(column.capacity < capacity);
+                column.shrinks += usize::from(column.capacity > capacity);
+                if column.address != address {
+                    column.moved_live_bytes += column.length.min(length) * element_bytes;
+                    column.moved_allocation_bytes += column.capacity.min(capacity) * element_bytes;
+                }
+            }
+            column.length = length;
+            column.capacity = capacity;
+            column.address = address;
+            column.element_bytes = element_bytes;
+            column.maximum_bytes = column.maximum_bytes.max(capacity * element_bytes);
+        }
+    }
 }
 
 /// Facts about the slots of one finished store, made in one pass over its
@@ -2035,10 +2095,21 @@ fn build_store_cell(store: FileStore) -> StoreCell {
 /// store of this thread. Inside a freeable parse scope
 /// (`enter_freeable_parse`) the store owns its astdata nodes (`OwnedAst`).
 pub fn new_file_store(file_name: &'static str, text: impl Into<FileText>) -> usize {
-    let mut new = FileStore::new(file_name, text.into());
+    new_file_store_with_slot_hint(file_name, text, 0)
+}
+
+/// A document edit may start at the first ordinary growth rung of its new text.
+pub fn new_file_store_with_slot_hint(
+    file_name: &'static str,
+    text: impl Into<FileText>,
+    predecessor_slots: usize,
+) -> usize {
+    let mut new = FileStore::new_with_slot_hint(file_name, text.into(), predecessor_slots);
     if FREEABLE_PARSE.get() {
         new.owned = Some(Box::new(OwnedAst::new(new.records.capacity())));
     }
+    #[cfg(test)]
+    new.record_column_allocations();
     let store: StoreCell = build_store_cell(new);
     let id = BUILD.with(|b| {
         let mut b = b.borrow_mut();
@@ -2061,7 +2132,21 @@ const STORE_TEXT_BYTES_PER_SLOT: usize = 12;
 
 impl FileStore {
     fn new(file_name: &'static str, text: FileText) -> Self {
-        let slots = text.len() / STORE_TEXT_BYTES_PER_SLOT + 1;
+        Self::new_with_slot_hint(file_name, text, 0)
+    }
+
+    fn new_with_slot_hint(
+        file_name: &'static str,
+        text: FileText,
+        predecessor_slots: usize,
+    ) -> Self {
+        let baseline_slots = text.len() / STORE_TEXT_BYTES_PER_SLOT + 1;
+        // Keep Vec's existing growth ladder; small columns have type-dependent minimums.
+        let slots = if baseline_slots >= 4 && predecessor_slots > baseline_slots {
+            baseline_slots.checked_mul(2).unwrap_or(baseline_slots)
+        } else {
+            baseline_slots
+        };
         let mut records = Vec::with_capacity(slots);
         records.push(NodeRecord::target(Node::NIL));
         let mut kinds = Vec::with_capacity(slots);
@@ -2074,7 +2159,8 @@ impl FileStore {
         build_links.push(SlotLinks::NONE);
         // PERF: U1 (a). About one distinct identifier text per 16 slots, so
         // the map of a large file does not rehash while it grows.
-        let identifier_names = FxHashMap::with_capacity_and_hasher(slots / 16, Default::default());
+        let identifier_names =
+            FxHashMap::with_capacity_and_hasher(baseline_slots / 16, Default::default());
         Self {
             file_name,
             text,
@@ -2119,7 +2205,9 @@ impl FileStore {
 
     /// The record, kind, kids and link vectors have one entry per slot.
     #[inline]
-    fn debug_assert_build_columns(&self) {
+    fn debug_assert_build_columns(&mut self) {
+        #[cfg(test)]
+        self.record_column_allocations();
         let slots = self.records.len();
         debug_assert_eq!(self.kinds.len(), slots);
         debug_assert_eq!(self.kids.len(), slots);
@@ -3854,6 +3942,8 @@ impl FileStore {
     /// Marks the store finished and marks its source file roots.
     fn end_parse(&mut self) {
         self.frozen = true;
+        #[cfg(test)]
+        self.record_column_allocations();
         self.records.shrink_to_fit();
         self.kinds.shrink_to_fit();
         self.kids.shrink_to_fit();
@@ -3864,6 +3954,8 @@ impl FileStore {
             owned.count_owned_nodes();
             owned.finish();
         }
+        #[cfg(test)]
+        self.record_column_allocations();
         mark_source_file_roots(self);
     }
 
@@ -6425,6 +6517,125 @@ pub fn is_nil_list_range(range: &crate::astdata::text::TextRange) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_slot_hint_uses_only_the_first_existing_growth_rung() {
+        for bytes in [0, 11, 12, 35, 36, 47, 48, 119, 59844] {
+            let baseline = bytes / STORE_TEXT_BYTES_PER_SLOT + 1;
+            for predecessor in [
+                0,
+                baseline.saturating_sub(1),
+                baseline,
+                baseline + 1,
+                usize::MAX,
+            ] {
+                let text = FileText::new(" ".repeat(bytes), true);
+                let mut plain = FileStore::new("/slot-seed.ts", text.clone());
+                let hinted = FileStore::new_with_slot_hint("/slot-seed.ts", text, predecessor);
+                let expected = if baseline >= 4 && predecessor > baseline {
+                    let old_capacity = plain.records.capacity();
+                    while plain.records.len() <= old_capacity {
+                        plain.records.push(NodeRecord::target(Node::NIL));
+                    }
+                    plain.records.capacity()
+                } else {
+                    baseline
+                };
+                assert_eq!(hinted.records.capacity(), expected);
+                assert_eq!(hinted.kinds.capacity(), expected);
+                assert_eq!(hinted.kids.capacity(), expected);
+                assert_eq!(hinted.nodes.capacity(), expected);
+                assert_eq!(hinted.build_links.capacity(), expected);
+                assert_eq!(OwnedAst::new(expected).cell_of.capacity(), expected);
+                assert_eq!(
+                    hinted.identifier_names.capacity(),
+                    FileStore::new("/slot-seed.ts", hinted.text.clone())
+                        .identifier_names
+                        .capacity()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn document_slot_hint_keeps_parse_and_owned_column_growth() {
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file_with_slot_hint};
+        use crate::frontend::tspath::Path;
+        let fixtures = [
+            ("empty", String::new()),
+            ("dense", "let x=1;".repeat(2000)),
+            (
+                "declarations",
+                (0..2000)
+                    .map(|i| format!("export const value{i} = {i};\n"))
+                    .collect(),
+            ),
+            ("sparse", format!("/*{}*/let x=1;", " ".repeat(59830))),
+            (
+                "unicode",
+                "const café='😀'; const 日本語=café;\n".repeat(100),
+            ),
+            ("broken", "function f( { let = ; }\n".repeat(100)),
+            (
+                "deep",
+                format!(
+                    "const sum={};",
+                    (0..1000).map(|_| "1").collect::<Vec<_>>().join("+")
+                ),
+            ),
+            (
+                "jsdoc",
+                "/** @param {number} x value */\nfunction f(x){return x;}\n".repeat(100),
+            ),
+        ];
+        for (name, text) in fixtures {
+            for owned in [false, true] {
+                let mut expected_shape = None;
+                let mut baseline_slots = 0;
+                for hinted in [false, true] {
+                    let _scope = owned.then(enter_owned_parse);
+                    let options = SourceFileParseOptions {
+                        file_name: format!("/slot-hint/{name}.ts"),
+                        path: Path(format!("/slot-hint/{name}.ts")),
+                        ..Default::default()
+                    };
+                    let file = parse_source_file_with_slot_hint(
+                        &options,
+                        FileText::new(text.clone(), owned),
+                        crate::flags::ScriptKind::TS,
+                        if hinted { baseline_slots } else { 0 },
+                    );
+                    let shape = crate::api::encoder::encode_source_file(file.root)
+                        .expect("encode allocation control")
+                        .0;
+                    let shape = shape[crate::api::encoder::HEADER_SIZE..].to_vec();
+                    if let Some(expected) = &expected_shape {
+                        assert_eq!(
+                            &shape, expected,
+                            "{name}/{owned}: allocation changes AST bytes"
+                        );
+                    } else {
+                        expected_shape = Some(shape);
+                    }
+                    baseline_slots = file_store_slot_count(file.store);
+                    let columns = with_store(file.store, |store| store.allocation_stats);
+                    assert!(
+                        columns
+                            .iter()
+                            .take(5)
+                            .all(|column| column.length == baseline_slots)
+                    );
+                    if owned {
+                        assert_eq!(columns[5].length, baseline_slots);
+                    }
+                    println!(
+                        "ALLOCATION name={name} owned={owned} hinted={hinted} text_bytes={} slots={baseline_slots} columns={columns:?}",
+                        text.len()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn scoped_file_reader_rejects_unfinished_and_published_stores() {

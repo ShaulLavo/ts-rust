@@ -385,9 +385,25 @@ pub fn parse_document(request: &Value, text: &[u8]) -> Result<Value, String> {
     let text = go_string_from_bytes(text.to_vec());
     let handle = project::new_cached_file_handle(&options.file_name, text);
     let key = project::new_parse_cache_key(&options, handle.hash(), ScriptKind(script_kind));
-    let cache = project::new_parse_cache(RefCountCacheOptions {
-        disable_deletion: false,
-    });
+    let predecessor_slots = with_sources(|sources| {
+        let Some(id) = request["predecessor"].as_u64() else {
+            return Ok(0);
+        };
+        let id = u32::try_from(id).map_err(|error| error.to_string())?;
+        let source = sources
+            .files
+            .get(&id)
+            .ok_or("predecessor source lease has been released")?;
+        Ok(ts_goport::ast::store::file_store_slot_count(
+            source.file.store,
+        ))
+    })?;
+    let cache = project::new_parse_cache_with_slot_hint(
+        RefCountCacheOptions {
+            disable_deletion: false,
+        },
+        predecessor_slots,
+    );
     let parsed = cache.acquire(key.clone(), handle.clone());
     let document = Document { cache, key, handle };
     with_sources(|sources| {

@@ -170,9 +170,17 @@ pub type ParseCache = RefCountCache<ParseCacheKey, HashedSourceFile, Rc<dyn File
 
 // Go: project/parsecache.go:74 NewParseCache
 pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
+    new_parse_cache_with_slot_hint(options, 0)
+}
+
+/// The allocation hint belongs to this document's cache, not its identity or parse options.
+pub fn new_parse_cache_with_slot_hint(
+    options: RefCountCacheOptions,
+    predecessor_slots: usize,
+) -> Rc<ParseCache> {
     new_ref_count_cache(
         options,
-        |key: &ParseCacheKey, fh: Rc<dyn FileHandle>| -> HashedSourceFile {
+        move |key: &ParseCacheKey, fh: Rc<dyn FileHandle>| -> HashedSourceFile {
             // Program versions share the parse, so its nodes belong to the thread.
             let _base = crate::ast::enter_base_synthetic_owner();
             // Not in Go: a new version of a published path can be freed
@@ -202,7 +210,12 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
                     // store and goes with the version; another text is
                     // leaked, as in compiler/host.rs (`FileText::new`).
                     let text = FileText::new(content, freeable);
-                    parser::parse_source_file(&opts, text, key.script_kind)
+                    parser::parse_source_file_with_slot_hint(
+                        &opts,
+                        text,
+                        key.script_kind,
+                        predecessor_slots,
+                    )
                 }
             };
             // Not in Go: a new version of a published path can be freed. The

@@ -667,6 +667,68 @@ Read-only preparation for later units (no candidate changes or closure claimed):
   `quickInfo`, 30 `goToDefinition`, 21 `jsdoc`, and 15 each `completion` and `breakpoint` failures.
   These labels classify test names, not independent root causes; recoveries remain zero.
 
+
+#### Lane A pause checkpoint (2026-10-11)
+
+Status: **Approved work, paused at the owner's request. WIP (unverified).** The allocation
+experiment is preserved only on `fork/wip/drop-in-lane-a`, based on `64951879`; it is not
+published to `feat/wasm-language-service`. No edit-cost or completion improvement is accepted.
+The five changed production/test files are `ast/store.rs`, `frontend/parser/parser_p1.rs`,
+`project/parsecache.rs`, `classic_sources.rs`, and `classic-registry.js` in their existing crates
+and package directories.
+
+The candidate carries an explicit private predecessor source lease through both classic update
+branches. Rust copies only its scalar store slot demand before releasing the source-table borrow.
+A document-specific parse-cache closure passes that scalar to the parser/store constructor, without
+changing keys/options, ownership, publication or binding. Cold/native callers retain the original
+seed. For new-text baseline seeds at least four, predecessor demand above the seed selects only the
+first existing doubling rung; smaller seeds remain unchanged. Identifier-map reservation continues
+to use the original seed. Each subsequent column grows independently. This is an experiment,
+not established memory safety: density-decreasing edits can over-reserve, and allocation overlap
+can raise peak memory even at identical final capacities.
+
+Two unverified store tests cover initial seed/rung behavior and real parser fixtures. Test-only
+six-column counters observe capacity changes and pointer-movement relocation estimates for
+`records`, `kinds`, `kids`, `nodes`, `build_links` and `OwnedAst.cell_of`. They do **not** observe
+actual allocator copying or peak memory. The focused release build was stopped while compiling
+`ts_goport`; there is no completed test verdict. Its log is retained at
+`/work/tmp/tsrust-ls-probes/u12-edit/focused/tests.log`. No fresh WASM, roster, runtime, browser,
+corpus, snapshot or fourteen-binary gate was completed for this WIP. Historical u11 results above
+remain baseline evidence only. Formal R188 remains **UNRUN**.
+
+Independent static review found no production semantic/ownership blocker for valid leases, but
+identified pending proof gaps. Reject supplied malformed predecessor values explicitly (currently
+non-unsigned values become the cold path). Strengthen allocation assertions, compare diagnostics
+and all encoded header fields except actual identity words, and cover density changes, nested
+parses, separate registries/instances and stale leases. The reviewer supplied no acceptance verdict.
+A standalone moving-allocator copy/peak probe was written, but never built or run, under
+`/work/tmp/tsrust-ls-probes/u12-edit/copy-probe`; its unsafe diagnostic allocator stays outside the
+repository. Do not mistake its existence for actual copied-byte or memory evidence.
+
+Mac timing preparation uses the owner's Apple M1 at `shaul-mac`, AC power, Node 22.22.1, and the
+shared `/work/tmp/mac-access.lock`. Frozen u10/u11 package arms, pinned TypeScript 6.0.3 and the
+unchanged workload were copied to `~/tmp/tsrust-lane-a-u11`. The scratch comparison runner records
+host, power and uptime and checks load below two before each child. The first attempt failed before
+timing because reference-manifest discovery reached a privacy-protected home directory; adding
+the reference package manifest scoped discovery correctly. Retry2 waited at loads above two and preserved **one base, one candidate and two reference
+process samples**, but did not finish the required six triplets. The controller and its orphaned remote Node process were stopped, and the
+Mac lock was verified released. Partial evidence is preserved locally at
+`/work/tmp/tsrust-ls-probes/u12-edit/mac-preserved/replicates-retry2`; there is no accepted replicated
+timing result, and these samples compare frozen u10/u11 rather than this allocation candidate.
+All lane A children and owned build/timing jobs are stopped.
+
+On resumption, finish or reject the bounded allocation experiment using actual copied bytes,
+per-column growth and allocator/native/WASM peak/live memory, including unchanged constrained
+limits and retained predecessors. Then run independent review, full local fourteen-binary zero-loss
+comparisons, snapshots/corpus, occurrence-qualified classic roster, runtime and source/packed browser
+matrices before publishing the unit. Next add completion duplicate-slot/stale-node controls before
+index/wrapper/materialization changes. Implement the explicit classic package-scope policy with
+native policy preserved. Move **resolver boundary closure ahead of the other boundary routes**,
+per coordination: ordered failed/affecting metadata, Classic/Node10 and lexical resolution-host
+routing belong to lane A and block lane B's rename recovery. After that, finish Rust syntax-only JSON,
+entity/JSDoc bridges, printer writers/synthesized-tree encoding and transform context ABI. All seven
+original-JavaScript routes remain **STOP**; none was closed during this lane.
+
 ## Native regression repair after r35
 
 Source `8523cc943d120e31b43a7f2e6879d2e9d3df333b` repairs the protected-test losses

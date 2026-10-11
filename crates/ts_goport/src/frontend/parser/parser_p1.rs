@@ -273,6 +273,17 @@ pub fn parse_source_file(
     source_text: impl Into<FileText>,
     script_kind: ScriptKind,
 ) -> ParsedSourceFile {
+    parse_source_file_with_slot_hint(opts, source_text, script_kind, 0)
+}
+
+/// Uses an allocation hint for one document parse, without changing parse options or ownership.
+#[must_use]
+pub fn parse_source_file_with_slot_hint(
+    opts: &SourceFileParseOptions,
+    source_text: impl Into<FileText>,
+    script_kind: ScriptKind,
+    predecessor_slots: usize,
+) -> ParsedSourceFile {
     let source_text: FileText = source_text.into();
     let jsdoc_cut_text = OnceCell::new();
     let mut p = new_parser();
@@ -287,7 +298,7 @@ pub fn parse_source_file(
     } else {
         Box::leak(opts.file_name.clone().into_boxed_str())
     };
-    p.store = new_file_store(file_name, source_text.clone());
+    p.store = new_file_store_with_slot_hint(file_name, source_text.clone(), predecessor_slots);
     // PERF: R3-1. A large bundled lib whose snapshot key matches is loaded
     // into the new store from `lib_parse.bin` (`lib_parse_snapshot.rs`),
     // with the same store and result as a parse. A lib text is static.

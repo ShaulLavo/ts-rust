@@ -4,7 +4,7 @@
 // bookkeeping is unchanged; its two compiler entry points parse in Rust.
 
 import { classicInstance } from "./classic-module.js";
-import { materializeSourceFile } from "./classic-source-files.js";
+import { materializeSourceFile, sourceFileLease } from "./classic-source-files.js";
 import { createGetCanonicalFileName, fileExtensionIsOneOf, getNormalizedAbsolutePath, normalizePath, toPath } from "./classic-paths.js";
 
 const ScriptKind = { Unknown: 0, JS: 1, JSX: 2, TS: 3, TSX: 4, External: 5, JSON: 6, Deferred: 7 };
@@ -182,6 +182,10 @@ export function withRequestedPath(fileName, path, action) {
 
 /** `createSourceFile` in Rust. Unknown `setExternalModuleIndicator` callbacks parse with the legacy rule. */
 export function createSourceFile(fileName, sourceText, languageVersionOrOptions, setParentNodes = false, scriptKind) {
+    return parseSourceFile(fileName, sourceText, languageVersionOrOptions, scriptKind);
+}
+
+function parseSourceFile(fileName, sourceText, languageVersionOrOptions, scriptKind, predecessor) {
     const options = typeof languageVersionOrOptions === "object" ? languageVersionOrOptions : { languageVersion: languageVersionOrOptions };
     const { languageVersion, setExternalModuleIndicator, impliedNodeFormat, jsDocParsingMode } = options;
     scriptKind = ensureScriptKind(fileName, languageVersion === ScriptTarget.JSON ? ScriptKind.JSON : scriptKind);
@@ -195,7 +199,7 @@ export function createSourceFile(fileName, sourceText, languageVersionOrOptions,
     const instance = classicInstance();
     const response = instance.parseDocument({
         fileName: parseName, path, scriptKind, languageVersion: resultVersion ?? 0, version: [],
-        jsx: indicator?.jsx ?? false, force: indicator?.force ?? false,
+        jsx: indicator?.jsx ?? false, force: indicator?.force ?? false, predecessor,
     }, sourceText);
     const file = materializeSourceFile(instance, response);
     if (classicName !== parseName) file.fileName = classicName;
@@ -241,7 +245,8 @@ export function updateLanguageServiceSourceFile(sourceFile, scriptSnapshot, vers
             const changedText = scriptSnapshot.getText(start, start + textChangeRange.newLength);
             newText = prefix && suffix ? prefix + changedText + suffix : prefix ? prefix + changedText : changedText + suffix;
         }
-        const newSourceFile = createSourceFile(sourceFile.fileName, newText, options, true, sourceFile.scriptKind);
+        const newSourceFile = parseSourceFile(sourceFile.fileName, newText, options, sourceFile.scriptKind,
+            sourceFileLease(sourceFile, classicInstance()));
         setSourceFileFields(newSourceFile, scriptSnapshot, version);
         newSourceFile.nameTable = undefined;
         if (sourceFile !== newSourceFile && sourceFile.scriptSnapshot) {
@@ -250,7 +255,10 @@ export function updateLanguageServiceSourceFile(sourceFile, scriptSnapshot, vers
         }
         return newSourceFile;
     }
-    return createLanguageServiceSourceFile(sourceFile.fileName, scriptSnapshot, options, version, true, sourceFile.scriptKind);
+    const newSourceFile = parseSourceFile(sourceFile.fileName, getSnapshotText(scriptSnapshot), options,
+        sourceFile.scriptKind, sourceFileLease(sourceFile, classicInstance()));
+    setSourceFileFields(newSourceFile, scriptSnapshot, version);
+    return newSourceFile;
 }
 
 function isDocumentRegistryEntry(entry) {

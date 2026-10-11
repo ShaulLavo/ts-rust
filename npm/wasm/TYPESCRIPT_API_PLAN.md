@@ -149,6 +149,19 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Builder comments and the slow implement-interface cases
+
+Injected run: **7,241 of 7,853** (fourslash 5,730, services 1,511), none lost against `r23`
+(`r24`). Builder nodes carry the port builder's synthetic leading and trailing comments as
+classic `emitNode` comments, so an elided union prints classic's `/*... N more elided ...*/`.
+
+The two slow `codeFixClassImplementInterfaceNoTruncation*` cases spent 60 of their 71 seconds
+in the fourslash harness's `highlightDifferenceBetweenStrings`, diffing the 1.3 MB expected and
+actual texts after the comparison failed (CPU profile, `prof/nt`); the code fix took under a
+second. With the elision comment the properties case passes and the other fails in 1.6 s on a
+remaining difference (Go's builder keeps the alias in `baz`'s constraint where classic expands
+it). The roster now takes 5.7 minutes with a 4.2 GiB peak (`r16`: 9.8 minutes, 5.9 GiB).
+
 ## Synthetic checker objects and program emit (unit 4 sixth batch, unit 5 start)
 
 Injected run: **7,240 of 7,853** (fourslash 5,729, services 1,511), none lost against `r16`

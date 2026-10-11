@@ -189,8 +189,15 @@ export function nodeHandle(node) {
 }
 
 /** Classic synthesized nodes from the node builder's binary output. */
-export function decodeSyntheticNode(bytes, symbols, emitFlags = new Map(), singleQuotes = new Set()) {
-    return decodeSourceFile(bytes, {}, undefined, { symbols, emitFlags, singleQuotes });
+export function decodeSyntheticNode(bytes, symbols, emitFlags = new Map(), singleQuotes = new Set(), comments = new Map()) {
+    return decodeSourceFile(bytes, {}, undefined, { symbols, emitFlags, singleQuotes, comments });
+}
+
+/** Classic `SynthesizedComment`s from the builder's `[kind, text, hasLeadingNewLine, hasTrailingNewLine]`. */
+function synthesizedComments(comments) {
+    if (comments.length === 0) return undefined;
+    return comments.map(([kind, text, hasLeadingNewLine, hasTrailingNewLine]) => ({ kind: translateKind(kind), text, pos: -1, end: -1,
+        ...(hasLeadingNewLine ? { hasLeadingNewLine } : {}), ...(hasTrailingNewLine ? { hasTrailingNewLine } : {}) }));
 }
 
 export function resolveNodeHandle(sourceFile, handle) {
@@ -253,6 +260,14 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
             const native = synthetic.emitFlags.get(value.index);
             overrides.emitNode = { flags: translateFlags(native, emitFlagBits) };
             if (native & nativeEmitFlags.StartOnNewLine) overrides.emitNode.startsOnNewLine = true;
+        }
+        if (synthetic?.comments.has(value.index)) {
+            const { leading, trailing } = synthetic.comments.get(value.index);
+            overrides.emitNode ??= { flags: 0 };
+            const leadingComments = synthesizedComments(leading);
+            const trailingComments = synthesizedComments(trailing);
+            if (leadingComments) overrides.emitNode.leadingComments = leadingComments;
+            if (trailingComments) overrides.emitNode.trailingComments = trailingComments;
         }
         const keys = () => Reflect.isExtensible(overrides) ? Array.from(new Set(fields.filter(field => !deleted.has(field)).concat(Reflect.ownKeys(overrides)))) : Reflect.ownKeys(overrides);
         const get = property => {

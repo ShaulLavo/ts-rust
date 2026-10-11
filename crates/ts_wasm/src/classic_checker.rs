@@ -824,7 +824,33 @@ impl ClassicChecker {
                 })
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
-            results.push(json!({"$synthetic": {"$payload": [offset, length]}, "symbols": symbols, "emitFlags": emit_flags, "singleQuotes": single_quotes}));
+            // Synthetic comments, such as the `... N more elided ...` comment on an elided union.
+            let comment = |comment: &ts_goport::printer::SynthesizedComment| {
+                json!([
+                    comment.kind as u32,
+                    comment.text,
+                    comment.has_leading_new_line,
+                    comment.has_trailing_new_line
+                ])
+            };
+            let comments = table
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.is_some())
+                .filter_map(|(index, node)| {
+                    let leading = emit_context.get_synthetic_leading_comments(*node);
+                    let trailing = emit_context.get_synthetic_trailing_comments(*node);
+                    (!leading.is_empty() || !trailing.is_empty()).then(|| {
+                        json!([
+                            index,
+                            leading.iter().map(comment).collect::<Vec<_>>(),
+                            trailing.iter().map(comment).collect::<Vec<_>>()
+                        ])
+                    })
+                })
+                .collect::<Vec<_>>();
+            results.push(json!({"$synthetic": {"$payload": [offset, length]}, "symbols": symbols, "emitFlags": emit_flags, "singleQuotes": single_quotes, "comments": comments}));
         }
         Ok(Value::Array(results))
     }

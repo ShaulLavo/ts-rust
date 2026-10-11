@@ -79,7 +79,7 @@ export function createTypeChecker(lease, resolveNode) {
         if (value.$node) return resolveNode(value.$node);
         if (value.$indexInfo) return indexInfo(value);
         if (value.$typePredicate) return typePredicate(value);
-        if (value.$synthetic) return decodeSyntheticNode(value.$synthetic, new Map(value.symbols.map(([index, symbol]) => [index, decode(symbol)])), new Map(value.emitFlags), new Set(value.singleQuotes));
+        if (value.$synthetic) return decodeSyntheticNode(value.$synthetic, new Map(value.symbols.map(([index, symbol]) => [index, decode(symbol)])), new Map(value.emitFlags), new Set(value.singleQuotes), new Map(value.comments.map(([index, leading, trailing]) => [index, { leading, trailing }])));
         return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, decode(item)]));
     }
 

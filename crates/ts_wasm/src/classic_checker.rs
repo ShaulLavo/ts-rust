@@ -157,6 +157,61 @@ impl ClassicChecker {
                 Ok(json!(checker.contains_arguments_reference(location)))
             }
             "nodeBuilder" => self.build_node(&mut checker, location, t, symbol, signature, request),
+            "tryGetMemberInModuleExportsAndProperties" => Ok(self.symbol_ref(
+                checker.try_get_member_in_module_exports_and_properties(
+                    string(request, "name")?,
+                    symbol,
+                ),
+            )),
+            "forEachExportAndPropertyOfModule" => {
+                let mut entries = Vec::new();
+                checker.for_each_export_and_property_of_module(symbol, &mut |_, exported, key| {
+                    entries.push((exported, escape_symbol_name(key)));
+                });
+                Ok(Value::Array(
+                    entries
+                        .into_iter()
+                        .map(|(exported, key)| {
+                            json!([
+                                self.symbol_ref(exported),
+                                crate::classic_strings::string_value(&key)
+                            ])
+                        })
+                        .collect(),
+                ))
+            }
+            "getExportSymbolOfSymbol" => {
+                Ok(self.symbol_ref(checker.get_export_symbol_of_symbol(symbol)))
+            }
+            "getPropertySymbolOfDestructuringAssignment" => Ok(self.symbol_ref(
+                checker.get_property_symbol_of_destructuring_assignment(location),
+            )),
+            "getTypeOfAssignmentPattern" => {
+                Ok(self.type_ref(checker.get_type_of_assignment_pattern(location)))
+            }
+            "getSuggestedSymbolForNonexistentSymbol" => {
+                Ok(self.symbol_ref(checker.get_suggested_symbol_for_nonexistent_symbol(
+                    location,
+                    string(request, "name")?,
+                    symbol_flags(request)?,
+                )))
+            }
+            "getSuggestedSymbolForNonexistentModule" => Ok(self.symbol_ref(
+                checker.get_suggested_symbol_for_nonexistent_module(location, symbol),
+            )),
+            "isTypeParameterPossiblyReferenced" => Ok(json!(
+                checker.is_type_parameter_possibly_referenced(t, location)
+            )),
+            "getResolvedSymbol" => Ok(self.symbol_ref(checker.get_resolved_symbol_exported(location))),
+            "getTypeOnlyAliasDeclaration" => {
+                Ok(node_ref(checker.get_type_only_alias_declaration_exported(symbol)))
+            }
+            "getSymbolFlags" => Ok(json!(checker.get_symbol_flags_exported(symbol).0)),
+            "getLocalTypeParametersOfClassOrInterfaceOrTypeAlias" => Ok(self.type_refs(
+                &checker.get_local_type_parameters_of_class_or_interface_or_type_alias_exported(
+                    symbol,
+                ),
+            )),
             "tryGetMemberInModuleExports" => Ok(self.symbol_ref(
                 checker.try_get_member_in_module_exports(string(request, "name")?, symbol),
             )),
@@ -386,6 +441,13 @@ impl ClassicChecker {
             "getNonOptionalType" => Ok(self.type_ref(checker.get_non_optional_type(t))),
             "isNullableType" => Ok(json!(checker.is_nullable_type(t))),
             "getWidenedType" => Ok(self.type_ref(checker.get_widened_type(t))),
+            "typeHasCallOrConstructSignatures" => {
+                Ok(json!(checker.type_has_call_or_construct_signatures_exported(t)))
+            }
+            "getAllPossiblePropertiesOfTypes" => {
+                let types = self.handles(request, "types", &self.types)?;
+                Ok(self.symbol_refs(&checker.get_all_possible_properties_of_types(&types)))
+            }
             "getWidenedLiteralType" => {
                 Ok(self.type_ref(checker.get_widened_literal_type_exported(t)))
             }

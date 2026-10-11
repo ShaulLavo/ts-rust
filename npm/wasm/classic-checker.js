@@ -155,6 +155,9 @@ export function createTypeChecker(lease, resolveNode) {
             isClassOrInterface: () => (object.flags & TypeFlags.Object) !== 0 && (object.objectFlags & ObjectFlags.ClassOrInterface) !== 0,
             isClass: () => (object.flags & TypeFlags.Object) !== 0 && (object.objectFlags & ObjectFlags.Class) !== 0,
             isIndexType: () => (object.flags & TypeFlags.Index) !== 0,
+            get typeArguments() {
+                return (object.flags & TypeFlags.Object) !== 0 && (object.objectFlags & ObjectFlags.Reference) !== 0 ? checker.getTypeArguments(object) : undefined;
+            },
         }), origin, true);
     }
 
@@ -178,6 +181,14 @@ export function createTypeChecker(lease, resolveNode) {
             getTypeParameters: () => object.typeParameters,
             getParameters: () => object.parameters,
             getReturnType: () => checker.getReturnTypeOfSignature(object),
+            getTypeParameterAtPosition(pos) {
+                const type = checker.getParameterType(object, pos);
+                if (type.isIndexType() && classicNamespace().isThisTypeParameter(type.type)) {
+                    const constraint = type.type.getConstraint();
+                    if (constraint) return checker.getIndexType(constraint);
+                }
+                return type;
+            },
             ...signatureDocumentationMembers(object, checker),
         }), origin, true);
     }
@@ -326,6 +337,28 @@ export function createTypeChecker(lease, resolveNode) {
     // Classic checks the file, here without polling the token, and answers its diagnostics.
     const symbolOf = symbol => ({ symbol: handle(symbol, "symbol"), origin: objectHandles.get(symbol)?.origin });
     const signatureOf = signature => ({ signature: handle(signature, "signature"), origin: objectHandles.get(signature)?.origin });
+    checker.tryGetMemberInModuleExportsAndProperties = (name, symbol) => query("tryGetMemberInModuleExportsAndProperties", Object.assign(symbolOf(symbol), { name }));
+    checker.forEachExportAndPropertyOfModule = (moduleSymbol, cb) => {
+        for (const [symbol, key] of query("forEachExportAndPropertyOfModule", symbolOf(moduleSymbol))) cb(symbol, key);
+    };
+    checker.getExportSymbolOfSymbol = symbol => query("getExportSymbolOfSymbol", symbolOf(symbol));
+    checker.getPropertySymbolOfDestructuringAssignment = locationIn => {
+        const node = parseTree(locationIn, "isIdentifier");
+        return node ? query("getPropertySymbolOfDestructuringAssignment", { location: location(node) }) : undefined;
+    };
+    checker.getTypeOfAssignmentPattern = nodeIn => {
+        const node = parseTree(nodeIn, "isAssignmentPattern");
+        return node && query("getTypeOfAssignmentPattern", { location: location(node) }) || errorType();
+    };
+    checker.getSuggestedSymbolForNonexistentSymbol = (node, name, flags) => query("getSuggestedSymbolForNonexistentSymbol", { location: location(node), name, meaning: meaning(flags) });
+    checker.getSuggestedSymbolForNonexistentModule = (name, targetModule) => query("getSuggestedSymbolForNonexistentModule", Object.assign(symbolOf(targetModule), { location: location(name) }));
+    checker.isTypeParameterPossiblyReferenced = (typeParameter, node) => query("isTypeParameterPossiblyReferenced", Object.assign(typeOf(typeParameter), { location: location(node) }));
+    checker.getResolvedSymbol = node => query("getResolvedSymbol", { location: location(node) });
+    checker.getTypeOnlyAliasDeclaration = symbol => query("getTypeOnlyAliasDeclaration", symbolOf(symbol));
+    checker.getSymbolFlags = symbol => translateBits(query("getSymbolFlags", symbolOf(symbol)), nativeSymbolFlags, SymbolFlags);
+    checker.getLocalTypeParametersOfClassOrInterfaceOrTypeAlias = symbol => query("getLocalTypeParametersOfClassOrInterfaceOrTypeAlias", symbolOf(symbol));
+    checker.typeHasCallOrConstructSignatures = type => query("typeHasCallOrConstructSignatures", typeOf(type));
+    checker.getAllPossiblePropertiesOfTypes = types => query("getAllPossiblePropertiesOfTypes", { types: types.map(type => handle(type, "type")) });
     checker.tryGetMemberInModuleExports = (name, symbol) => query("tryGetMemberInModuleExports", Object.assign(symbolOf(symbol), { name }));
     checker.getTypePredicateOfSignature = signature => query("getTypePredicateOfSignature", signatureOf(signature));
     checker.isDeclarationVisible = node => query("isDeclarationVisible", { location: location(node) });

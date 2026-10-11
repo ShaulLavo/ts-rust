@@ -476,6 +476,8 @@ Remaining units, in order. Each ends with its narrow checks and then the injecte
    resolved modules and references, `structureIsReused`, emit). Done for the dispatch's
    resolution members and host libraries (above); `structureIsReused` and emit remain.
 4. `TypeChecker` members and symbol/type internals each service family reads, by family.
+   Started: the four batches above (6,793 of 7,853 after the fourth); the last batch's "Next"
+   list orders the rest.
 5. `getEmitOutput` through Rust emit, including custom transformers; cancellation tokens;
    host module and type-reference resolution; project references.
 6. Node 22, Chromium and WebKit main-thread and worker runs; before/after timing and reads.

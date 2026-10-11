@@ -468,27 +468,40 @@ impl Printer {
     // emitted without parentheses.
     // Go: printer/printer.go:2778 getLiteralKindOfBinaryPlusOperand
     pub(crate) fn get_literal_kind_of_binary_plus_operand(&mut self, node: Node) -> SyntaxKind {
-        let node = skip_partially_emitted_expressions(node);
-
-        if is_literal_kind(node.kind()) {
-            return node.kind();
+        enum Frame {
+            Visit(Node),
+            AfterLeft(Node),
+            AfterRight(SyntaxKind),
         }
 
-        if node.kind() == SyntaxKind::BinaryExpression
-            && node.operator_token().kind() == SyntaxKind::PlusToken
-        {
-            // !!! Determine if caching this is worthwhile over recomputing
-            let left_kind = self.get_literal_kind_of_binary_plus_operand(node.left());
-            let mut literal_kind = SyntaxKind::Unknown;
-            if is_literal_kind(left_kind)
-                && left_kind == self.get_literal_kind_of_binary_plus_operand(node.right())
-            {
-                literal_kind = left_kind;
+        let mut frames = vec![Frame::Visit(node)];
+        let mut literal_kind = SyntaxKind::Unknown;
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Visit(node) => {
+                    let node = skip_partially_emitted_expressions(node);
+                    literal_kind = SyntaxKind::Unknown;
+                    if is_literal_kind(node.kind()) {
+                        literal_kind = node.kind();
+                    } else if is_binary_operation(node, SyntaxKind::PlusToken) {
+                        frames.push(Frame::AfterLeft(node.right()));
+                        frames.push(Frame::Visit(node.left()));
+                    }
+                }
+                Frame::AfterLeft(right) => {
+                    if is_literal_kind(literal_kind) {
+                        frames.push(Frame::AfterRight(literal_kind));
+                        frames.push(Frame::Visit(right));
+                    }
+                }
+                Frame::AfterRight(left_kind) => {
+                    if literal_kind != left_kind {
+                        literal_kind = SyntaxKind::Unknown;
+                    }
+                }
             }
-            return literal_kind;
         }
-
-        SyntaxKind::Unknown
+        literal_kind
     }
 
     // Go: printer/printer.go:2806 getBinaryExpressionPrecedence
@@ -577,43 +590,113 @@ impl Printer {
 
     // Go: printer/printer.go:2872 emitBinaryExpression
     pub(crate) fn emit_binary_expression(&mut self, node: Node) {
-        let (mut left_prec, mut right_prec) = self.get_binary_expression_precedence(node);
-        let emitted_left = skip_partially_emitted_expressions(node.left());
-        if node_is_synthesized(emitted_left)
-            && emitted_left.kind() == SyntaxKind::BinaryExpression
-            && mixing_binary_operators_requires_parentheses(
-                node.operator_token().kind(),
-                emitted_left.operator_token().kind(),
-            )
-        {
-            left_prec = OperatorPrecedence::HIGHEST;
+        enum Frame {
+            Expression(Node, OperatorPrecedence),
+            Binary(Node, bool),
+            AfterLeft {
+                node: Node,
+                state: PrinterState,
+                right_prec: OperatorPrecedence,
+                parens: bool,
+            },
+            AfterRight {
+                node: Node,
+                state: PrinterState,
+                lines_before_operator: i32,
+                lines_after_operator: i32,
+                parens: bool,
+            },
         }
-        let emitted_right = skip_partially_emitted_expressions(node.right());
-        if node_is_synthesized(emitted_right)
-            && emitted_right.kind() == SyntaxKind::BinaryExpression
-            && mixing_binary_operators_requires_parentheses(
-                node.operator_token().kind(),
-                emitted_right.operator_token().kind(),
-            )
-        {
-            right_prec = OperatorPrecedence::HIGHEST;
+
+        // Keep Go's enter → left → operator → right → exit effects on owned
+        // continuations so a consecutive binary chain does not use the call stack.
+        let mut frames = vec![Frame::Binary(node, false)];
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Expression(node, precedence) => {
+                    if node.kind() != SyntaxKind::BinaryExpression {
+                        self.emit_expression(node, precedence);
+                        continue;
+                    }
+                    let parens = get_expression_precedence(node) < precedence;
+                    if parens {
+                        self.write_punctuation("(");
+                    }
+                    frames.push(Frame::Binary(node, parens));
+                }
+                Frame::Binary(node, parens) => {
+                    let (mut left_prec, mut right_prec) =
+                        self.get_binary_expression_precedence(node);
+                    let emitted_left = skip_partially_emitted_expressions(node.left());
+                    if node_is_synthesized(emitted_left)
+                        && emitted_left.kind() == SyntaxKind::BinaryExpression
+                        && mixing_binary_operators_requires_parentheses(
+                            node.operator_token().kind(),
+                            emitted_left.operator_token().kind(),
+                        )
+                    {
+                        left_prec = OperatorPrecedence::HIGHEST;
+                    }
+                    let emitted_right = skip_partially_emitted_expressions(node.right());
+                    if node_is_synthesized(emitted_right)
+                        && emitted_right.kind() == SyntaxKind::BinaryExpression
+                        && mixing_binary_operators_requires_parentheses(
+                            node.operator_token().kind(),
+                            emitted_right.operator_token().kind(),
+                        )
+                    {
+                        right_prec = OperatorPrecedence::HIGHEST;
+                    }
+                    let state = self.enter_node(node);
+                    frames.push(Frame::AfterLeft {
+                        node,
+                        state,
+                        right_prec,
+                        parens,
+                    });
+                    frames.push(Frame::Expression(node.left(), left_prec));
+                }
+                Frame::AfterLeft {
+                    node,
+                    state,
+                    right_prec,
+                    parens,
+                } => {
+                    let lines_before_operator =
+                        self.get_lines_between_nodes(node, node.left(), node.operator_token());
+                    let lines_after_operator =
+                        self.get_lines_between_nodes(node, node.operator_token(), node.right());
+                    self.write_lines_and_indent(
+                        lines_before_operator,
+                        node.operator_token().kind() != SyntaxKind::CommaToken,
+                    );
+                    self.emit_token_node_ex(node.operator_token(), TokenEmitFlags::NO_SOURCE_MAPS);
+                    self.write_lines_and_indent(lines_after_operator, true);
+                    frames.push(Frame::AfterRight {
+                        node,
+                        state,
+                        lines_before_operator,
+                        lines_after_operator,
+                        parens,
+                    });
+                    frames.push(Frame::Expression(node.right(), right_prec));
+                }
+                Frame::AfterRight {
+                    node,
+                    state,
+                    lines_before_operator,
+                    lines_after_operator,
+                    parens,
+                } => {
+                    self.decrease_indent_if(lines_after_operator > 0);
+                    self.decrease_indent_if(lines_before_operator > 0);
+                    self.exit_node(node, state);
+                    if parens {
+                        self.write_punctuation(")");
+                    }
+                }
+            }
         }
-        let state = self.enter_node(node);
-        self.emit_expression(node.left(), left_prec);
-        let lines_before_operator =
-            self.get_lines_between_nodes(node, node.left(), node.operator_token());
-        let lines_after_operator =
-            self.get_lines_between_nodes(node, node.operator_token(), node.right());
-        self.write_lines_and_indent(
-            lines_before_operator,
-            node.operator_token().kind() != SyntaxKind::CommaToken, /*writeSpaceIfNotIndenting*/
-        );
-        self.emit_token_node_ex(node.operator_token(), TokenEmitFlags::NO_SOURCE_MAPS);
-        self.write_lines_and_indent(lines_after_operator, true /*writeSpaceIfNotIndenting*/); // Binary operators should have a space before the comment starts
-        self.emit_expression(node.right(), right_prec);
-        self.decrease_indent_if(lines_after_operator > 0);
-        self.decrease_indent_if(lines_before_operator > 0);
-        self.exit_node(node, state);
     }
 
     // Go: printer/printer.go:2893 emitShortCircuitExpression
@@ -1701,5 +1784,327 @@ impl Printer {
     pub(crate) fn emit_not_emitted_type_element(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.exit_node(node, state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::sourcemap::generator::{RawSourceMap, new_generator};
+
+    fn binary(factory: &NodeFactory, left: Node, operator: SyntaxKind, right: Node) -> Node {
+        factory.new_binary_expression(
+            ModifierList::NIL,
+            left,
+            Node::NIL,
+            factory.new_token(operator),
+            right,
+        )
+    }
+
+    fn print(node: Node) -> String {
+        new_printer(PrinterOptions::default(), PrintHandlers::default(), None).emit(node, Node::NIL)
+    }
+
+    #[test]
+    fn binary_printer_deep_parsed_sum_5000_cold_and_reused() {
+        let source = format!("export const sum = {};", vec!["1"; 5_000].join(" + "));
+        let file = parse_source_file(
+            &SourceFileParseOptions {
+                file_name: "/binary-printer.ts".to_string(),
+                ..Default::default()
+            },
+            &source,
+            ScriptKind::TS,
+        );
+        let mut printer = new_printer(PrinterOptions::default(), PrintHandlers::default(), None);
+        for _ in 0..2 {
+            assert_eq!(
+                printer.emit_source_file_exported(file.root),
+                format!("{source}\n")
+            );
+        }
+    }
+
+    #[test]
+    fn binary_printer_deep_right_associative_5000() {
+        let factory = NodeFactory::new();
+        for (operator, separator) in [
+            (SyntaxKind::EqualsToken, " = "),
+            (SyntaxKind::AsteriskAsteriskToken, " ** "),
+        ] {
+            let operand = factory.new_identifier("x");
+            let mut root = operand;
+            for _ in 1..5_000 {
+                root = binary(&factory, operand, operator, root);
+            }
+            let saved_right = root.right();
+            assert_eq!(print(root), vec!["x"; 5_000].join(separator));
+            assert_eq!(root.right(), saved_right);
+        }
+    }
+
+    #[test]
+    fn binary_printer_deep_literal_precedence_scan_5000() {
+        let factory = NodeFactory::new();
+        let literal = factory.new_numeric_literal("1", TokenFlags::NONE);
+        let mut left = literal;
+        for _ in 1..5_000 {
+            left = binary(&factory, left, SyntaxKind::PlusToken, literal);
+        }
+        let right = binary(&factory, literal, SyntaxKind::PlusToken, literal);
+        let root = binary(&factory, left, SyntaxKind::PlusToken, right);
+        assert_eq!(print(root), vec!["1"; 5_002].join(" + "));
+    }
+
+    #[test]
+    fn binary_printer_precedence_and_mixed_operators() {
+        let factory = NodeFactory::new();
+        let a = factory.new_identifier("a");
+        let b = factory.new_identifier("b");
+        let c = factory.new_identifier("c");
+        for (inner, outer, expected) in [
+            (
+                SyntaxKind::PlusToken,
+                SyntaxKind::AsteriskToken,
+                "a * (b + c)",
+            ),
+            (
+                SyntaxKind::MinusToken,
+                SyntaxKind::MinusToken,
+                "a - (b - c)",
+            ),
+            (
+                SyntaxKind::SlashToken,
+                SyntaxKind::SlashToken,
+                "a / (b / c)",
+            ),
+            (
+                SyntaxKind::EqualsToken,
+                SyntaxKind::EqualsToken,
+                "a = b = c",
+            ),
+            (
+                SyntaxKind::AsteriskAsteriskToken,
+                SyntaxKind::AsteriskAsteriskToken,
+                "a ** b ** c",
+            ),
+            (SyntaxKind::CommaToken, SyntaxKind::CommaToken, "a, b, c"),
+            (
+                SyntaxKind::BarBarToken,
+                SyntaxKind::QuestionQuestionToken,
+                "a ?? (b || c)",
+            ),
+            (
+                SyntaxKind::QuestionQuestionToken,
+                SyntaxKind::AmpersandAmpersandToken,
+                "a && (b ?? c)",
+            ),
+        ] {
+            assert_eq!(
+                print(binary(&factory, a, outer, binary(&factory, b, inner, c))),
+                expected
+            );
+        }
+        let power = binary(&factory, a, SyntaxKind::AsteriskAsteriskToken, b);
+        assert_eq!(
+            print(binary(
+                &factory,
+                power,
+                SyntaxKind::AsteriskAsteriskToken,
+                c
+            )),
+            "(a ** b) ** c"
+        );
+        let assignment = binary(&factory, a, SyntaxKind::EqualsToken, b);
+        assert_eq!(
+            print(binary(&factory, assignment, SyntaxKind::EqualsToken, c)),
+            "(a = b) = c"
+        );
+        let string = factory.new_string_literal("a", TokenFlags::NONE);
+        let numbers = binary(
+            &factory,
+            factory.new_numeric_literal("1", TokenFlags::NONE),
+            SyntaxKind::PlusToken,
+            factory.new_numeric_literal("2", TokenFlags::NONE),
+        );
+        assert_eq!(
+            print(binary(&factory, string, SyntaxKind::PlusToken, numbers)),
+            "\"a\" + (1 + 2)"
+        );
+    }
+
+    // The pre-continuation Go sequence is a shallow reference for effects,
+    // including the writer positions observed by hooks and the source-map bytes.
+    fn recursive_expression(printer: &mut Printer, node: Node, precedence: OperatorPrecedence) {
+        if node.kind() != SyntaxKind::BinaryExpression {
+            printer.emit_expression(node, precedence);
+            return;
+        }
+        let parens = get_expression_precedence(node) < precedence;
+        if parens {
+            printer.write_punctuation("(");
+        }
+        let (mut left_prec, mut right_prec) = printer.get_binary_expression_precedence(node);
+        let left = skip_partially_emitted_expressions(node.left());
+        if node_is_synthesized(left)
+            && left.kind() == SyntaxKind::BinaryExpression
+            && mixing_binary_operators_requires_parentheses(
+                node.operator_token().kind(),
+                left.operator_token().kind(),
+            )
+        {
+            left_prec = OperatorPrecedence::HIGHEST;
+        }
+        let right = skip_partially_emitted_expressions(node.right());
+        if node_is_synthesized(right)
+            && right.kind() == SyntaxKind::BinaryExpression
+            && mixing_binary_operators_requires_parentheses(
+                node.operator_token().kind(),
+                right.operator_token().kind(),
+            )
+        {
+            right_prec = OperatorPrecedence::HIGHEST;
+        }
+        let state = printer.enter_node(node);
+        recursive_expression(printer, node.left(), left_prec);
+        let before = printer.get_lines_between_nodes(node, node.left(), node.operator_token());
+        let after = printer.get_lines_between_nodes(node, node.operator_token(), node.right());
+        printer.write_lines_and_indent(
+            before,
+            node.operator_token().kind() != SyntaxKind::CommaToken,
+        );
+        printer.emit_token_node_ex(node.operator_token(), TokenEmitFlags::NO_SOURCE_MAPS);
+        printer.write_lines_and_indent(after, true);
+        recursive_expression(printer, node.right(), right_prec);
+        printer.decrease_indent_if(after > 0);
+        printer.decrease_indent_if(before > 0);
+        printer.exit_node(node, state);
+        if parens {
+            printer.write_punctuation(")");
+        }
+    }
+
+    type Events = Rc<RefCell<Vec<(u8, Node, i32, i32)>>>;
+
+    fn snapshot(
+        node: Node,
+        file: Node,
+        context: &Rc<EmitContext>,
+        recursive: bool,
+        preserve_source_newlines: bool,
+    ) -> (String, Vec<(u8, Node, i32, i32)>, RawSourceMap) {
+        let writer: Rc<RefCell<dyn EmitTextWriter>> =
+            Rc::new(RefCell::new(new_text_writer("\n", 4)));
+        let events: Events = Rc::new(RefCell::new(Vec::new()));
+        let hook = |kind| {
+            let events = events.clone();
+            let writer = writer.clone();
+            Rc::new(move |node| {
+                let writer = writer.borrow();
+                events
+                    .borrow_mut()
+                    .push((kind, node, writer.get_text_pos(), writer.get_indent()));
+            }) as Rc<dyn Fn(Node)>
+        };
+        let map_events = events.clone();
+        let map_writer = writer.clone();
+        let handlers = PrintHandlers {
+            on_before_emit_node: Some(hook(0)),
+            on_after_emit_node: Some(hook(1)),
+            on_before_emit_token: Some(hook(2)),
+            on_after_emit_token: Some(hook(3)),
+            map_source_position: Some(Rc::new(move |source, pos| {
+                map_events
+                    .borrow_mut()
+                    .push((4, source, map_writer.borrow().get_text_pos(), pos));
+                Some((None, pos))
+            })),
+            ..Default::default()
+        };
+        let generator = Rc::new(RefCell::new(new_generator(
+            "binary-printer.js",
+            "",
+            "/",
+            Default::default(),
+        )));
+        let mut printer = new_printer(
+            PrinterOptions {
+                source_map: true,
+                preserve_source_newlines,
+                ..Default::default()
+            },
+            handlers,
+            Some(context.clone()),
+        );
+        printer.writer = Some(writer.clone());
+        printer.source_map_generator = Some(generator.clone());
+        printer.source_maps_disabled = false;
+        printer.set_source_file(file);
+        if recursive {
+            recursive_expression(&mut printer, node, OperatorPrecedence::LOWEST);
+        } else {
+            printer.emit_expression(node, OperatorPrecedence::LOWEST);
+        }
+        assert_eq!(writer.borrow().get_indent(), 0);
+        let text = writer.borrow().string();
+        let events = events.borrow().clone();
+        let map = generator.borrow_mut().raw_source_map();
+        (text, events, map)
+    }
+
+    #[test]
+    fn binary_printer_preserves_comments_layout_hooks_and_maps() {
+        for source in [
+            "a /*left*/ + /*operator*/ b * c;",
+            "a\n    +\n        b *\n            c;",
+            "a = b = c;",
+            "a ** b ** c;",
+            "a + b * c - d / e;",
+            "a, b, c;",
+        ] {
+            let file = parse_source_file(
+                &SourceFileParseOptions {
+                    file_name: "/binary-printer.ts".to_string(),
+                    ..Default::default()
+                },
+                source,
+                ScriptKind::TS,
+            );
+            let root = file.root.statements().nodes().get(0).expression();
+            let context = new_emit_context();
+            for preserve in [false, true] {
+                let expected = snapshot(root, file.root, &context, true, preserve);
+                assert!(!expected.1.is_empty());
+                assert!(!expected.2.mappings.is_empty());
+                assert_eq!(
+                    snapshot(root, file.root, &context, false, preserve),
+                    expected
+                );
+            }
+            context.set_emit_flags(
+                root.left(),
+                EmitFlags::NO_NESTED_COMMENTS | EmitFlags::NO_NESTED_SOURCE_MAPS,
+            );
+            context.set_comment_range(root.right(), root.left().loc());
+            context.set_source_map_range(root.right(), root.left().loc());
+            context.add_synthetic_leading_comment(
+                root.right(),
+                SyntaxKind::MultiLineCommentTrivia,
+                "leading",
+                false,
+            );
+            context.add_synthetic_trailing_comment(
+                root.right(),
+                SyntaxKind::MultiLineCommentTrivia,
+                "trailing",
+                false,
+            );
+            assert_eq!(
+                snapshot(root, file.root, &context, false, true),
+                snapshot(root, file.root, &context, true, true),
+            );
+        }
     }
 }

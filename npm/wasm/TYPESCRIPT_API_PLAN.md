@@ -149,6 +149,40 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Options, pragmas and parameter info (unit 4, fourth batch)
+
+Injected run: **6,793 of 7,853** (fourslash 5,305, services 1,488), none lost against the
+previous batch (`r15`, `r16` in `/work/tmp/tsrust-ls-probes/u3/`, WASM e15765c821633ceb).
+
+- Classic's internal `allowNonTsExtensions` reaches the Rust program (the tsconfig converter
+  does not declare it), so the fourslash harness's `.js` roots without `allowJs` load.
+- Source files have classic `pragmas` (a Map by lowercase name, an array for a repeated name,
+  `{ arguments, range }` with classic's captured spans for `reference` `types`, `lib` and
+  `path`); checked name for name against 6.0.3.
+- Symbols of kinds that classic's binder always gives tables (class, enum, module and variable
+  `exports`; class, interface, type literal and object literal `members`) have an empty table
+  where the port's binder made none.
+- `getParameterIdentifierInfoAtPosition` (the `classic_parameters` module, previously in the
+  tree but not compiled); `getModuleResolutionCache` is undefined (the Rust resolver keeps its
+  own cache).
+
+Deviations: classic answers no parameter info for a JSDoc function type's signature; the port
+has no JSDoc function type nodes, so that case is not distinguished. A pragma's
+`hasTrailingNewLine` is whether a line break directly follows the comment.
+
+Cost: two fourslash cases (`codeFixClassImplementInterfaceNoTruncation*`, whose expected text is
+1.3 MB) now run the implement-interface fix to the end and take 76 s and 189 s with a 5.8 GiB
+peak; the roster takes about 10 minutes. They still fail on the produced text.
+
+Next by failing count (`r16`): range text (63), quick info text (58), `getSymbolOfExpando` (46),
+unbacked nodes (42, synthesized members passed to `getMemberOverrideModifierStatus`), `program.emit`
+(36, unit 5), types of another checker (36), `createSymbol` (31), code fixes not found (30),
+`getIndexInfosAtLocation` (28), `getChildren` of builder nodes (21, needs a port of classic
+`createChildren` over assigned positions), `createSignature` (19). `getSymbolOfExpando`,
+`getIndexInfosAtLocation`, `getExactOptionalProperties` and `isLibType` have no Rust
+counterpart yet, so they need `ts_goport` additions with the independent review AGENTS.md
+requires.
+
 ## Symbols, nodes and formatting objects (unit 4, third batch)
 
 Injected run: **6,546 of 7,853** (fourslash 5,058, services 1,488), none lost against the

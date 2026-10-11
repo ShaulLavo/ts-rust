@@ -38,9 +38,29 @@ export function materializeSourceFile(instance, response) {
         // TypeScript 6.0.3 ignores `no-default-lib` references; its parser sets this false.
         file.hasNoDefaultLib = false;
         addSourceFileMembers(file, instance, response.source);
+        file.pragmas = pragmaMap(response.pragmas ?? []);
         lease.file = new WeakRef(file);
     }
     return file;
+}
+
+/** Classic `processCommentPragmas`: one entry per name, an array when the name repeats. */
+function pragmaMap(pragmas) {
+    const result = new Map();
+    for (const [name, values, kind, pos, end, hasTrailingNewLine] of pragmas) {
+        const args = {
+            arguments: Object.fromEntries(values.map(([argument, value, start, stop]) => [argument, start === undefined ? value : { value, pos: start, end: stop }])),
+            range: { kind, pos, end, hasTrailingNewLine },
+        };
+        if (result.has(name)) {
+            const current = result.get(name);
+            if (current instanceof Array) current.push(args);
+            else result.set(name, [current, args]);
+            continue;
+        }
+        result.set(name, args);
+    }
+    return result;
 }
 
 /** SourceFileObject's `identifiers` (read once from Rust) and `getNamedDeclarations`. */

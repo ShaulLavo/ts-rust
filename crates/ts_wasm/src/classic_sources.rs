@@ -23,6 +23,51 @@ thread_local! {
 
 /// Runs `action` on the instance's source leases. The borrow lasts only for
 /// the call, so no host callback may run inside `action`.
+/// Classic `SourceFile.pragmas` entries in source order: `[name, arguments, kind, pos, end,
+/// hasTrailingNewLine]`, each argument `[name, value]` or, for the spans classic captures,
+/// `[name, value, pos, end]`; positions are UTF-16.
+fn pragmas(file: &ParsedSourceFile) -> Value {
+    let positions = ts_goport::ast::source_file_get_position_map(file.root);
+    let utf16 = |position: i32| positions.utf8_to_utf16(position);
+    let text = file.text().as_bytes();
+    Value::Array(
+        file.pragmas
+            .iter()
+            .map(|pragma| {
+                let arguments = pragma
+                    .args
+                    .iter()
+                    .map(|(name, argument)| {
+                        let value = crate::classic_strings::string_value(&argument.value);
+                        if pragma.name == "reference"
+                            && matches!(name.as_str(), "types" | "lib" | "path")
+                        {
+                            json!([
+                                name,
+                                value,
+                                utf16(argument.range.pos()),
+                                utf16(argument.range.end())
+                            ])
+                        } else {
+                            json!([name, value])
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let end = usize::try_from(pragma.range.end()).unwrap_or(0);
+                let trailing_new_line = matches!(text.get(end), Some(b'\n' | b'\r'));
+                json!([
+                    pragma.name,
+                    arguments,
+                    pragma.kind as u32,
+                    utf16(pragma.range.pos()),
+                    utf16(pragma.range.end()),
+                    trailing_new_line
+                ])
+            })
+            .collect(),
+    )
+}
+
 pub fn with_sources<R>(action: impl FnOnce(&mut Sources) -> R) -> R {
     SOURCES.with(|sources| action(&mut sources.borrow_mut()))
 }
@@ -161,6 +206,7 @@ impl Sources {
             "fileName": file.file_name(),
             "data": {"$payload": [offset, length]},
             "parseDiagnostics": diagnostics,
+            "pragmas": pragmas(file),
         }))
     }
 

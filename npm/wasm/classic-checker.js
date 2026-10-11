@@ -179,12 +179,17 @@ export function createTypeChecker(lease, resolveNode) {
     }
 
     const symbolTables = new WeakMap();
+    // Classic's binder gives these symbols tables even when empty (`addDeclarationToSymbol`);
+    // the port's binder makes a table with its first entry.
+    const exportsFlags = SymbolFlags.Class | SymbolFlags.Enum | SymbolFlags.Module | SymbolFlags.Variable;
+    const membersFlags = SymbolFlags.Class | SymbolFlags.Interface | SymbolFlags.TypeLiteral | SymbolFlags.ObjectLiteral;
     function symbolTable(object, exports) {
-        if (!(exports ? object.hasExports : object.hasMembers)) return undefined;
+        const present = exports ? object.hasExports : object.hasMembers;
+        if (!present && !(object.flags & (exports ? exportsFlags : membersFlags))) return undefined;
         let tables = symbolTables.get(object);
         if (!tables) symbolTables.set(object, tables = {});
         const key = exports ? "exports" : "members";
-        return tables[key] ??= new Map(query("getSymbolTable", { symbol: handle(object, "symbol"), exports, origin: objectHandles.get(object)?.origin }));
+        return tables[key] ??= new Map(present ? query("getSymbolTable", { symbol: handle(object, "symbol"), exports, origin: objectHandles.get(object)?.origin }) : []);
     }
 
     function signature(id, origin) {

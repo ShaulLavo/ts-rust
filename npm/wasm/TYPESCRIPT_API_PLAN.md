@@ -527,9 +527,9 @@ and WASM gates below. No such production change is implemented at this checkpoin
    `BindingElement` where classic expects `OmittedExpression`. Four direct failures require
    `getAnyAsyncIterableType`, `getNullableType` and `writeTypePredicate`. No recovery is yet claimed.
 
-#### u11 scoped unpublished reader — verification in progress
+#### u11 scoped unpublished reader — local correctness gates pass; timing pending
 
-Status: **Approved; candidate implemented, acceptance pending.** Evidence is retained under
+Status: **Approved; source-bound local correctness verification complete, performance pending.** Evidence is retained under
 `/work/tmp/tsrust-ls-probes/u11-unpublished`. The production reader resolves a frozen unpublished
 store once and confines each header/data read to a short borrow. Queued unpublished lists own
 handles and range values; lazy JSDoc runs after those borrows end. Published files retain their
@@ -549,32 +549,73 @@ Keep all attempts: the first compile failed on a test-only `NodeSlice` iterator 
 revealed invalid assertions about eagerly parsed `@see`/`@link` and synthetic JSDoc identity
 across publication; retry3 caught a test-only nonexistent `NodeSlice::is_nil` accessor. Retry4
 corrects the controls without changing production code or existing expectations. The independent
-reviewer confirmed the corrected cache/identity contracts. Final evidence-bound review is pending.
+reviewer confirmed the corrected cache/identity contracts. Final evidence-bound scoped-reader review
+passed for the frozen commit/tree, including all 80 package-input hashes and actual gate artifacts.
+The independent regression auditor also returned **LOCAL u11 REGRESSION AUDIT PASS** for that
+exact source/tree, independently rebuilding per-name outcome maps and validating original emit
+completeness. Neither verdict supplies formal R188 acceptance or a performance claim.
 
 Both unchanged snapshot generators passed 1/1; live parse/bind checks passed 2/2. Parse blob
 sections changed only their eight-byte source keys; bind regeneration was byte-identical.
 `focused-retry4/blob-delta.json` records the hashes and section comparisons.
-Fresh fourteen-binary local comparison, fresh
-WASM, full occurrence-qualified classic roster, runtime, source/packed browser matrices and original
-emit equality/completeness gates are **UNRUN** for this candidate. Baseline remains 7,482/7,853;
-no recovery or speedup is claimed. Formal R188 and its unavailable wider protected evidence remain
-**UNRUN** locally and are separate from these fork checks. All seven original-JavaScript boundary
-routes remain **STOP**.
+Frozen compiler candidate: `dcb48df984830c69496e58fefbb4677ace546d01`, crates tree
+`9c7121743d77f4d7fe5faaa5a3fb622d71794be1`. Fresh fourteen-binary / nineteen-suite local
+comparison passed: **181,931 passing, 3,623 ignored**, retaining all 181,891 local-base,
+181,922 u6 and 181,927 u7 passes, with **0 lost, 0 absent, 0 unrun** and four new passing
+u7-relative names. Results SHA-256 `1ec8cd6aba327917be2f55c2d69bb53ac7abd2c62b1318006a9c303ae52e6a61`;
+binary-manifest digest `10fcde1a9fef7dd8c47fa0fb985a2bf4919162c8aa75630ce5a3f7f650abb420`.
 
-Timing is blocked by host load around 20, above the required 2. Do not disturb other workloads or
+Fresh Rust 1.98.1 WASM: **7,486,468 bytes**, SHA-256
+`1ce891ea72ddc2d2496a6f579dd5e9c973b5ea6399f36923ec52b581678dbf60`.
+`final/source-manifest.json` binds the source/package inputs. Runtime passed **70/70**, with
+no skips. Source and packed Chromium/WebKit main-thread/worker matrices passed **8/8 cells**.
+Packed Node smoke and strict declarations passed, covering the same 65 required service members.
+The full occurrence-qualified classic roster remained **7,482/7,853**, **371 failures**:
+**7,482 retained, 0 recovered, 0 lost, 0 absent**, with no added/missing names.
+Original emit equality and strict completeness both passed: **19,922 inventoried inputs,
+19,915 identical readable rows, the same seven non-UTF8 exclusions, 19,745 outputs**,
+with no changed/missing rows or changed inputs. See `final/classic-compare.json`,
+`final/emit-compare.json` and `final/emit-completeness.json`; all gate jobs ended `DONE`.
+No recovery or speedup is claimed. Formal R188 and its unavailable wider protected evidence remain
+**UNRUN** locally and are separate from these fork checks. The boundary diagnostic still exits 1:
+all seven original-JavaScript boundary routes remain **STOP**.
+
+Timing is blocked by host load 11–20, above the required 2. Do not disturb other workloads or
 accept overlapping timings. After correctness gates, obtain six fresh processes per arm on a quiet
 host, re-profile edits, repair the next demonstrated edit cause, then continue the completion unit.
 
 Read-only completion investigation identifies two separate costs for the next verified unit:
 `NodeIndexTable::get_index` lazily sorts indices using repeated global `get_node_id` map access.
 The workload edits before each completion, so this cold sort repeats per source version. Consider
-sorting/searching the existing full `Node` handle while preserving slots, nil/missing behavior,
-duplicates and per-source ownership; do not change global node IDs. Prove every lookup against the
-old result and retain old versions across edits before measuring. Of 303 exclusive diagnostic
+sorting/searching the existing full `Node` handle only for tables proven unique, preserving slots,
+nil/missing behavior and per-source ownership; do not change global node IDs. Duplicate tables must
+retain the exact existing ID-based path, rebuilt from original encoder order: binary search selects
+a matching midpoint, and changing distinct-key order can select another duplicate slot. Distinct
+slots can have distinct JS wrappers and encoded parents even when they resolve to the same Rust
+node. Add old-versus-candidate controls for duplicate ranks, preassigned IDs, synthetic/foreign
+aliases and per-slot JS identity. Prove every lookup against the old result and retain old versions
+across edits before measuring. Of 303 exclusive diagnostic
 `wrap` samples, 257 follow token navigation through `classicChildren`, 18 follow semicolon detection,
 and six follow checker declaration decoding. A separate token-position optimization must retain
 public child-array semantics. Eager symbol loads are per newly interned object; disabling eager
 loads alone has no demonstrated saving and must not be presented as a repair.
+
+Read-only preparation for later units (no candidate changes or closure claimed):
+
+- TypeScript 6.0.3 package-scope probe: **360 observations / 720 passing assertions**. Ordinary
+  `.ts`/`.d.ts` outside `node_modules` perform implied-format scope lookup only under Node16/NodeNext;
+  inside `node_modules`, Classic/Node10/Bundler also lookup. Fixed `.mts`/`.cts` retain their fixed
+  format without that lookup. Apply an explicit classic policy before parse-cache access, in serial
+  and parallel paths; retain native package-directory/symlink behavior and independent resolver reads.
+- JSON syntax-only probe: a fresh **27-fixture TypeScript-only baseline** is retained at
+  `/work/tmp/tsrust-ls-probes/u11-preparation/ts603-json-baseline-5a8183e6-8fb1-4298-b6f2-251a2b1ed2b7.json`.
+  Use a dedicated Rust syntax-only parse entry, explicit synchronous instance action and standalone
+  retained source lease; keep native validating defaults and registry parse-cache policy unchanged.
+  Redirect the lexical `parseJsonText` wrapper and guard its retained original implementation:
+  replacing only the namespace export leaves config parsing on the original parser. Do not filter
+  validating diagnostics afterward. Cover parentless visibility, actual node/identifier counts,
+  identifier-map membership/order, recovery-list ranges, multiline/Unicode flags and empty JSON
+  pragma/reference metadata. The historical u7 prototype is incomplete and is not current proof.
 
 ## Native regression repair after r35
 

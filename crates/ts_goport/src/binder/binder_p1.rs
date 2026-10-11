@@ -1523,6 +1523,11 @@ impl Binder {
         // node data once (`parsed_node_data`) and pass it on, so their field reads
         // (`postfix_token`, `modifiers`, `name`) skip the node lookup.
         let kind = node.kind();
+        #[cfg(target_family = "wasm")]
+        if self.can_bind_binary_iteratively(node) {
+            self.bind_binary_iteratively(node);
+            return false;
+        }
         // PERF: binderview1. The fields of a BinaryExpression, read once in
         // its arm below for the arm and for `bind_children_of_kind`.
         let mut binary = None;
@@ -1560,16 +1565,7 @@ impl Binder {
             }
             SyntaxKind::BinaryExpression => {
                 let bin = self.binary_view(node);
-                match get_binary_assignment_declaration_kind(&bin) {
-                    JSDeclarationKind::MODULE_EXPORTS => self.bind_module_exports_assignment(node),
-                    JSDeclarationKind::EXPORTS_PROPERTY => {
-                        self.bind_exports_or_object_define_property(node)
-                    }
-                    JSDeclarationKind::PROPERTY => self.bind_expando_property_assignment(node),
-                    JSDeclarationKind::THIS_PROPERTY => self.bind_this_property_assignment(node),
-                    _ => {}
-                }
-                self.check_strict_mode_binary_expression(node, &bin);
+                self.bind_binary_declaration(node, &bin);
                 binary = Some(bin);
             }
             SyntaxKind::CatchClause => {
@@ -1809,6 +1805,20 @@ impl Binder {
             self.seen_parse_error = true;
         }
         false
+    }
+
+    #[inline]
+    pub(super) fn bind_binary_declaration(&mut self, node: Node, expression: &BinaryView) {
+        match get_binary_assignment_declaration_kind(expression) {
+            JSDeclarationKind::MODULE_EXPORTS => self.bind_module_exports_assignment(node),
+            JSDeclarationKind::EXPORTS_PROPERTY => {
+                self.bind_exports_or_object_define_property(node)
+            }
+            JSDeclarationKind::PROPERTY => self.bind_expando_property_assignment(node),
+            JSDeclarationKind::THIS_PROPERTY => self.bind_this_property_assignment(node),
+            _ => {}
+        }
+        self.check_strict_mode_binary_expression(node, expression);
     }
 
     // Go: binder/binder.go:752 bindPropertyWorker

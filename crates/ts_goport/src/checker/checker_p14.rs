@@ -363,8 +363,30 @@ impl Checker {
                 right.kind() == SyntaxKind::ThisKeyword,
             );
         }
-        let mut left_type = self.check_expression_ex(left, check_mode);
-        let mut right_type = self.check_expression_ex(right, check_mode);
+        let left_type = self.check_expression_ex(left, check_mode);
+        let right_type = self.check_expression_ex(right, check_mode);
+        self.check_binary_expression_types(
+            left,
+            operator_token,
+            right,
+            check_mode,
+            error_node,
+            left_type,
+            right_type,
+        )
+    }
+
+    pub(super) fn check_binary_expression_types(
+        &mut self,
+        left: Node,
+        operator_token: Node,
+        right: Node,
+        check_mode: CheckMode,
+        error_node: Node,
+        mut left_type: TypeId,
+        mut right_type: TypeId,
+    ) -> TypeId {
+        let operator = operator_token.kind();
         if is_logical_or_coalescing_binary_operator(operator) {
             let mut parent = left.parent().parent();
             while is_parenthesized_expression(parent)

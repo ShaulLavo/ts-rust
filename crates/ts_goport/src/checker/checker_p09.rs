@@ -18,6 +18,10 @@ impl Checker {
 
     // Go: checker/checker.go:7729 checkExpressionEx
     pub fn check_expression_ex(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
+        #[cfg(target_family = "wasm")]
+        if self.can_check_binary_iteratively(node) {
+            return self.check_binary_iteratively(node, check_mode);
+        }
         let _trace = self.tracer.map(|tr| {
             tr.push(
                 crate::tracing::Phase::Check,

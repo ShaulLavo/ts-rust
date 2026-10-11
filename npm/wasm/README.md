@@ -51,9 +51,10 @@ const { exitCode, diagnostics, files } = await tsc(["-p", "/app"], {
 tsc's usual text.
 
 In a browser, call `tsc` from a module Web Worker, as `examples/browser` does, so that a run does not
-block the page. It also works on the page's main thread. A Safari worker has a small stack and no
-JSPI: a run there fails at about 230 terms of `1 + 1 + ...`, or at a chain of 200 method calls.
-Chrome and Firefox workers reach about 1,000 to 1,500 terms, and Safari's main thread about 7,000.
+block the page. It also works on the page's main thread. Arithmetic and comma chains with 5,000
+operators, including unreachable arithmetic, are tested in Chromium and WebKit on both the main
+thread and module workers. Other deeply nested syntax and recursive expression shapes can still
+exhaust the stack.
 Serve `ts_rust.wasm` as `application/wasm`, so that it compiles while it downloads.
 To try the example, run `python3 -m http.server -d npm/wasm` and open
 `http://localhost:8000/examples/browser/`.
@@ -79,7 +80,7 @@ To try the example, run `python3 -m http.server -d npm/wasm` and open
 - Each run uses a new instance of the compiled module, because the compiler keeps one program per
   process. The module is compiled once. Memory goes back when a run ends.
 - The checker recurses deeply, so very deep nesting can run out of stack. Node runs each call in a
-  worker thread with a 256 MB stack (about 30,000 terms of `1 + 1 + ...`). Bun ignores that
+  worker thread with a 256 MB stack. Bun ignores that
   setting, so under Bun a call runs on the calling thread. In a browser worker, `tsc` runs through
   JSPI where the engine has it, which gives about 2 times the stack in Chrome.
 - `scripts/wasm/diff.mjs` compares the module with the native tsgo on Query core, Hono, the

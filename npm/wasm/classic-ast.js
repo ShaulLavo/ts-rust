@@ -2,6 +2,7 @@ import { decodeNode, RemoteNode, RemoteNodeList } from "./native-ast.js";
 import { SyntaxKind, NodeFlags, TokenFlags, ModifierFlags,
     nativeSyntaxKind, nativeNodeFlags, nativeTokenFlags, nativeModifierFlags } from "./classic-enums.js";
 import { nodeFields } from "./classic-node-fields.js";
+import { classicNamespaceOrUndefined } from "./classic-module.js";
 
 const nativeNodes = new WeakMap();
 let nodeSymbol = () => undefined;
@@ -24,6 +25,47 @@ for (const [name, value] of Object.entries(nativeSyntaxKind)) {
     if (classic !== undefined) kinds.set(value, classic);
     if (nodeFields[name]) childFields.set(value, nodeFields[name]);
 }
+
+// NodeObject's position methods (services.ts) over the node's own `pos` and `end`, so an object
+// made with `Object.create(node)` and given new positions answers with those, as classic's do.
+function assertHasRealPosition(node) {
+    if (!(node.pos >= 0) || !(node.end >= 0)) throw new Error("Debug Failure. False expression: Node must have a real position for this operation");
+}
+const positionMethods = {
+    getStart(sourceFile, includeJsDocComment) {
+        assertHasRealPosition(this);
+        return classicNamespaceOrUndefined().getTokenPosOfNode(this, sourceFile, includeJsDocComment);
+    },
+    getFullStart() {
+        assertHasRealPosition(this);
+        return this.pos;
+    },
+    getEnd() {
+        assertHasRealPosition(this);
+        return this.end;
+    },
+    getWidth(sourceFile) {
+        assertHasRealPosition(this);
+        return this.getEnd() - this.getStart(sourceFile);
+    },
+    getFullWidth() {
+        assertHasRealPosition(this);
+        return this.end - this.pos;
+    },
+    getLeadingTriviaWidth(sourceFile) {
+        assertHasRealPosition(this);
+        return this.getStart(sourceFile) - this.pos;
+    },
+    getFullText(sourceFile) {
+        assertHasRealPosition(this);
+        return (sourceFile || this.getSourceFile()).text.substring(this.pos, this.end);
+    },
+    getText(sourceFile) {
+        assertHasRealPosition(this);
+        if (!sourceFile) sourceFile = this.getSourceFile();
+        return sourceFile.text.substring(this.getStart(sourceFile), this.getEnd());
+    },
+};
 
 const nodeMethods = new Set(["getSourceFile", "getStart", "getFullStart", "getEnd", "getWidth", "getFullWidth",
     "getLeadingTriviaWidth", "getFullText", "getText", "getChildCount", "getChildAt", "getChildren", "getFirstToken", "getLastToken", "forEachChild"]);
@@ -199,7 +241,9 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         const valueNode = value;
         node = new Proxy(overrides, {
             get: (_, property) => get(property),
-            set: (_, property, replacement) => {
+            set: (_, property, replacement, receiver) => {
+                // An object made with `Object.create(node)` gets its own property, as an ordinary prototype gives.
+                if (receiver !== node) return Reflect.defineProperty(receiver, property, { configurable: true, enumerable: true, writable: true, value: replacement });
                 deleted.delete(property);
                 return Reflect.set(overrides, property, replacement);
             },
@@ -258,6 +302,7 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         if (property === "getFirstToken" || property === "getLastToken") return source => edgeToken(wrap(raw), property === "getFirstToken", source);
         if (raw === root && Object.hasOwn(metadata, property)) return metadata[property];
         if (property === "getSourceFile") return () => wrap(root);
+        if (Object.hasOwn(positionMethods, property) && classicNamespaceOrUndefined()) return positionMethods[property];
         if (property === "getLineEndOfPosition") return position => {
             const { line } = root.getLineAndCharacterOfPosition(position);
             const starts = root.getLineStarts();

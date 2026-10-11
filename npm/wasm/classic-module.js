@@ -34,3 +34,8 @@ export function classicNamespace() {
     if (!namespace) throw new Error("the classic TypeScript namespace is not loaded");
     return namespace;
 }
+
+/** The classic namespace when the package entry has loaded it. */
+export function classicNamespaceOrUndefined() {
+    return namespace;
+}

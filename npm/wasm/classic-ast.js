@@ -95,6 +95,7 @@ const renamedFields = new Map(Object.entries({
     JSDocImplementsTag: { class: "className" },
     JSDocAugmentsTag: { class: "className" },
     JSDocTypeLiteral: { jsDocPropertyTags: "jsdocPropertyTags" },
+    ImportAttributes: { elements: "attributes" },
 }).map(([kind, names]) => [nativeSyntaxKind[kind], names]));
 const nativeFieldNames = new Map(Array.from(renamedFields, ([kind, names]) => [kind, new Map(Object.entries(names).map(([classic, native]) => [native, classic]))]));
 
@@ -271,9 +272,32 @@ function synthesizedComments(comments) {
 export function resolveNodeHandle(sourceFile, handle) {
     const data = nativeNodes.get(sourceFile);
     if (!data) throw new TypeError("Source file is not backed by this compiler");
-    const raw = data.root.getOrCreateNodeAtIndex(handle.index);
+    let raw = data.root.getOrCreateNodeAtIndex(handle.index);
     if (raw.kind !== handle.nativeKind) throw new TypeError("Node handle does not match the source file");
+    // Go's reparser clones JSDoc nodes (a `@template` type parameter) into the host declaration;
+    // classic's tree has only the JSDoc node, which the clone copies with its range.
+    if ((raw.flags & nativeNodeFlags.Reparsed) !== 0 && !data.synthetic) raw = parsedCounterpart(data.root, raw) ?? raw;
     return data.wrap(raw);
+}
+
+const parsedNodeIndexes = new WeakMap();
+/** The first parsed (not reparsed) node of the file with the node's kind and range. */
+function parsedCounterpart(root, raw) {
+    let index = parsedNodeIndexes.get(root);
+    if (!index) {
+        index = new Map();
+        const view = root.view;
+        for (let i = 1; i < root.nodes.length; i++) {
+            const offset = root._offsetNodes + i * 28;
+            const kind = view.getUint32(offset, true);
+            if (kind === 0xffffffff || (view.getUint32(offset + 24, true) & nativeNodeFlags.Reparsed) !== 0) continue;
+            const key = `${kind}:${view.getInt32(offset + 4, true)}:${view.getInt32(offset + 8, true)}`;
+            if (!index.has(key)) index.set(key, i);
+        }
+        parsedNodeIndexes.set(root, index);
+    }
+    const found = index.get(`${raw.kind}:${raw.pos}:${raw.end}`);
+    return found === undefined ? undefined : root.getOrCreateNodeAtIndex(found);
 }
 
 function materializeParents(root, index) {
@@ -343,7 +367,7 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
             // Builder output has positions only once textChanges assigns them; classic's own node
             // methods then scan its tokens (`createChildren`) from those positions.
             if (synthetic && syntheticChildMethods.has(property)) return classicNodePrototype(translateKind(valueNode.kind))[property];
-            if ((property === "symbol" || property === "localSymbol") && !synthetic && !deleted.has(property)) return nodeSymbol(node, property);
+            if ((property === "symbol" || property === "localSymbol" || property === "locals") && !synthetic && !deleted.has(property)) return nodeSymbol(node, property);
             if (deleted.has(property) || !allowed.has(property)) return Reflect.get(overrides, property, node);
             const value = read(valueNode, overrides, property);
             if (typeof value !== "function") return value;

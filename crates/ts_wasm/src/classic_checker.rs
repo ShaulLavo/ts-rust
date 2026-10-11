@@ -249,6 +249,10 @@ impl ClassicChecker {
             "symbolToString" => Ok(json!(checker.symbol_to_string_exported(symbol))),
             "signatureToString" => Ok(json!(checker.signature_to_string(signature))),
             "getFullyQualifiedName" => Ok(json!(checker.get_fully_qualified_name_exported(symbol))),
+            "symbolIsValue" => Ok(json!(checker.symbol_is_value_ex(
+                symbol,
+                request["includeTypeOnlyMembers"].as_bool() == Some(true)
+            ))),
             // The binder's `node.symbol` and `node.localSymbol`.
             "getNodeSymbol" => Ok(
                 self.symbol_ref(if request["local"].as_bool() == Some(true) {
@@ -257,6 +261,50 @@ impl ClassicChecker {
                     location.symbol()
                 }),
             ),
+            // The binder's `node.locals` table, as classic `SymbolTable` entries.
+            "getNodeLocals" => {
+                let table = location.locals();
+                if table.is_nil() {
+                    return Ok(Value::Null);
+                }
+                Ok(Value::Array(
+                    checker
+                        .symbols
+                        .entries(table)
+                        .into_iter()
+                        .map(|(name, local)| {
+                            json!([
+                                crate::classic_strings::string_value(&escape_symbol_name(&name)),
+                                self.symbol_ref(local)
+                            ])
+                        })
+                        .collect(),
+                ))
+            }
+            "tryFindAmbientModule" => {
+                Ok(self
+                    .symbol_ref(checker.try_find_ambient_module_exported(string(request, "name")?)))
+            }
+            "getSuggestedSymbolForNonexistentClassMember" => Ok(self.symbol_ref(
+                checker
+                    .get_suggested_symbol_for_nonexistent_class_member(string(request, "name")?, t),
+            )),
+            "getSuggestedSymbolForNonexistentJSXAttribute" => Ok(self.symbol_ref(
+                checker.get_suggested_symbol_for_nonexistent_jsx_attribute(
+                    string(request, "name")?,
+                    t,
+                ),
+            )),
+            // Classic's checker answers this; Go's emit resolver has the same worker.
+            "requiresAddingImplicitUndefined" => {
+                let enclosing = node(request, "enclosing")?;
+                let resolver = checker.get_emit_resolver();
+                Ok(json!(resolver.requires_adding_implicit_undefined_worker(
+                    &mut checker,
+                    location,
+                    enclosing
+                )))
+            }
             "isUnknownSymbol" => Ok(json!(checker.is_unknown_symbol(symbol))),
             "isUndefinedSymbol" => Ok(json!(checker.is_undefined_symbol(symbol))),
             "isArgumentsSymbol" => Ok(json!(checker.is_arguments_symbol(symbol))),
@@ -763,6 +811,7 @@ impl ClassicChecker {
             }
             "getAwaitedType" => Ok(self.type_ref(checker.get_awaited_type_exported(t))),
             "isArrayType" => Ok(json!(checker.is_array_type_exported(t))),
+            "isEmptyAnonymousObjectType" => Ok(json!(checker.is_empty_anonymous_object_type(t))),
             "isTupleType" => Ok(json!(checker.is_tuple_type_exported(t))),
             "isArrayLikeType" => Ok(json!(checker.is_array_like_type_exported(t))),
             "getPromisedTypeOfPromise" => {
@@ -904,6 +953,16 @@ impl ClassicChecker {
                     .ok_or("signature declaration kind is not a syntax kind")?;
                 vec![checker.node_builder_signature_to_signature_declaration(
                     &builder, signature, kind, enclosing, flags, internal, None,
+                )]
+            }
+            "typePredicateToTypePredicateNode" => {
+                vec![checker.node_builder_type_predicate_to_type_predicate_node(
+                    &builder,
+                    TypePredicateId(number(request, "typePredicate")?),
+                    enclosing,
+                    flags,
+                    internal,
+                    None,
                 )]
             }
             "indexInfoToIndexSignatureDeclaration" => {
@@ -1243,6 +1302,14 @@ impl ClassicChecker {
                 ));
             }
         }
+        // Classic's index and string mapping types name their operand `type`; Go's `target`.
+        if ty
+            .flags()
+            .intersects(TypeFlags::INDEX | TypeFlags::STRING_MAPPING)
+            && let Some(target) = data.as_object_mut().and_then(|data| data.remove("target"))
+        {
+            data["type"] = target;
+        }
         for key in [
             "typeParameters",
             "outerTypeParameters",
@@ -1278,6 +1345,16 @@ impl ClassicChecker {
             // Classic `links.nameType`: a mapped or late-bound member's property name type.
             if name_type.is_some() {
                 links["nameType"] = self.type_ref(name_type);
+            }
+            // Classic `links.target` and `links.originatingImport` of the uncallable namespace
+            // symbol `resolveESModuleSymbol` makes; the port keeps them in its export type links.
+            if let Some(export) = checker.export_type_links.try_get(symbol) {
+                if target.is_nil() {
+                    links["target"] = self.symbol_ref(export.target);
+                }
+                if export.originating_import.is_some() {
+                    links["originatingImport"] = node_ref(export.originating_import);
+                }
             }
         }
         // The port's index symbol is a transient property; classic's is a `Signature` symbol
@@ -1455,7 +1532,42 @@ fn classic_type_at_location(checker: &mut Checker, node: Node) -> TypeId {
     {
         return classic_type_from_type_node(checker, node);
     }
+    // Classic `checkMetaPropertyKeyword` for the keyword of `import.meta` or `new.target`; Go's is
+    // an unported stub that answers the error type.
+    let parent = node.parent();
+    if parent.is_some()
+        && parent.kind() == SyntaxKind::MetaProperty
+        && parent.keyword_token() == node.kind()
+    {
+        return classic_meta_property_keyword_type(checker, parent);
+    }
+    // Classic `getTypeOfNode` answers import attributes with the global `ImportAttributes`
+    // type; Go's has no case for them.
+    if node.kind() == SyntaxKind::ImportAttributes {
+        return checker.get_global_import_attributes_type();
+    }
     checker.get_type_at_location(node)
+}
+
+/// Classic `checkMetaPropertyKeyword` with `createNewTargetExpressionType`.
+fn classic_meta_property_keyword_type(checker: &mut Checker, node: Node) -> TypeId {
+    if node.keyword_token() == SyntaxKind::ImportKeyword {
+        return checker.get_global_import_meta_expression_type();
+    }
+    let target_type = checker.check_new_target_meta_property(node);
+    if checker.is_error_type(target_type) {
+        return checker.error_type;
+    }
+    let symbol = checker.new_symbol(SymbolFlags::NONE, "NewTargetExpression");
+    let target = checker.new_symbol_ex(SymbolFlags::PROPERTY, "target", CheckFlags::READONLY);
+    checker.sym_mut(target).parent = symbol;
+    checker
+        .value_symbol_links
+        .get_by_id(&checker.symbols, target)
+        .resolved_type = target_type;
+    let members = checker.create_symbol_table(&[target]);
+    checker.sym_mut(symbol).members = members;
+    checker.new_anonymous_type(symbol, members, &[], &[], &[])
 }
 
 /// Go `GetMemberOverrideModifierStatus` (checker.go) after its member reads.

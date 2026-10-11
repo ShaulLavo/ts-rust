@@ -149,6 +149,39 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Node locals, meta properties and more checker members (r33, r34)
+
+Injected run: **7,482 of 7,853** (fourslash 5,958, services 1,524), none lost against `r32`
+or any earlier run (`r33` 7,443, `r34`). No `ts_goport` source changed.
+
+- `ImportAttributes.elements` (Go's field is `attributes`), the global `ImportAttributes` type
+  for an import attributes node, and `type.checker` on every type.
+- A node reference to one of Go's reparsed JSDoc clones (a `@template` type parameter in a
+  symbol's declarations) answers the parsed JSDoc node with the same kind and range.
+- Index and string mapping types name their operand `type`, as classic's do.
+- `getTypeAtLocation` of the `import` or `new` keyword of a meta property answers classic's
+  `checkMetaPropertyKeyword` (`ImportMeta` expression and `NewTargetExpression` types); Go's
+  is an unported stub.
+- Symbol links carry `originatingImport` and its `target` (the port's export type links), so
+  the invalid-namespace-import fixes appear.
+- Parsed nodes answer `locals` from the binder, with an empty table where classic's binder
+  makes one (`ContainerFlags.HasLocals`).
+- New checker members over Go's functions: `symbolIsValue`, `isEmptyAnonymousObjectType`,
+  `tryFindAmbientModule`, `getSuggestedSymbolForNonexistentClassMember`,
+  `getSuggestedSymbolForNonexistentJSXAttribute`, `requiresAddingImplicitUndefined` (Go's
+  emit resolver worker) and `typePredicateToTypePredicateNode`.
+
+Classified in this batch (counts added to the table below): JavaScript `this.x` and
+`prototype` properties cannot be renamed (5) and `convertFunctionToEs6Class1` and
+`_falsePositive` (2), constructor functions; `jsObjectDefinePropertyRenameLocations` (1), JS
+expando. Go reports an unused `infer` or JSDoc type parameter as TS6196 on its name where
+classic reports TS6133 on the `infer` node, so classic's fix fails in `deleteNodeInList` (6
+`codeFixUnusedIdentifier_*` cases; a design difference, not a removal).
+
+Next by failing count (`r34`, 371 failing): `getEditsForFileRename*` triple-slash edits (6),
+`breakpointValidationDestructuring*` baselines (12 in four groups), "found 2 codefixes" (5),
+JS export assignment errors in modules (4), and `getRegionSemanticDiagnostics` regions.
+
 ## Cancellation polls, classic AST views, symbol walker and hover verbosity (r27 to r32)
 
 Injected run: **7,402 of 7,853** (fourslash 5,878, services 1,524), none lost against `r26`
@@ -232,16 +265,16 @@ Classified, not changed (TypeScript-Go removed semantics; owner decision), by ca
 
 | Group | Cases |
 | --- | --- |
-| Constructor functions get no `this`/`prototype` members | 29 (`convertFunctionToEs6Class*` 26, `getJavaScriptSyntacticDiagnostics24`, `jsDocFunctionSignatures7`, `jsDocFunctionSignatures8`) |
+| Constructor functions get no `this`/`prototype` members | 36 (`convertFunctionToEs6Class*` 28, `getJavaScriptSyntacticDiagnostics24`, `jsDocFunctionSignatures7`, `jsDocFunctionSignatures8`, `renameJsPrototypeProperty01`, `02`, `renameJsThisProperty01`, `05`, `06`) |
 | Closure `function(...)` JSDoc types | 12 (`getJavaScriptQuickInfo1`, `6`, `jsDocFunctionSignatures12`, `jsDocGenerics2`, `quickInfoJSDocFunctionNew`, `quickInfoJSDocFunctionThis`, `annotateWithTypeFromJSDoc4`, `16`, `23`, `getJavaScriptCompletions8`, `9`, `10`) |
 | `outFile` concatenation and AMD output | 12 |
 | Bare `?` JSDoc unknown type (Go reports TS1110) | 3 (`codeFixChangeJSDocSyntax1`, `18`, `19`) |
 | `@enum` | 3 (`quickInfoJSExport`, `quickInfoJsdocEnum`, `codeFixInferFromUsageExistingJSDoc`) |
 | CommonJS beyond `const x = require()` (`module.exports = require()`, an `exports` alias, exports in an IIFE) | 3 (`refactorConvertToEsModule_export_alias`, `refactorConvertToEsModule_export_moduleDotExportsEqualsRequire`, `javascriptModules22`) |
-| JS expando forms (`Object.defineProperty`, element-access declarations) | 3 (`quickInfoOnExpandoLikePropertyWithSetterDeclarationJs1`, `2`, `quickInfoElementAccessDeclaration`) |
+| JS expando forms (`Object.defineProperty`, element-access declarations) | 4 (`quickInfoOnExpandoLikePropertyWithSetterDeclarationJs1`, `2`, `quickInfoElementAccessDeclaration`, `jsObjectDefinePropertyRenameLocations`) |
 | `@typedef` without a type; hyphenated JSDoc property names | 2 (`quickInfoJsdocTypedefMissingType`, `jsDocTagsWithHyphen`) |
 
-That is 67 cases. TypeScript-Go design differences that are not removals, also unchanged:
+That is 75 cases (through `r34`). TypeScript-Go design differences that are not removals, also unchanged:
 Go parses an exported class in a namespace outside `AwaitContext` (8 node-flag cases); Go's
 deterministic union order (`exhaustiveCaseCompletions8`, `quickinfoVerbosity2`,
 `quickinfoVerbosityTuple`, `quickInfoCanBeTruncated` in part); Go reports TS6198 for an unused

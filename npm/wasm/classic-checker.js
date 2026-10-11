@@ -14,6 +14,8 @@ function translateBits(flags, source, destination) {
 
 /** The checker member that answers a parsed node's binder symbol. */
 export const nodeSymbolKey = Symbol("nodeSymbol");
+/** The checker member that answers a parsed node's binder `locals`. */
+export const nodeLocalsKey = Symbol("nodeLocals");
 
 // Internal classic flags (types.ts): SymbolFormatFlags and InternalNodeBuilderFlags.
 const symbolFormatWriteComputedProps = 1 << 4;
@@ -179,6 +181,8 @@ export function createTypeChecker(lease, resolveNode) {
                 data.intrinsicName = String(data.value);
                 delete data.value;
             }
+            // Classic's `TypeObject` keeps the checker that made it.
+            data.checker = checker;
             return data;
         }, object => ({
             getFlags: () => object.flags,
@@ -410,10 +414,16 @@ export function createTypeChecker(lease, resolveNode) {
     for (const method of ["getDeclaredTypeOfSymbol", "getTypeOfSymbol", "getAliasedSymbol", "getImmediateAliasedSymbol", "getMergedSymbol", "getRootSymbols", "getExportsOfModule", "getFullyQualifiedName", "getIndexInfosOfIndexSymbol"]) {
         checker[method] = object => query(method, { symbol: handle(object, "symbol"), origin: objectHandles.get(object)?.origin });
     }
+    checker.tryFindAmbientModule = moduleName => query("tryFindAmbientModule", { name: moduleName });
+    checker.getSuggestedSymbolForNonexistentClassMember = (name, baseType) => query("getSuggestedSymbolForNonexistentClassMember", { name, ...typeOf(baseType) });
+    checker.getSuggestedSymbolForNonexistentJSXAttribute = (name, containingType) => query("getSuggestedSymbolForNonexistentJSXAttribute", {
+        name: typeof name === "string" ? name : classicNamespace().idText(name), ...typeOf(containingType) });
+    checker.requiresAddingImplicitUndefined = (parameter, enclosing) => query("requiresAddingImplicitUndefined", { location: location(parameter), enclosing: enclosing && location(enclosing) });
+    checker.symbolIsValue = (object, includeTypeOnlyMembers) => query("symbolIsValue", { symbol: handle(object, "symbol"), includeTypeOnlyMembers: !!includeTypeOnlyMembers, origin: objectHandles.get(object)?.origin });
     // Classic `getMergedSymbol` answers a missing symbol (a script file's) with itself.
     const mergedSymbol = checker.getMergedSymbol;
     checker.getMergedSymbol = object => object === undefined ? undefined : mergedSymbol(object);
-    for (const method of ["getPropertiesOfType", "getAugmentedPropertiesOfType", "getBaseTypes", "getTypeArguments", "getApparentType", "getNonNullableType", "getNonOptionalType", "isNullableType", "getWidenedType", "getBaseTypeOfLiteralType", "getBaseConstraintOfType", "getDefaultFromTypeParameter", "getConstraintOfTypeParameter", "getAwaitedType", "isArrayType", "isTupleType", "isArrayLikeType"]) {
+    for (const method of ["getPropertiesOfType", "getAugmentedPropertiesOfType", "getBaseTypes", "getTypeArguments", "getApparentType", "getNonNullableType", "getNonOptionalType", "isNullableType", "getWidenedType", "getBaseTypeOfLiteralType", "getBaseConstraintOfType", "getDefaultFromTypeParameter", "getConstraintOfTypeParameter", "getAwaitedType", "isArrayType", "isTupleType", "isArrayLikeType", "isEmptyAnonymousObjectType"]) {
         checker[method] = object => query(method, { type: handle(object, "type"), origin: objectHandles.get(object)?.origin });
     }
     // Classic compares with its own unknown, undefined and arguments symbols.
@@ -461,6 +471,18 @@ export function createTypeChecker(lease, resolveNode) {
         if (!symbols) nodeSymbols.set(node, symbols = {});
         if (!(key in symbols)) symbols[key] = query("getNodeSymbol", { location: location(node), local });
         return symbols[key];
+    };
+    // The binder's `node.locals`: classic's binder gives every container with `HasLocals` a
+    // table, even an empty one; the port's makes a table with its first entry.
+    const nodeLocals = new WeakMap();
+    checker[nodeLocalsKey] = node => {
+        if (nodeLocals.has(node)) return nodeLocals.get(node);
+        const entries = query("getNodeLocals", { location: location(node) });
+        // Classic `ContainerFlags.HasLocals` (binder.ts).
+        const hasLocals = (classicNamespace().getContainerFlags(node) & 32) !== 0;
+        const locals = entries ? new Map(entries) : hasLocals ? new Map() : undefined;
+        nodeLocals.set(node, locals);
+        return locals;
     };
     const typeOf = type => ({ type: handle(type, "type"), origin: objectHandles.get(type)?.origin });
     checker.isImplementationOfOverload = nodeIn => {
@@ -612,6 +634,11 @@ export function createTypeChecker(lease, resolveNode) {
         symbolToDeclarations: (symbol, symbolMeaning, flags, maximumLength, verbosityLevel, out) => build("symbolToDeclarations", symbolParams(symbol, symbolMeaning), undefined, flags, 0, maximumLength, verbosityLevel, out ?? {}),
     };
     checker.getEmitResolver = () => emitResolver;
+    checker.typePredicateToTypePredicateNode = (predicate, enclosing, flags, internalFlags) => {
+        const id = typePredicateIds.get(predicate);
+        if (id === undefined) throw new TypeError("type predicate is not owned by this checker");
+        return build("typePredicateToTypePredicateNode", { typePredicate: id }, enclosing, flags, internalFlags)[0];
+    };
     checker.indexInfoToIndexSignatureDeclaration = (info, enclosing, flags, internalFlags) => {
         const id = indexInfoIds.get(info);
         if (id === undefined) throw new TypeError("index info is not owned by this checker");

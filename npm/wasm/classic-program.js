@@ -1,6 +1,6 @@
 import { nodeHandle } from "./classic-ast.js";
 import { materializeSourceFile, resolveSourceNode } from "./classic-source-files.js";
-import { createTypeChecker, nodeSymbolKey } from "./classic-checker.js";
+import { createTypeChecker, nodeLocalsKey, nodeSymbolKey } from "./classic-checker.js";
 import { useNodeSymbols } from "./classic-ast.js";
 import { createModeAwareCache } from "./classic-resolutions.js";
 import { SyntaxKind } from "./classic-enums.js";
@@ -11,6 +11,7 @@ const programs = new WeakMap();
 const filePrograms = new WeakMap();
 useNodeSymbols((node, property) => {
     const program = filePrograms.get(node.getSourceFile())?.deref();
+    if (property === "locals") return program?.getTypeChecker()[nodeLocalsKey](node);
     return program?.getTypeChecker()[nodeSymbolKey](node, property === "localSymbol");
 });
 const leases = new WeakMap();

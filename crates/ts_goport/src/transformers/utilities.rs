@@ -1,5 +1,6 @@
 //! Port of Go `transformers/utilities.go`.
 
+use crate::ast::visitor::NodeVisitor;
 use crate::prelude::*;
 
 // Go: transformers/utilities.go:12 IsGeneratedIdentifier
@@ -425,5 +426,444 @@ pub fn get_non_assignment_operator_for_compound_assignment(kind: SyntaxKind) -> 
         SyntaxKind::AmpersandAmpersandEqualsToken => SyntaxKind::AmpersandAmpersandToken,
         SyntaxKind::QuestionQuestionEqualsToken => SyntaxKind::QuestionQuestionToken,
         _ => kind,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BinaryPhase {
+    Left,
+    Type,
+    Operator,
+    Right,
+}
+
+struct BinaryFrame {
+    node: Node,
+    modifiers: ModifierList,
+    left: Node,
+    type_node: Node,
+    operator: Node,
+    phase: BinaryPhase,
+}
+
+/// Go `ast_generated.go` binary-child order, with owned continuations for binary chains.
+/// Opt-in traversal for callbacks whose binary-expression branch only visits children.
+/// Node and modifier overrides must be unset; all other children use the running callback.
+pub(crate) fn visit_binary_expression_chain<C>(
+    node: Node,
+    visitor: &mut NodeVisitor<'_, C>,
+) -> Node {
+    debug_assert_eq!(node.kind(), SyntaxKind::BinaryExpression);
+    debug_assert!(visitor.visit.is_some());
+    debug_assert!(visitor.hooks.visit_node.is_none());
+    debug_assert!(visitor.hooks.visit_modifiers.is_none());
+    let mut frames = Vec::new();
+    let mut next = node;
+    loop {
+        if next.is_some() && next.kind() == SyntaxKind::BinaryExpression {
+            let modifiers = visitor.visit_modifiers(next.modifiers());
+            frames.push(BinaryFrame {
+                node: next,
+                modifiers,
+                left: Node::NIL,
+                type_node: Node::NIL,
+                operator: Node::NIL,
+                phase: BinaryPhase::Left,
+            });
+            next = next.left();
+            continue;
+        }
+        let mut result = visitor.visit_node(next);
+        loop {
+            let Some(frame) = frames.last_mut() else {
+                return result;
+            };
+            match frame.phase {
+                BinaryPhase::Left => {
+                    frame.left = result;
+                    frame.phase = BinaryPhase::Type;
+                    next = frame.node.type_();
+                    break;
+                }
+                BinaryPhase::Type => {
+                    frame.type_node = result;
+                    frame.phase = BinaryPhase::Operator;
+                    next = frame.node.operator_token();
+                    break;
+                }
+                BinaryPhase::Operator => {
+                    frame.operator = result;
+                    frame.phase = BinaryPhase::Right;
+                    next = frame.node.right();
+                    break;
+                }
+                BinaryPhase::Right => {
+                    let frame = frames.pop().unwrap();
+                    result = visitor.factory().update_binary_expression(
+                        frame.node,
+                        frame.modifiers,
+                        frame.left,
+                        frame.type_node,
+                        frame.operator,
+                        result,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod binary_transform_tests {
+    use super::*;
+    use crate::checker::emit_resolver_p1::get_emit_resolver_of_shared_checker;
+    use crate::transformers::transformer::{EmitResolverReferenceResolver, TransformOptions};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    struct FixtureDirectory(PathBuf);
+
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct FixtureProgram(&'static GoProgram);
+
+    impl Drop for FixtureProgram {
+        fn drop(&mut self) {
+            crate::program::release_program(self.0);
+        }
+    }
+
+    pub(crate) fn with_program(
+        source: &str,
+        file_name: &str,
+        edit_options: impl FnOnce(&mut CompilerOptions),
+        run: impl FnOnce(&TransformOptions, Node),
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "goport-binary-transform-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let directory = FixtureDirectory(path);
+        std::fs::write(directory.0.join(file_name), source).unwrap();
+        let config = directory.0.join("tsconfig.json");
+        std::fs::write(&config, format!(r#"{{"files":["{file_name}"]}}"#)).unwrap();
+        let program = FixtureProgram(
+            crate::program::try_load_version(config.to_str().unwrap(), |options| {
+                options.no_lib = Tristate::True;
+                options.target = ScriptTarget::ES2020;
+                options.module = ModuleKind::ES2015;
+                options.allow_js = Tristate::True;
+                edit_options(options);
+            })
+            .unwrap(),
+        );
+        let _scope = crate::core::enter_program(Some(program.0));
+        let checker = Rc::new(RefCell::new(
+            crate::program::ls_program::new_checker_for_version(program.0),
+        ));
+        let emit_resolver: Rc<dyn crate::printer::EmitResolver> =
+            get_emit_resolver_of_shared_checker(&checker);
+        let compiler_options = program.0.options;
+        let opts = TransformOptions {
+            context: new_emit_context(),
+            compiler_options,
+            resolver: Rc::new(EmitResolverReferenceResolver(emit_resolver.clone())),
+            emit_resolver,
+            get_emit_module_format_of_file: Rc::new(move |_| {
+                compiler_options.get_emit_module_kind()
+            }),
+        };
+        let file = program
+            .0
+            .source_files()
+            .find(|file| file.info.file_name.ends_with(file_name))
+            .unwrap()
+            .root;
+        run(&opts, file);
+    }
+
+    pub(crate) fn preorder(root: Node) -> Vec<Node> {
+        let mut pending = vec![root];
+        let mut nodes = Vec::new();
+        while let Some(node) = pending.pop() {
+            nodes.push(node);
+            let start = pending.len();
+            node.for_each_child(|child| {
+                pending.push(child);
+                false
+            });
+            pending[start..].reverse();
+        }
+        nodes
+    }
+
+    pub(crate) fn binary(factory: &NodeFactory, left: Node, right: Node) -> Node {
+        factory.new_binary_expression(
+            ModifierList::NIL,
+            left,
+            Node::NIL,
+            factory.new_token(SyntaxKind::PlusToken),
+            right,
+        )
+    }
+
+    pub(crate) fn deep_chain(factory: &NodeFactory, depth: usize, right: bool) -> Node {
+        let mut node = factory.new_numeric_literal("0", TokenFlags::NONE);
+        for _ in 0..depth {
+            let leaf = factory.new_numeric_literal("1", TokenFlags::NONE);
+            node = if right {
+                binary(factory, leaf, node)
+            } else {
+                binary(factory, node, leaf)
+            };
+        }
+        node
+    }
+
+    fn balanced(factory: &NodeFactory, depth: usize) -> Node {
+        let mut nodes: Vec<_> = (0..(1 << depth))
+            .map(|_| factory.new_numeric_literal("1", TokenFlags::NONE))
+            .collect();
+        while nodes.len() > 1 {
+            nodes = nodes
+                .chunks_exact(2)
+                .map(|pair| binary(factory, pair[0], pair[1]))
+                .collect();
+        }
+        nodes[0]
+    }
+
+    struct VisitState {
+        iterative: bool,
+        seen: Vec<Node>,
+        replacements: FxHashMap<Node, Node>,
+    }
+
+    fn visit(node: Node, visitor: &mut NodeVisitor<'_, VisitState>) -> Node {
+        if node.kind() == SyntaxKind::BinaryExpression {
+            if visitor.ctx.iterative {
+                return visit_binary_expression_chain(node, visitor);
+            }
+            return visitor.visit_each_child(node);
+        }
+        visitor.ctx.seen.push(node);
+        if let Some(&replacement) = visitor.ctx.replacements.get(&node) {
+            return replacement;
+        }
+        visitor.visit_each_child(node)
+    }
+
+    fn run(
+        context: &EmitContext,
+        root: Node,
+        iterative: bool,
+        replacements: FxHashMap<Node, Node>,
+    ) -> (Node, Vec<Node>) {
+        let mut visitor = context.new_node_visitor(
+            visit,
+            VisitState {
+                iterative,
+                seen: Vec::new(),
+                replacements,
+            },
+        );
+        let result = visitor.visit_node(root);
+        (result, visitor.ctx.seen)
+    }
+
+    #[test]
+    fn binary_transform_deep_left_right_balanced_identity_cold_and_warm() {
+        let context = new_emit_context();
+        let factory = &context.factory().ast;
+        let roots = [
+            deep_chain(factory, 10_000, false),
+            deep_chain(factory, 10_000, true),
+            balanced(factory, 13),
+        ];
+        for root in roots {
+            assert!(static_ast_node(root).is_none());
+            let (cold, cold_seen) = run(&context, root, true, FxHashMap::default());
+            let (warm, warm_seen) = run(&context, root, true, FxHashMap::default());
+            assert_eq!(cold, root);
+            assert_eq!(warm, root);
+            assert_eq!(warm_seen, cold_seen);
+            assert_eq!(context.original(root), Node::NIL);
+        }
+    }
+
+    #[test]
+    fn binary_transform_preserves_go_roles_modifiers_and_factory_metadata() {
+        let context = new_emit_context();
+        let factory = &context.factory().ast;
+        let modifier = factory.new_modifier(SyntaxKind::ExportKeyword);
+        let modifiers = factory.new_modifier_list_with_loc(&[modifier], TextRange::new(1, 3));
+        let left = factory.new_numeric_literal("1", TokenFlags::NONE);
+        let type_node = factory.new_identifier("T");
+        let operator = factory.new_token(SyntaxKind::PlusToken);
+        let right = factory.new_numeric_literal("2", TokenFlags::NONE);
+        let root = factory.new_binary_expression(modifiers, left, type_node, operator, right);
+        set_node_flags(root, root.flags() | NodeFlags::AMBIENT);
+        set_node_loc(root, TextRange::new(4, 12));
+        context.add_emit_flags(root, EmitFlags::NO_COMMENTS);
+        context.set_comment_range(root, TextRange::new(0, 15));
+        context.set_source_map_range(root, TextRange::new(3, 13));
+        let (original, original_seen) = run(&context, root, false, FxHashMap::default());
+        let (unchanged, seen) = run(&context, root, true, FxHashMap::default());
+        assert_eq!(original, root);
+        assert_eq!(unchanged, root);
+        assert_eq!(seen, original_seen);
+        assert_eq!(seen, vec![modifier, left, type_node, operator, right]);
+
+        let changed_modifier = factory.new_modifier(SyntaxKind::DeclareKeyword);
+        let changed_left = factory.new_numeric_literal("3", TokenFlags::NONE);
+        let changed_type = factory.new_identifier("U");
+        let changed_operator = factory.new_token(SyntaxKind::MinusToken);
+        let replacements = FxHashMap::from_iter([
+            (modifier, changed_modifier),
+            (left, changed_left),
+            (type_node, changed_type),
+            (operator, changed_operator),
+        ]);
+        let (recursive, recursive_seen) = run(&context, root, false, replacements.clone());
+        let (changed, changed_seen) = run(&context, root, true, replacements);
+        assert_eq!(changed_seen, recursive_seen);
+        assert_ne!(changed, root);
+        assert_eq!(changed.left(), recursive.left());
+        assert_eq!(changed.type_(), recursive.type_());
+        assert_eq!(changed.operator_token(), recursive.operator_token());
+        assert_eq!(changed.right(), right);
+        assert_eq!(changed.modifier_nodes().to_vec(), vec![changed_modifier]);
+        assert_eq!(
+            changed.modifiers().node_list().loc(),
+            modifiers.node_list().loc()
+        );
+        assert_eq!(changed.flags(), root.flags());
+        assert_eq!(changed.loc(), root.loc());
+        assert_eq!(context.original(changed), root);
+        assert_eq!(context.emit_flags(changed), context.emit_flags(root));
+        assert_eq!(context.comment_range(changed), context.comment_range(root));
+        assert_eq!(
+            context.source_map_range(changed),
+            context.source_map_range(root)
+        );
+    }
+
+    #[test]
+    fn binary_transform_keeps_nil_empty_modifiers_and_single_node_lifting() {
+        let context = new_emit_context();
+        let factory = &context.factory().ast;
+        let left = factory.new_numeric_literal("1", TokenFlags::NONE);
+        let right = factory.new_numeric_literal("2", TokenFlags::NONE);
+        for modifiers in [ModifierList::NIL, factory.new_modifier_list(&[])] {
+            let root = factory.new_binary_expression(
+                modifiers,
+                left,
+                Node::NIL,
+                factory.new_token(SyntaxKind::PlusToken),
+                right,
+            );
+            let stored_modifiers = root.modifiers();
+            assert_eq!(stored_modifiers.is_nil(), modifiers.is_nil());
+            assert!(stored_modifiers.nodes().is_empty());
+            if modifiers.is_some() {
+                assert_ne!(stored_modifiers, modifiers);
+                assert_eq!(stored_modifiers.loc(), modifiers.loc());
+            }
+            let (unchanged, _) = run(&context, root, true, FxHashMap::default());
+            assert_eq!(unchanged, root);
+            assert_eq!(unchanged.modifiers(), stored_modifiers);
+            assert_eq!(unchanged.modifiers().is_nil(), modifiers.is_nil());
+            let replacement = binary(factory, right, left);
+            let lifted = factory.new_syntax_list(&[replacement]);
+            let replacements = FxHashMap::from_iter([(left, lifted)]);
+            let (recursive, recursive_seen) = run(&context, root, false, replacements.clone());
+            let (result, seen) = run(&context, root, true, replacements);
+            assert_eq!(result.left(), replacement);
+            assert_eq!(result.left(), recursive.left());
+            assert_eq!(seen, recursive_seen);
+            assert_eq!(seen, vec![left, root.operator_token(), right]);
+        }
+    }
+
+    #[test]
+    fn binary_transform_static_parsed_chain_keeps_handles() {
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        let context = new_emit_context();
+        let options = SourceFileParseOptions {
+            file_name: "/binary-transform-static.ts".to_string(),
+            ..Default::default()
+        };
+        let file = parse_source_file(&options, "const value = 1 + 2 * 3;", ScriptKind::TS).root;
+        let root = preorder(file)
+            .into_iter()
+            .find(|node| node.kind() == SyntaxKind::BinaryExpression)
+            .unwrap();
+        assert!(static_ast_node(root).is_some());
+        let (recursive, recursive_seen) = run(&context, root, false, FxHashMap::default());
+        assert_eq!(recursive, root);
+        for _ in 0..2 {
+            let (result, seen) = run(&context, root, true, FxHashMap::default());
+            assert_eq!(result, root);
+            assert_eq!(seen, recursive_seen);
+        }
+    }
+
+    #[test]
+    fn binary_transform_preserves_nil_callback_result() {
+        let context = new_emit_context();
+        let factory = &context.factory().ast;
+        let type_node = factory.new_identifier("T");
+        let root = factory.new_binary_expression(
+            ModifierList::NIL,
+            factory.new_numeric_literal("1", TokenFlags::NONE),
+            type_node,
+            factory.new_token(SyntaxKind::PlusToken),
+            factory.new_numeric_literal("2", TokenFlags::NONE),
+        );
+        let replacements = FxHashMap::from_iter([(type_node, Node::NIL)]);
+        let (recursive, recursive_seen) = run(&context, root, false, replacements.clone());
+        let (result, seen) = run(&context, root, true, replacements);
+        assert!(result.type_().is_nil());
+        assert!(recursive.type_().is_nil());
+        assert_eq!(seen, recursive_seen);
+        assert_eq!(context.original(result), root);
+    }
+
+    #[test]
+    fn binary_transform_scoped_parsed_chain_keeps_handles() {
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        let options = SourceFileParseOptions {
+            file_name: "/binary-transform-owned.ts".to_string(),
+            ..Default::default()
+        };
+        let file = {
+            let _scope = crate::ast::enter_owned_parse();
+            parse_source_file(&options, "export const value = 1 + 2 * 3;", ScriptKind::TS)
+        };
+        let context = new_emit_context();
+        let root = preorder(file.root)
+            .into_iter()
+            .find(|node| node.kind() == SyntaxKind::BinaryExpression)
+            .unwrap();
+        assert_ne!(root.file_index(), SYNTHETIC_NODE_FILE);
+        assert!(static_ast_node(root).is_none());
+        assert!(crate::ast::try_store_ast_node(root).is_none());
+        assert!(file.root.statement_list().store_list().is_some());
+        let (cold, cold_seen) = run(&context, root, true, FxHashMap::default());
+        let (warm, warm_seen) = run(&context, root, true, FxHashMap::default());
+        let (recursive, recursive_seen) = run(&context, root, false, FxHashMap::default());
+        assert_eq!(cold, root);
+        assert_eq!(warm, root);
+        assert_eq!(recursive, root);
+        assert_eq!(cold_seen, recursive_seen);
+        assert_eq!(warm_seen, cold_seen);
     }
 }

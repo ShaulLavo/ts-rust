@@ -18,7 +18,7 @@ use crate::prelude::*;
 use crate::transformers::transformer::{
     TransformOptions, TransformReferenceResolver, Transformer, TransformerBox,
 };
-use crate::transformers::utilities::single_or_many;
+use crate::transformers::utilities::{single_or_many, visit_binary_expression_chain};
 
 // Go: transformers/moduletransforms/esmodule.go:13 ESModuleTransformer
 pub struct ESModuleTransformer {
@@ -477,6 +477,7 @@ fn visit_in(node: Node, v: &mut NodeVisitor<'_, &mut ESModuleTransformer>) -> No
         SyntaxKind::ExportAssignment => v.ctx.visit_export_assignment(node),
         SyntaxKind::ExportDeclaration => v.ctx.visit_export_declaration(node),
         SyntaxKind::CallExpression => visit_call_expression_in(node, v),
+        SyntaxKind::BinaryExpression => visit_binary_expression_chain(node, v),
         _ => v.visit_each_child(node),
     }
 }
@@ -496,4 +497,206 @@ fn visit_call_expression_in(node: Node, v: &mut NodeVisitor<'_, &mut ESModuleTra
         return v.ctx.visit_import_or_require_call(node);
     }
     v.visit_each_child(node)
+}
+
+#[cfg(test)]
+mod binary_transform_tests {
+    use super::*;
+    use crate::transformers::utilities::binary_transform_tests::{
+        deep_chain, preorder, with_program,
+    };
+
+    fn transformer(opts: &TransformOptions) -> ESModuleTransformer {
+        ESModuleTransformer {
+            emit_context: opts.context.clone(),
+            compiler_options: opts.compiler_options,
+            resolver: opts.resolver.clone(),
+            get_emit_module_format_of_file: opts.get_emit_module_format_of_file.clone(),
+            current_source_file: Node::NIL,
+            import_require_statements: None,
+            helper_name_substitutions: FxHashMap::default(),
+        }
+    }
+
+    #[test]
+    fn binary_transform_es_module_rewrites_binary_children_and_preserves_metadata() {
+        with_program(
+            "export const value = import('./first.ts') + import('./second.ts');",
+            "input.ts",
+            |options| {
+                options.rewrite_relative_import_extensions = Tristate::True;
+            },
+            |opts, file| {
+                let root = preorder(file)
+                    .into_iter()
+                    .find(|node| node.kind() == SyntaxKind::BinaryExpression)
+                    .unwrap();
+                opts.context.set_comment_range(root, TextRange::new(1, 4));
+                opts.context
+                    .set_source_map_range(root, TextRange::new(2, 5));
+                let mut tx = transformer(opts);
+                for _ in 0..2 {
+                    let result = tx.transform_source_file(file);
+                    let nodes = preorder(result);
+                    let changed = nodes
+                        .iter()
+                        .copied()
+                        .find(|node| node.kind() == SyntaxKind::BinaryExpression)
+                        .unwrap();
+                    assert_ne!(changed, root);
+                    assert_eq!(opts.context.original(changed), root);
+                    assert_eq!(changed.flags(), root.flags());
+                    assert_eq!(changed.loc(), root.loc());
+                    assert_eq!(
+                        opts.context.comment_range(changed),
+                        opts.context.comment_range(root)
+                    );
+                    assert_eq!(
+                        opts.context.source_map_range(changed),
+                        opts.context.source_map_range(root)
+                    );
+                    let arguments: Vec<_> = nodes
+                        .into_iter()
+                        .filter(|node| {
+                            node.kind() == SyntaxKind::CallExpression
+                                && node.expression().kind() == SyntaxKind::ImportKeyword
+                        })
+                        .map(|node| node.arguments().to_vec()[0].text().to_string())
+                        .collect();
+                    assert_eq!(arguments, vec!["./first.js", "./second.js"]);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn binary_transform_es_module_source_guards_and_empty_export_finalization() {
+        for (source, name) in [
+            ("const value = 1 + 2;", "input.ts"),
+            ("export declare const value: number;", "input.d.ts"),
+        ] {
+            with_program(
+                source,
+                name,
+                |_| {},
+                |opts, file| {
+                    assert_eq!(
+                        new_es_module_transformer(opts).transform_source_file(file),
+                        file
+                    );
+                },
+            );
+        }
+        with_program(
+            "import value = require('./dep.ts');",
+            "input.ts",
+            |_| {},
+            |opts, file| {
+                let result = new_es_module_transformer(opts).transform_source_file(file);
+                let statements = result.statements().to_vec();
+                assert_eq!(statements.len(), 1);
+                assert_eq!(statements[0].kind(), SyntaxKind::ExportDeclaration);
+                assert!(statements[0].export_clause().elements().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn binary_transform_es_module_nonliteral_first_argument_is_not_previsited() {
+        with_program(
+            "export const value = import(import('./nested.ts')) + 1;",
+            "input.ts",
+            |options| {
+                options.rewrite_relative_import_extensions = Tristate::True;
+            },
+            |opts, file| {
+                let original_calls: Vec<_> = preorder(file)
+                    .into_iter()
+                    .filter(|node| node.kind() == SyntaxKind::CallExpression)
+                    .collect();
+                assert_eq!(original_calls.len(), 2);
+                let result = new_es_module_transformer(opts).transform_source_file(file);
+                let outer = preorder(result)
+                    .into_iter()
+                    .find(|node| {
+                        node.kind() == SyntaxKind::CallExpression
+                            && node.expression().kind() == SyntaxKind::ImportKeyword
+                    })
+                    .unwrap();
+                let helper = outer.arguments().to_vec()[0];
+                assert_eq!(helper.kind(), SyntaxKind::CallExpression);
+                assert_eq!(helper.arguments().to_vec()[0], original_calls[1]);
+                assert_eq!(
+                    original_calls[1].arguments().to_vec()[0].text(),
+                    "./nested.ts"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn binary_transform_es_module_require_helpers_follow_prologue_once() {
+        with_program(
+            "'use strict'; import a = require('./a.ts'); import b = require('./b.ts'); export const total = 1 + 2;",
+            "input.ts",
+            |options| {
+                options.module = ModuleKind::NODE16;
+                options.rewrite_relative_import_extensions = Tristate::True;
+            },
+            |opts, file| {
+                let original = file.statements().to_vec();
+                let mut tx = transformer(opts);
+                for _ in 0..2 {
+                    let result = tx.transform_source_file(file);
+                    let statements = result.statements().to_vec();
+                    assert_eq!(statements.len(), 6);
+                    assert_eq!(statements[0], original[0]);
+                    assert_eq!(statements[1].kind(), SyntaxKind::ImportDeclaration);
+                    assert_eq!(statements[1].module_specifier().text(), "module");
+                    assert_eq!(statements[2].kind(), SyntaxKind::VariableStatement);
+                    let helper = statements[2]
+                        .declaration_list()
+                        .declarations()
+                        .nodes()
+                        .get(0)
+                        .name();
+                    for (index, expected) in [(3, "./a.js"), (4, "./b.js")] {
+                        let declaration = statements[index]
+                            .declaration_list()
+                            .declarations()
+                            .nodes()
+                            .get(0);
+                        let call = declaration.initializer();
+                        assert_eq!(call.expression().text(), helper.text());
+                        assert_eq!(call.arguments().to_vec()[0].text(), expected);
+                        assert_eq!(
+                            opts.context.original(statements[index]),
+                            original[index - 2]
+                        );
+                    }
+                    assert_eq!(statements[5], original[3]);
+                    assert!(tx.import_require_statements.is_none());
+                    assert!(tx.current_source_file.is_nil());
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn binary_transform_es_module_callback_deep_identity_cold_and_warm() {
+        with_program(
+            "export const value = 1;",
+            "input.ts",
+            |_| {},
+            |opts, file| {
+                let mut tx = transformer(opts);
+                tx.current_source_file = file;
+                for right in [false, true] {
+                    let root = deep_chain(&opts.context.factory().ast, 10_000, right);
+                    assert_eq!(tx.with_visitor(|visitor| visitor.visit_node(root)), root);
+                    assert_eq!(tx.with_visitor(|visitor| visitor.visit_node(root)), root);
+                }
+            },
+        );
+    }
 }

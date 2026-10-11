@@ -5,6 +5,7 @@ use crate::transformers::transformer::{
     TransformOptions, Transformer, TransformerBox, TransformerVisit,
 };
 use crate::transformers::tstransforms::TxVisit;
+use crate::transformers::utilities::visit_binary_expression_chain;
 
 // Go: transformers/inliners/constenum.go:15 ConstEnumInliningTransformer
 pub struct ConstEnumInliningTransformer {
@@ -50,6 +51,9 @@ impl TransformerVisit for ConstEnumInliningTransformer {
     // Go: transformers/inliners/constenum.go:32 ConstEnumInliningTransformer.visit
     fn visit(&mut self, node: Node) -> Node {
         match node.kind() {
+            SyntaxKind::BinaryExpression => {
+                self.with_visitor(|visitor| visit_binary_expression_chain(node, visitor))
+            }
             SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
                 let ec = self.emit_context.clone();
                 let f = ec.factory();
@@ -137,4 +141,130 @@ fn safe_multi_line_comment(text: &str) -> String {
     b.push_str(text);
     b.push(' ');
     b
+}
+
+#[cfg(test)]
+mod binary_transform_tests {
+    use super::*;
+    use crate::transformers::utilities::binary_transform_tests::{
+        deep_chain, preorder, with_program,
+    };
+
+    fn transformer(opts: &TransformOptions, file: Node) -> ConstEnumInliningTransformer {
+        ConstEnumInliningTransformer {
+            emit_context: opts.context.clone(),
+            compiler_options: opts.compiler_options,
+            current_source_file: file,
+            emit_resolver: opts.emit_resolver.clone(),
+        }
+    }
+
+    #[test]
+    fn binary_transform_const_enum_real_checker_values_comments_and_pruning() {
+        let source = "const enum E { Number = 7, Text = 'word', Negative = -3 } const enum F { Child = 9 } export const value = E.Number + E['Text'] + E.Negative; const child = F.Child;";
+        for remove_comments in [false, true] {
+            with_program(
+                source,
+                "input.ts",
+                |options| {
+                    options.remove_comments = if remove_comments {
+                        Tristate::True
+                    } else {
+                        Tristate::False
+                    };
+                },
+                |opts, file| {
+                    let accesses: Vec<_> = preorder(file)
+                        .into_iter()
+                        .filter(|node| {
+                            matches!(
+                                node.kind(),
+                                SyntaxKind::PropertyAccessExpression
+                                    | SyntaxKind::ElementAccessExpression
+                            )
+                        })
+                        .collect();
+                    assert_eq!(accesses.len(), 4);
+                    let mut tx = transformer(opts, file);
+                    for _ in 0..2 {
+                        for (index, access) in accesses[..3].iter().copied().enumerate() {
+                            let replacement = tx.visit(access);
+                            match index {
+                                0 => {
+                                    assert_eq!(replacement.kind(), SyntaxKind::NumericLiteral);
+                                    assert_eq!(replacement.text(), "7");
+                                }
+                                1 => {
+                                    assert_eq!(replacement.kind(), SyntaxKind::StringLiteral);
+                                    assert_eq!(replacement.text(), "word");
+                                }
+                                _ => {
+                                    assert_eq!(
+                                        replacement.kind(),
+                                        SyntaxKind::PrefixUnaryExpression
+                                    );
+                                    assert_eq!(replacement.operator(), SyntaxKind::MinusToken);
+                                    assert_eq!(replacement.operand().text(), "3");
+                                }
+                            }
+                            let comments =
+                                opts.context.get_synthetic_trailing_comments(replacement);
+                            if remove_comments {
+                                assert!(comments.is_empty());
+                            } else {
+                                assert_eq!(comments.len(), 1);
+                                assert_eq!(
+                                    comments[0].text,
+                                    safe_multi_line_comment(&get_text_of_node(access))
+                                );
+                            }
+                        }
+                        let result = tx.transform_source_file(file);
+                        assert!(
+                            !preorder(result)
+                                .into_iter()
+                                .any(|node| node.kind() == SyntaxKind::PropertyAccessExpression)
+                        );
+                    }
+                    let factory = &opts.context.factory().ast;
+                    let synthetic = factory.new_property_access_expression(
+                        accesses[3],
+                        Node::NIL,
+                        factory.new_identifier("ignored"),
+                        NodeFlags::NONE,
+                    );
+                    opts.context.set_original(synthetic, accesses[0]);
+                    assert_eq!(opts.context.parse_node(synthetic), accesses[0]);
+                    let before = factory.node_count();
+                    let result = tx.visit(synthetic);
+                    assert_eq!(result.kind(), SyntaxKind::NumericLiteral);
+                    assert_eq!(result.text(), "7");
+                    assert_eq!(
+                        factory.node_count() - before,
+                        1,
+                        "successful parent replacement must prune the enum-valued receiver"
+                    );
+                    assert_eq!(synthetic.expression(), accesses[3]);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn binary_transform_const_enum_callback_deep_identity_cold_and_warm() {
+        with_program(
+            "export const value = 1;",
+            "input.ts",
+            |_| {},
+            |opts, file| {
+                let factory = &opts.context.factory().ast;
+                let mut tx = transformer(opts, file);
+                for right in [false, true] {
+                    let root = deep_chain(factory, 10_000, right);
+                    assert_eq!(tx.visit(root), root);
+                    assert_eq!(tx.visit(root), root);
+                }
+            },
+        );
+    }
 }

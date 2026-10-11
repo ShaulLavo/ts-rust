@@ -50,6 +50,9 @@ function isClassElementWithName(node) {
 }
 
 /** Intern compiler objects within the checker that owns their Rust arenas. */
+const lineageSymbols = new WeakMap();
+const lineageHandles = new WeakMap();
+
 export function createTypeChecker(lease, resolveNode) {
     const types = new Map();
     const symbols = new Map();
@@ -74,7 +77,7 @@ export function createTypeChecker(lease, resolveNode) {
         if (Array.isArray(value)) return value.map(decode);
         if (typeof value !== "object") return value;
         if (value.$type) return type(value.$type, value.origin);
-        if (value.$symbol) return symbol(value.$symbol, value.origin);
+        if (value.$symbol) return value.lineage ? lineageSymbol(value.$symbol, value.origin) : symbol(value.$symbol, value.origin);
         if (value.$signature) return signature(value.$signature, value.origin);
         if (value.$node) return resolveNode(value.$node);
         if (value.$indexInfo) return indexInfo(value);
@@ -140,13 +143,13 @@ export function createTypeChecker(lease, resolveNode) {
     /** The checker's id of `object`, or undefined for an object it does not own. */
     function ownedHandle(object, kind) {
         if (kind === "symbol" && pendingSymbols.has(object)) materializeSymbol(object);
-        const reference = object && objectHandles.get(object);
+        const reference = object && (objectHandles.get(object) ?? (kind === "symbol" ? lineageHandles.get(object) : undefined));
         return reference?.kind === kind ? reference.id : undefined;
     }
 
     function handle(object, kind) {
         if (kind === "symbol" && pendingSymbols.has(object)) materializeSymbol(object);
-        const reference = objectHandles.get(object);
+        const reference = objectHandles.get(object) ?? (kind === "symbol" ? lineageHandles.get(object) : undefined);
         if (!reference || reference.kind !== kind) throw new TypeError(`${kind} is not owned by this checker`);
         return reference.id;
     }
@@ -196,6 +199,19 @@ export function createTypeChecker(lease, resolveNode) {
                 return (object.flags & TypeFlags.TypeParameter) !== 0 ? checker.getConstraintOfTypeParameter(object) : undefined;
             },
         }), origin, true);
+    }
+
+    // A binder lineage symbol is one object for every checker of the instance, as a classic
+    // binder symbol is one object for every program that holds its file.
+    function lineageSymbol(id, origin) {
+        let cache = lineageSymbols.get(lease.channel.instance);
+        if (!cache) lineageSymbols.set(lease.channel.instance, cache = new Map());
+        const existing = cache.get(id)?.deref();
+        if (existing) return existing;
+        const created = symbol(id, origin);
+        cache.set(id, new WeakRef(created));
+        lineageHandles.set(created, { id, kind: "symbol", origin: undefined });
+        return created;
     }
 
     function symbol(id, origin) {
@@ -379,6 +395,9 @@ export function createTypeChecker(lease, resolveNode) {
     for (const method of ["getDeclaredTypeOfSymbol", "getTypeOfSymbol", "getAliasedSymbol", "getImmediateAliasedSymbol", "getMergedSymbol", "getRootSymbols", "getExportsOfModule", "getFullyQualifiedName"]) {
         checker[method] = object => query(method, { symbol: handle(object, "symbol"), origin: objectHandles.get(object)?.origin });
     }
+    // Classic `getMergedSymbol` answers a missing symbol (a script file's) with itself.
+    const mergedSymbol = checker.getMergedSymbol;
+    checker.getMergedSymbol = object => object === undefined ? undefined : mergedSymbol(object);
     for (const method of ["getPropertiesOfType", "getAugmentedPropertiesOfType", "getBaseTypes", "getTypeArguments", "getApparentType", "getNonNullableType", "getNonOptionalType", "isNullableType", "getWidenedType", "getBaseTypeOfLiteralType", "getBaseConstraintOfType", "getDefaultFromTypeParameter", "getConstraintOfTypeParameter", "getAwaitedType", "isArrayType", "isTupleType", "isArrayLikeType"]) {
         checker[method] = object => query(method, { type: handle(object, "type"), origin: objectHandles.get(object)?.origin });
     }

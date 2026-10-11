@@ -56,7 +56,11 @@ export function createProgramGraph(channel, handle, settings = {}) {
     graph("setParseTarget", { target: settings.target ?? 1 });
 
     function resolveNode(handle) {
-        return resolveSourceNode(channel.instance, handle);
+        const node = resolveSourceNode(channel.instance, handle);
+        // A node the checker answers names its file's binder symbols too.
+        const file = node.getSourceFile();
+        if (!filePrograms.get(file)?.deref()) filePrograms.set(file, programReference);
+        return node;
     }
 
     function getSourceFile(fileName) {

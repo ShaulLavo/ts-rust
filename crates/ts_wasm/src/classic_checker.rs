@@ -44,7 +44,7 @@ impl ClassicChecker {
             .as_str()
             .ok_or("checker method is required")?;
         let t = TypeId(Self::handle(request, "type", &self.types)?);
-        let symbol = SymbolId(Self::handle(request, "symbol", &self.symbols)?);
+        let symbol = SymbolId(Self::symbol_handle(request, "symbol", &self.symbols)?);
         let signature = SignatureId(Self::handle(request, "signature", &self.signatures)?);
         let mut checker = self.checker.borrow_mut();
         ts_goport::program::catch_up_checker(&mut checker.symbols);
@@ -409,7 +409,7 @@ impl ClassicChecker {
                 Ok(self.symbol_ref(created))
             }
             "createAnonymousType" => {
-                let members: Vec<SymbolId> = Self::ids(request, "members", &self.symbols)?
+                let members: Vec<SymbolId> = Self::symbol_ids(request, "members", &self.symbols)?
                     .into_iter()
                     .map(SymbolId)
                     .collect();
@@ -445,12 +445,16 @@ impl ClassicChecker {
                         .into_iter()
                         .map(TypeId)
                         .collect();
-                let parameters: Vec<SymbolId> = Self::ids(request, "parameters", &self.symbols)?
-                    .into_iter()
-                    .map(SymbolId)
-                    .collect();
-                let this_parameter =
-                    SymbolId(Self::handle(request, "thisParameter", &self.symbols)?);
+                let parameters: Vec<SymbolId> =
+                    Self::symbol_ids(request, "parameters", &self.symbols)?
+                        .into_iter()
+                        .map(SymbolId)
+                        .collect();
+                let this_parameter = SymbolId(Self::symbol_handle(
+                    request,
+                    "thisParameter",
+                    &self.symbols,
+                )?);
                 let min_argument_count = i32::try_from(number(request, "minArgumentCount")?)
                     .map_err(|error| error.to_string())?;
                 let created = checker.new_signature(
@@ -934,6 +938,37 @@ impl ClassicChecker {
             .collect()
     }
 
+    /// A symbol this checker issued, or a binder lineage symbol, which names the same symbol in
+    /// every checker of the instance, as a classic binder symbol is shared by every program
+    /// that holds its file.
+    fn symbol_handle(
+        request: &Value,
+        key: &str,
+        issued: &RefCell<HashSet<u32>>,
+    ) -> Result<u32, String> {
+        let id = number(request, key)?;
+        if id != 0 && !ts_goport::core::is_own_index(id) {
+            issued.borrow_mut().insert(id);
+        }
+        Self::handle(request, key, issued)
+    }
+
+    fn symbol_ids(
+        request: &Value,
+        key: &str,
+        issued: &RefCell<HashSet<u32>>,
+    ) -> Result<Vec<u32>, String> {
+        for id in request[key].as_array().into_iter().flatten() {
+            if let Some(id) = id.as_u64().and_then(|id| u32::try_from(id).ok())
+                && id != 0
+                && !ts_goport::core::is_own_index(id)
+            {
+                issued.borrow_mut().insert(id);
+            }
+        }
+        Self::ids(request, key, issued)
+    }
+
     fn handle(request: &Value, key: &str, issued: &RefCell<HashSet<u32>>) -> Result<u32, String> {
         let id = number(request, key)?;
         if id == 0 || issued.borrow().contains(&id) {
@@ -947,7 +982,11 @@ impl ClassicChecker {
     }
 
     fn symbol_ref(&self, symbol: SymbolId) -> Value {
-        reference(&self.symbols, symbol.0, "$symbol")
+        let mut value = reference(&self.symbols, symbol.0, "$symbol");
+        if symbol.is_some() && !ts_goport::core::is_own_index(symbol.0) {
+            value["lineage"] = json!(true);
+        }
+        value
     }
 
     fn signature_ref(&self, signature: SignatureId) -> Value {

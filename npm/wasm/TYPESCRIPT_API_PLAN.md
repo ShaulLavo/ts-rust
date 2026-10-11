@@ -149,6 +149,18 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Symbol identity across checkers
+
+Injected run: **7,247 of 7,853** (fourslash 5,736, services 1,511), none lost against `r24`
+(`r25`). A binder lineage symbol (an id that is not a checker's own index) names one symbol in
+every checker arena of the instance, as a classic binder symbol is one object for every program
+holding its file: it is now one JavaScript object per instance (held weakly), and every checker
+accepts it. Transient symbols stay private to their checker. A node a checker answers records
+its file's program for `node.symbol`, so a signature declaration in another file has its
+symbol; `getMergedSymbol(undefined)` is undefined, as classic's is for a script file.
+
+This replaces the earlier deviation that a symbol of another program's checker is another object.
+
 ## Builder comments and the slow implement-interface cases
 
 Injected run: **7,241 of 7,853** (fourslash 5,730, services 1,511), none lost against `r23`
@@ -313,7 +325,7 @@ RSS 2.8 GiB).
   rest listed in the commits of this batch.
 
 Deviations: a symbol's binder identity is per checker (a symbol from another program's checker is
-another object); `identifiers` holds every literal text as Go collects them (classic interns only
+another object; replaced by "Symbol identity across checkers"); `identifiers` holds every literal text as Go collects them (classic interns only
 property-name literals); `links` carries only `checkFlags` and `target`.
 
 Next by failing count (`r14`): per-case undefined reads (117), `getModuleResolutionCache` (104),

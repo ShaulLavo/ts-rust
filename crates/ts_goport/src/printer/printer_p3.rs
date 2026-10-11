@@ -1818,6 +1818,10 @@ mod tests {
             crate::ast::file_version::FileText::new(source.clone(), true),
             ScriptKind::TS,
         );
+        let file = Rc::new(file);
+        crate::program::note_parsed_source_file(&file);
+        crate::program::publish_parsed_files("/");
+        assert!(crate::ast::is_published(file.store));
         let mut printer = new_printer(PrinterOptions::default(), PrintHandlers::default(), None);
         for _ in 0..2 {
             assert_eq!(
@@ -2072,6 +2076,10 @@ mod tests {
                 source,
                 ScriptKind::TS,
             );
+            let file = Rc::new(file);
+            crate::program::note_parsed_source_file(&file);
+            crate::program::publish_parsed_files("/");
+            assert!(crate::ast::is_published(file.store));
             let root = file.root.statements().get(0).expression();
             let context = new_emit_context();
             for preserve in [false, true] {

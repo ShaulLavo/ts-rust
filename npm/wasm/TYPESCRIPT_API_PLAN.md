@@ -117,11 +117,9 @@ private sequence passes on Chromium and WebKit main threads and workers. Chromiu
 18 MB release-profile module when synchronously creating an instance on its main thread, so
 browser synchronous-instantiation checks must use the distributable size profile.
 
-The synchronous stack gate fails on Node 22: classic TypeScript handles a 5,000-term addition
-expression, while this Rust channel raises `RangeError: Maximum call stack size exceeded` in both
-release and size profiles. Both handle the 100- and 1,000-term controls. The existing asynchronous
-Node service's large-stack worker passes the 5,000-term case. The synchronous replacement needs
-a verified stack solution before this gate can pass; a worker promise would change the contract.
+The synchronous stack gate failed here first on Node 22 (a 5,000-term addition raised
+`RangeError`); the binder, checker and encoder repairs fix every step but emit, which still
+overflows (see "Deep-expression stack check (r35)"). A worker promise would change the contract.
 
 To run the declaration check, install the reference into a temporary directory and pass its
 package directory to `npm run check:typescript-api --prefix npm/wasm -- <reference-directory>`.
@@ -148,6 +146,75 @@ cannot be bridged moves its algorithm into Rust.
 Every classic service and registry of a compiled module lives in one shared WASM instance
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
+
+## Deep-expression stack check (r35)
+
+Injected run: **7,482 of 7,853** (fourslash 5,958, services 1,524), the same names as `r34`
+(none lost, none gained), on a fresh release module (`/work/tmp/tsrust-ls-probes/u3/r35*`).
+
+Finding: the binder and checker repair (`binder/wasm_binary.rs`, `checker/wasm_binary.rs`) still
+holds; it did not regress. The 5,000-term check failed on a newer recursive path: every parse the
+classic factory or the host channel ships to JavaScript goes through the API AST encoder
+(`api/encoder/encoder.rs` `encode_tree`), which recursed through the `NodeVisitor`, as Go's
+`encodeTree` does. It has done so since the classic bridge first encoded parses (`891c14c`,
+binary payloads in `687dc66`), so no bisect was needed. A registry parse inside a build's host
+callback then trapped, and the outer request reported the follow-on `TypeError: Cannot read
+properties of undefined (reading 'buffer')` from `fs_take` in place of the `RangeError`.
+
+Fixes:
+
+- `ts_goport` (reviewed): the encoder's visit and its list hooks collect each child that
+  `visit_each_child` reaches, and `run_encode_tasks` visits them with a task stack in Go's
+  preorder (sibling links, parent indices, list entries, the store-data children mask, JSDoc
+  after children, the root's children then its JSDoc). Unpublished parses (the classic registry)
+  and published store files both take it.
+- `classic-instance.js`: a nested request's trap stays the instance's failure (`failure ??=`), so
+  callers see the real error.
+
+Evidence: 39,615 encodings of TypeScript 6.0.3's `src` and `tests/cases` (19,915 files, static
+and freeable publishes) are identical in length and hash to the unchanged encoder at `291a002`
+(temporary dump, not committed); an intermediate version that dropped the root's child order was
+caught by that comparison, so `assert_same_encoding` now also checks the node table against
+the recursive `build_node_index_table`, and the test has a 1,000-term sample. `go_baselines`:
+1,402 pass on base and candidate, the same names (130 fail on both). `ts_goport` lib tests
+single-threaded: 398 pass on both, the same two failures (`snapshot_matches_live_bind`,
+`test_format_format_checker_ts`); parallel runs fail 62 to 69 tests on base and candidate alike
+(shared store state between test threads). Runtime tests 50/50.
+
+Review record (independent read-only reviewer): `goport-encoder.diff` 04b49c8f6d912643…,
+`encoder.rs` c5339877fa2f9174… ACCEPT, no blocking findings; one comment nit (the deep-sample
+comment said the visitor recurses), fixed in the committed file, which changes nothing else
+(committed `ts_goport` diff against `291a002` cdc264b79d4c4e17…, `encoder.rs` c768f3062dbcc55d…).
+
+Node 22, default stack, synchronous `createLanguageService` (`/work/tmp/tsrust-ls-probes/u4/deep.mjs`):
+
+| Case | TypeScript 6.0.3 | Candidate |
+| --- | --- | --- |
+| 100 and 1,000 terms (`+`, string `+`, `&&`/`\|\|`, comma) | pass | pass |
+| 5,000-term `1 + …`: program, syntactic and semantic diagnostics, quick info | pass | pass |
+| 5,000-term `1 + …`: `getEmitOutput` | pass | `RangeError` |
+| 5,000-term logical chain | `RangeError` | `RangeError` |
+
+Remaining stack path, the next item: emit overflows in `ast/node.rs` subtree facts
+(`composite_subtree_facts` → `subtree_facts_of_data` → `propagate_node_facts`, which recurses per
+child). After it, check the transformers and the printer at 5,000 terms (with a 200 MB V8
+stack every step passes at 5,000 and 20,000 terms, so depth is the only problem). Each is a
+`ts_goport` change and needs the review.
+
+Portable-runtime gate, not started: the browser checks in `/work/tmp/ts-rust-wasm-pr/`
+(`browser-check.mjs`, `classic-browser-check.mjs`) were written on the Mac (`~/Library/Caches/
+ms-playwright` executable paths, a `./browser/node_modules/playwright` install and a
+`node-candidate` copy of `npm/wasm`). On this host: install Playwright under
+`/work/tmp/ts-rust-wasm-pr/browser`, drop the `executablePath` overrides, run
+`/work/projects/platform/scripts/playwright-webkit-arch.sh` after a WebKit download, and build the
+size profile (`WASM_PROFILE=wasm`), since Chromium refuses synchronous instantiation of the
+19 MB release module on its main thread. Add the deep fixture, emit and error paths to
+`test/classic-runtime-sequence.mjs` before the run. The public exports wait for this gate.
+
+Next, in order: emit-path stack repair (above); browser matrix; then `getEditsForFileRename*`
+(6), `breakpointValidationDestructuring*` (12), "Found 2 codefixes" (5), JS export-assignment
+errors (4), a port of `checkSourceFileNodes`, the JSDoc `@import` reference, verbosity
+diffs; then the performance gate.
 
 ## Node locals, meta properties and more checker members (r33, r34)
 

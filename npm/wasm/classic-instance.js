@@ -79,7 +79,8 @@ function createInstance(module) {
             exports.ts_service();
             response = decodeResponse(new Uint8Array(exports.memory.buffer, exports.ts_output() >>> 0, exports.ts_output_len() >>> 0));
         } catch (error) {
-            failure = Object.assign(error, { stderr: run.stderrText() });
+            // A nested request that trapped ended the instance first; its error is the cause.
+            failure ??= Object.assign(error, { stderr: run.stderrText() });
             exports = undefined;
             run.detach();
             throw failure;

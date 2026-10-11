@@ -770,6 +770,9 @@ struct EncodeTreeState {
     node_table: Vec<Node>,
     node_index_map: Option<FxHashMap<Node, u32>>,
     source_file: Node,
+    /// The children that the visitor's visit and hooks collected during
+    /// one `visit_each_child` (`collect_children`).
+    collected: Vec<EncodeTask<'static>>,
 }
 
 impl EncodeTreeState {
@@ -861,7 +864,7 @@ fn encode_tree(
     }
 
     // PERF: (apiperf2) the nodes of a published store file are encoded from
-    // their node data (`StoreFile`, `encode_visit`).
+    // their node data (`StoreFile`, `run_encode_tasks`).
     let file_nodes = FileNodes::of(root_node.file_index()).filter(|_| !visitor_only());
     let store_file = file_nodes.as_ref().map(|nodes| StoreFile {
         file: root_node.file_index(),
@@ -871,21 +874,27 @@ fn encode_tree(
 
     // PORT: Go builds the visitor with only `Hooks` and sets `Visit` after;
     // the Rust callbacks get the visitor as an argument instead.
+    // PORT: the visit and the hooks collect each child that Go visits
+    // (`collect_children`); `run_encode_tasks` then visits it.
     let hooks: NodeVisitorHooks<'_, EncodeTreeState> = NodeVisitorHooks {
         visit_nodes: Some(Rc::new(
-            move |node_list: NodeList, visitor: &mut EncodeVisitor<'_>| -> NodeList {
-                encode_visit_nodes(node_list, visitor, fast)
+            |node_list: NodeList, visitor: &mut EncodeVisitor<'_>| -> NodeList {
+                if !node_list.is_nil() {
+                    visitor.ctx.collected.push(EncodeTask::List(node_list));
+                }
+                node_list
             },
         )),
         visit_modifiers: Some(Rc::new(
             |modifiers: ModifierList, visitor: &mut EncodeVisitor<'_>| -> ModifierList {
-                if modifiers.is_some() && !modifiers.nodes().is_empty() {
-                    let visit_nodes = visitor
-                        .hooks
-                        .visit_nodes
-                        .clone()
-                        .expect("VisitNodes hook is set");
-                    visit_nodes(modifiers.node_list(), visitor);
+                if modifiers.is_some()
+                    && !modifiers.nodes().is_empty()
+                    && !modifiers.node_list().is_nil()
+                {
+                    visitor
+                        .ctx
+                        .collected
+                        .push(EncodeTask::List(modifiers.node_list()));
                 }
                 modifiers
             },
@@ -893,8 +902,9 @@ fn encode_tree(
         ..NodeVisitorHooks::default()
     };
     let mut visitor = new_node_visitor(
-        move |node: Node, visitor: &mut EncodeVisitor<'_>| -> Node {
-            encode_visit(node, visitor, fast)
+        |node: Node, visitor: &mut EncodeVisitor<'_>| -> Node {
+            visitor.ctx.collected.push(EncodeTask::Visit(node));
+            node
         },
         None,
         hooks,
@@ -910,6 +920,7 @@ fn encode_tree(
             node_table,
             node_index_map,
             source_file,
+            collected: Vec::new(),
         },
     );
 
@@ -937,13 +948,29 @@ fn encode_tree(
         append_uint32s(&mut st.nodes, &[kind, pos, end, 0, 0, data, flags]);
     }
 
-    encode_each_child(root_node, &mut visitor, fast);
+    // Go visits the root's children, then its JSDoc.
+    let mut tasks: Vec<EncodeTask<'_>> = Vec::new();
     if source_file.is_some() {
-        for jsdoc in root_node.js_doc(source_file) {
-            let visit = visitor.visit.clone().expect("NodeVisitor.Visit is nil");
-            visit(jsdoc, &mut visitor);
-        }
+        tasks.extend(
+            root_node
+                .js_doc(source_file)
+                .into_iter()
+                .rev()
+                .map(EncodeTask::Visit),
+        );
     }
+    let kind = root_node.kind();
+    let first = tasks.len();
+    collect_children(
+        root_node,
+        kind,
+        store_node_data(root_node, kind, fast),
+        &mut visitor,
+        fast,
+        &mut tasks,
+    );
+    tasks[first..].reverse();
+    run_encode_tasks(tasks, &mut visitor, fast);
 
     let EncodeTreeState {
         mut extended_data,
@@ -1083,7 +1110,7 @@ fn visitor_only() -> bool {
 }
 
 /// The published store file of the node that `encode_tree` encodes, whose
-/// nodes `encode_visit` encodes from their node data.
+/// nodes `run_encode_tasks` encodes from their node data.
 // PERF: (apiperf2) Go `encodeTree` walks the tree with `VisitEachChild`.
 // Here the visitor read each child field of a node three times (the
 // property mask, the visit, the `Update` compare), each with a store
@@ -1094,7 +1121,7 @@ struct StoreFile<'a> {
     nodes: FileNodeReader<'a>,
 }
 
-/// True when `encode_visit` encodes the children of a node of kind `kind`
+/// True when `run_encode_tasks` encodes the children of a node of kind `kind`
 /// of the store file from its node data: Go `VisitEachChild` visits the
 /// fields of `ForEachChild` (`for_each_child_field`) in the same order.
 /// JSDoc nodes and a SyntaxList take the visitor.
@@ -1103,7 +1130,7 @@ fn walks_node_data(kind: SyntaxKind) -> bool {
     !is_js_doc_kind(kind) && kind != SyntaxKind::SyntaxList
 }
 
-/// The node data of `node`, of kind `kind`, when `encode_visit` encodes it
+/// The node data of `node`, of kind `kind`, when `run_encode_tasks` encodes it
 /// from its node data: a node of store file `fast` (`walks_node_data`).
 #[inline]
 fn store_node_data<'f>(
@@ -1118,8 +1145,43 @@ fn store_node_data<'f>(
     Some(fast.nodes.data(node))
 }
 
-// Go: api/encoder/encoder.go:540 (the visitor.Visit func of encodeTree)
-fn encode_visit(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&StoreFile<'_>>) -> Node {
+/// One step of `run_encode_tasks`: the parts of Go's recursive visit in
+/// `encodeTree`, in the order Go runs them.
+// PORT: Go's visit (encoder.go:540) recurses through `VisitEachChild` on
+// goroutine stacks that grow, and WebAssembly's stack is fixed. Here the
+// visit and the list hooks collect each child (`collect_children`), and a
+// task stack visits them in Go's order, so a deep tree (a long binary
+// chain) needs no deep call stack.
+enum EncodeTask<'f> {
+    /// The visit of a node (Go `visitor.Visit`).
+    Visit(Node),
+    /// A list (the VisitNodes or VisitModifiers hook).
+    List(NodeList),
+    /// A list of the node data of the store file.
+    StoreList(&'f crate::astdata::NodeList),
+    /// The end of a node or list visit: Go restores `prevIndex` and
+    /// `parentIndex`.
+    Exit { index: u32, parent_index: u32 },
+}
+
+/// A node entered by `enter_node`: its entry is written and its children
+/// come next.
+struct EnteredNode<'f> {
+    flags: NodeFlags,
+    kind: SyntaxKind,
+    data_node: Option<&'f NodeData>,
+    data_word: u32,
+    current_index: u32,
+    save_parent_index: u32,
+}
+
+/// The start of Go's visit of `node`: its entry, its link from the previous
+/// sibling and its index; `parentIndex` becomes the node.
+fn enter_node<'f>(
+    node: Node,
+    visitor: &mut EncodeVisitor<'_>,
+    fast: Option<&StoreFile<'f>>,
+) -> EnteredNode<'f> {
     // PERF: (apiperf2) a node of the store file reads its record once.
     let in_file = fast.filter(|fast| node.file_index() == fast.file);
     let (kind, loc, flags) = match in_file {
@@ -1179,34 +1241,130 @@ fn encode_visit(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&Store
     let current_index = st.node_count;
     st.prev_index = 0;
     st.parent_index = current_index;
-    match (data_node, fast) {
-        (Some(data), Some(fast)) => {
-            let mask = encode_store_children(kind, data, visitor, fast);
-            if data_word & NODE_DATA_TYPE_MASK == NODE_DATA_TYPE_CHILDREN {
-                // The low byte of the data word (`NODE_DATA_CHILD_MASK`).
-                visitor.ctx.nodes[current_index as usize * NODE_SIZE + NODE_OFFSET_DATA] |= mask;
+    EnteredNode {
+        flags,
+        kind,
+        data_node,
+        data_word,
+        current_index,
+        save_parent_index,
+    }
+}
+
+/// Pushes a task for each child that Go `visitor.VisitEachChild(node)`
+/// visits, in Go's order: from the node data `data` of a node of store file
+/// `fast` (`push_store_children`), else through the visitor, whose visit
+/// and hooks collect them. Returns the children mask of node data.
+fn collect_children<'f>(
+    node: Node,
+    kind: SyntaxKind,
+    data: Option<&'f NodeData>,
+    visitor: &mut EncodeVisitor<'_>,
+    fast: Option<&StoreFile<'f>>,
+    tasks: &mut Vec<EncodeTask<'f>>,
+) -> Option<u8> {
+    if let (Some(data), Some(fast)) = (data, fast) {
+        return Some(push_store_children(kind, data, fast, tasks));
+    }
+    debug_assert!(visitor.ctx.collected.is_empty());
+    visitor.visit_each_child(node);
+    tasks.extend(visitor.ctx.collected.drain(..));
+    None
+}
+
+/// Runs `tasks` (the last first) and the tasks they add, until none is
+/// left: Go's recursive visits of `encodeTree`, in Go's order.
+fn run_encode_tasks<'f>(
+    mut tasks: Vec<EncodeTask<'f>>,
+    visitor: &mut EncodeVisitor<'_>,
+    fast: Option<&StoreFile<'f>>,
+) {
+    while let Some(task) = tasks.pop() {
+        match task {
+            EncodeTask::Exit {
+                index,
+                parent_index,
+            } => {
+                visitor.ctx.prev_index = index;
+                visitor.ctx.parent_index = parent_index;
+            }
+            // Go: api/encoder/encoder.go:503 (the VisitNodes hook of encodeTree)
+            EncodeTask::List(node_list) => {
+                let nodes = node_list.nodes();
+                let index = begin_node_list(
+                    &mut visitor.ctx,
+                    node_list.pos(),
+                    node_list.end(),
+                    nodes.len(),
+                    node_list.has_trailing_comma(),
+                );
+                tasks.push(EncodeTask::Exit {
+                    index,
+                    parent_index: visitor.ctx.parent_index,
+                });
+                visitor.ctx.prev_index = 0;
+                visitor.ctx.parent_index = index;
+                // Go `VisitSlice` over the list.
+                tasks.extend(nodes.iter().rev().map(EncodeTask::Visit));
+            }
+            EncodeTask::StoreList(list) => {
+                let fast = fast.expect("a store list has its store file");
+                let (index, parent_index) = enter_store_list(list, visitor, fast);
+                tasks.push(EncodeTask::Exit {
+                    index,
+                    parent_index,
+                });
+                // Go `visitor.VisitSlice(nodeList.Nodes)`.
+                let file = fast.file;
+                tasks.extend(
+                    list.nodes
+                        .iter()
+                        .rev()
+                        .map(|&id| EncodeTask::Visit(Node::new(file, id))),
+                );
+            }
+            EncodeTask::Visit(node) => {
+                let entered = enter_node(node, visitor, fast);
+                tasks.push(EncodeTask::Exit {
+                    index: entered.current_index,
+                    parent_index: entered.save_parent_index,
+                });
+                let source_file = visitor.ctx.source_file;
+                // PERF: (apiperf2) `Node::js_doc` is nil without the parser
+                // flag `HAS_JS_DOC`, which `flags` has.
+                if source_file.is_some() && entered.flags.intersects(NodeFlags::HAS_JS_DOC) {
+                    tasks.extend(
+                        node.js_doc(source_file)
+                            .into_iter()
+                            .rev()
+                            .map(EncodeTask::Visit),
+                    );
+                }
+                let first = tasks.len();
+                let mask = collect_children(
+                    node,
+                    entered.kind,
+                    entered.data_node,
+                    visitor,
+                    fast,
+                    &mut tasks,
+                );
+                tasks[first..].reverse();
+                if let Some(mask) = mask
+                    && entered.data_word & NODE_DATA_TYPE_MASK == NODE_DATA_TYPE_CHILDREN
+                {
+                    // The low byte of the data word (`NODE_DATA_CHILD_MASK`).
+                    visitor.ctx.nodes
+                        [entered.current_index as usize * NODE_SIZE + NODE_OFFSET_DATA] |= mask;
+                }
             }
         }
-        _ => {
-            visitor.visit_each_child(node);
-        }
     }
-    let source_file = visitor.ctx.source_file;
-    // PERF: (apiperf2) `Node::js_doc` is nil without the parser flag
-    // `HAS_JS_DOC`, which `flags` has.
-    if source_file.is_some() && flags.intersects(NodeFlags::HAS_JS_DOC) {
-        for jsdoc in node.js_doc(source_file) {
-            encode_visit(jsdoc, visitor, fast);
-        }
-    }
-    visitor.ctx.prev_index = current_index;
-    visitor.ctx.parent_index = save_parent_index;
-    node
 }
 
 /// Go `getNodeData(node, ...)` of `node` (kind `kind`, Go `Pos` and `End`
 /// `pos` and `end`), read from its node data `data`, with no children mask:
-/// `encode_store_children` gives it.
+/// `push_store_children` gives it.
 fn store_node_data_word(
     node: Node,
     kind: SyntaxKind,
@@ -1293,32 +1451,18 @@ fn store_node_data_word(
     }
 }
 
-/// Go `visitor.VisitEachChild(node)` in `encodeTree`, for any node: from its
-/// node data when it has some (`store_node_data`), else with the visitor.
-fn encode_each_child(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&StoreFile<'_>>) {
-    let kind = node.kind();
-    match (store_node_data(node, kind, fast), fast) {
-        (Some(data), Some(fast)) => {
-            encode_store_children(kind, data, visitor, fast);
-        }
-        _ => {
-            visitor.visit_each_child(node);
-        }
-    }
-}
-
 /// Go `visitor.VisitEachChild(node)` in `encodeTree` for a node of kind
-/// `kind` of store file `fast` with node data `data`: the fields of
-/// `for_each_child_field`, each visited as Go `VisitEachChild` visits it
-/// with the encoder's hooks. Returns Go `getChildrenPropertyMask(node)`: a
-/// bit per field, in field order, for a field that is not Go `nil` (a
-/// modifier list that is not empty, Go `hasModifiers`). `FullSignature` has
-/// no bit.
-fn encode_store_children(
+/// `kind` of store file `fast` with node data `data`: pushes a task for each
+/// field of `for_each_child_field`, in field order, as Go `VisitEachChild`
+/// visits it with the encoder's hooks. Returns Go
+/// `getChildrenPropertyMask(node)`: a bit per field, in field order, for a
+/// field that is not Go `nil` (a modifier list that is not empty, Go
+/// `hasModifiers`). `FullSignature` has no bit.
+fn push_store_children<'f>(
     kind: SyntaxKind,
-    data: &NodeData,
-    visitor: &mut EncodeVisitor<'_>,
-    fast: &StoreFile<'_>,
+    data: &'f NodeData,
+    fast: &StoreFile<'f>,
+    tasks: &mut Vec<EncodeTask<'f>>,
 ) -> u8 {
     let mut mask: u8 = 0;
     let mut bit: u32 = 0;
@@ -1334,19 +1478,19 @@ fn encode_store_children(
         ChildField::Node(child) => {
             field(child.is_some());
             if child.is_some() {
-                encode_visit(child, visitor, Some(fast));
+                tasks.push(EncodeTask::Visit(child));
             }
         }
         ChildField::FullSignature(child) => {
             if child.is_some() {
-                encode_visit(child, visitor, Some(fast));
+                tasks.push(EncodeTask::Visit(child));
             }
         }
         // Go `v.visitNodes(list)`: the VisitNodes hook.
         ChildField::List(list) => {
             field(list.is_some());
             if let Some(list) = list {
-                encode_store_list(list, visitor, fast);
+                tasks.push(EncodeTask::StoreList(list));
             }
         }
         // Go `v.visitModifiers(modifiers)`: the VisitModifiers hook.
@@ -1354,7 +1498,7 @@ fn encode_store_children(
             let modifiers = modifiers.filter(|modifiers| !modifiers.list.nodes.is_empty());
             field(modifiers.is_some());
             if let Some(modifiers) = modifiers {
-                encode_store_list(&modifiers.list, visitor, fast);
+                tasks.push(EncodeTask::StoreList(&modifiers.list));
             }
         }
         ChildField::Ids(_) => unreachable!("a SyntaxList or a JSDoc node takes the visitor"),
@@ -1362,44 +1506,14 @@ fn encode_store_children(
     mask
 }
 
-// Go: api/encoder/encoder.go:503 (the VisitNodes hook of encodeTree)
-fn encode_visit_nodes(
-    node_list: NodeList,
-    visitor: &mut EncodeVisitor<'_>,
-    fast: Option<&StoreFile<'_>>,
-) -> NodeList {
-    if node_list.is_nil() {
-        return node_list;
-    }
-
-    let nodes = node_list.nodes();
-    let current_index = begin_node_list(
-        &mut visitor.ctx,
-        node_list.pos(),
-        node_list.end(),
-        nodes.len(),
-        node_list.has_trailing_comma(),
-    );
-    let save_parent_index = visitor.ctx.parent_index;
-    visitor.ctx.prev_index = 0;
-    visitor.ctx.parent_index = current_index;
-    // PERF: (apiperf1) Go `VisitSlice` over the list in place
-    // (`visit_slice_changed`). The visit returns each node as it is, so
-    // nothing is copied.
-    let _ = visitor.visit_slice_changed(nodes.iter());
-    visitor.ctx.prev_index = current_index;
-    visitor.ctx.parent_index = save_parent_index;
-
-    node_list
-}
-
-/// `encode_visit_nodes` for a non-nil list of the node data of store file
-/// `fast`.
-fn encode_store_list(
+/// The start of the VisitNodes hook for a non-nil list of the node data of
+/// store file `fast`: its entry, and `parentIndex` becomes the list. Returns
+/// the list's index and the `parentIndex` to restore after its nodes.
+fn enter_store_list(
     list: &crate::astdata::NodeList,
     visitor: &mut EncodeVisitor<'_>,
     fast: &StoreFile<'_>,
-) {
+) -> (u32, u32) {
     let file = fast.file;
     // Go `NodeList.Loc` and `HasTrailingComma` (the last node ends before
     // the list).
@@ -1418,12 +1532,7 @@ fn encode_store_list(
     let save_parent_index = visitor.ctx.parent_index;
     visitor.ctx.prev_index = 0;
     visitor.ctx.parent_index = current_index;
-    // Go `visitor.VisitSlice(nodeList.Nodes)`.
-    for &id in &list.nodes {
-        encode_visit(Node::new(file, id), visitor, Some(fast));
-    }
-    visitor.ctx.prev_index = current_index;
-    visitor.ctx.parent_index = save_parent_index;
+    (current_index, save_parent_index)
 }
 
 /// The start of the VisitNodes hook of Go `encodeTree`: the entry of a
@@ -2193,13 +2302,20 @@ module.exports.z = "z";
             Some(FileNodes::Static(_)) => assert!(!freeable, "{file_name}: a static publish"),
             None => panic!("{file_name}: the file is not published"),
         }
-        let (walk, _) = encode_parsed_source_file(&file).expect("encode");
+        let (walk, table) = encode_parsed_source_file(&file).expect("encode");
         VISITOR_ONLY.with(|v| v.set(true));
-        let (visitor, _) = encode_parsed_source_file(&file).expect("encode");
+        let (visitor, visitor_table) = encode_parsed_source_file(&file).expect("encode");
         VISITOR_ONLY.with(|v| v.set(false));
         assert!(
             walk == visitor,
             "{file_name}: the node data walk and the visitor differ"
+        );
+        // Go `BuildNodeIndexTable` recurses through the visitor in Go's
+        // order: both walks give its table.
+        let expected = build_node_index_table(file.root);
+        assert!(
+            table.nodes == expected.nodes && visitor_table.nodes == expected.nodes,
+            "{file_name}: the walk order differs from BuildNodeIndexTable"
         );
         drop(file);
         // The pins of this thread hold a freeable version until here.
@@ -2212,6 +2328,16 @@ module.exports.z = "z";
             assert_same_encoding(&format!("/apiperf2/static/{i}/{name}"), text, false);
             assert_same_encoding(&format!("/apiperf2/freeable/{i}/{name}"), text, true);
         }
+        // A deep binary chain: both walks run on a task stack, and the
+        // recursive `build_node_index_table` checks their order within the
+        // test's stack.
+        let deep = format!(
+            "export const deep = {}1;\n/** doc */\nexport const mixed = {}a;\n",
+            "1 + ".repeat(1_000),
+            "a && b || c ?? ".repeat(100)
+        );
+        assert_same_encoding("/apiperf2/deep/static.ts", &deep, false);
+        assert_same_encoding("/apiperf2/deep/freeable.ts", &deep, true);
         // Not run by the test suite: set GOPORT_ENCODE_CORPUS to directories
         // (`:` between them) to compare every .ts, .tsx, .js, .jsx, .mts and
         // .cts file under them, outside node_modules.

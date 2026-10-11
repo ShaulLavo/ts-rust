@@ -148,6 +148,120 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Public facade and browser unit (u7, locally verified)
+
+The root package now selects `classic-node.js` or `classic-browser.js`. Import evaluation makes
+the WASM module ready; `createLanguageService`, `createDocumentRegistry` and ordinary service
+methods stay synchronous. The environment-neutral `classic-namespace.js` owns the Rust injection.
+The explicit `ts-rust-wasm/lsp` entry retains the asynchronous editor/CLI interface. Generated
+entries expose the pinned runtime's 2,248 named exports and default namespace; declarations retain
+the pinned 6.0.3 namespace with ESM aliases. Both factory declaration checks pass with
+`skipLibCheck: false`. Matching types is not a claim of complete implementation behavior.
+
+The preserved pre-repair size build is 7,463,611 bytes, SHA-256
+`fb2b5f8a1fdbec63d178ce826095666819fd6033b17d4a8e4a56bf4033480f3b`. Chromium's module worker
+passed through deep quick info, then overflowed during cold 5,000-term emit. Chromium main and
+both WebKit cells passed. A named diagnostic build identified repeated
+`printer_p3::Printer::emit_expression` frames; its size exceeds Chromium's 8 MiB synchronous
+main-thread limit, so it is diagnostic evidence only. All failed runs remain under `u7/`.
+
+The final Rust 1.98.1 size-profile build (`CI=1`, plain Cargo, `WASM_OPT=none`) is 7,464,717 bytes,
+SHA-256 `e6ce8855c39fc65f583942528019039f61d929114f0300ad9e51def3c2118c10`.
+Chromium 156.0.8078.4 and WebKit 27.2 now pass on both main threads and module workers, with no
+page errors. Each cell verifies synchronous construction, bound host callbacks, registry/program/
+symbol/diagnostic identity, edits, syntactic mode, host-exception recovery, disposal, and exact
+cold/warm 5,000-term emit (20,018 bytes). Node 22.23.3 passes the same public sequence.
+The runner records frozen executed assets and sequence hashes in `u7/printer-final/browser-size.json`.
+
+A fresh npm tarball installs into a new project and passes the complete Node sequence. A real
+esbuild browser bundle selects `classic-browser.js` with zero external imports and no polyfills;
+all four packed-browser cells also pass. Bundle SHA-256
+`53e27f4aa44850568cc9172bbb456bcda45f0ef72a933c71c17d93a14b6c515c`;
+tarball SHA-256 `cef8cc9d6e46cb3b29a530ca730ebec7f5789d205887ac96aa6e6361a7a862cd`.
+The initial bundle failure from original Node `require` sites is preserved. The generator removes
+those nine Node-tooling calls using pinned AST ranges, preserves global performance, and guards
+file tracing. Generated artifact SHA-256
+`daff7ddee9b3c88f4364577555df87847351699edc1f1204366f3d6cc6934b7a`.
+Unchanged roster `r42` repeats against this artifact: 7,482/7,853 passes, including 5,958 fourslash
+and 1,524 services, with zero lost/absent/gained occurrences. Original-JavaScript compiler reachability
+remains a separate failing boundary gate.
+
+The sole compiler writer owns `printer/printer_p3.rs` for the demonstrated binary-printer path.
+The repair must preserve traversal, precedence, hooks, comments, source maps and output text with
+owned continuations, without balancing the expression. Fresh independent review and regression
+audit, all fourteen local native binaries against `9f6ee6d1` and the u6 accepted local repair,
+original 19,915-row emit corpus, full classic pass-list retention and all four browser cells are
+required before pushing the compiler unit. Formal R188 remains unrun and unchanged.
+
+The source-reviewed continuation candidate is frozen locally at `4f1f0e2b`, printer SHA-256
+`0f5f00cf07951fefeeba089b8a3827177f563181c71d734efb08e38be82f5d08`.
+Independent static review passes, and all five focused release tests pass. Two preserved focused
+compile attempts failed on test-only parser text ownership and a nonexistent node-slice method;
+a third run passed three tests and exposed missing parsed-fixture publication in two tests.
+The final candidate fixes those fixture APIs and uses the production note/publish sequence,
+without changing the reviewed printer logic or weakening assertions. Premature broad builds
+against `b8a09f04` were stopped and preserved under `u7/printer-verified/`; they give no acceptance
+credit. Final release and browser gates use `u7/printer-final/`: 56/56 runtime tests, 18/18
+default-stack deep checks, all 19,915 original corpus rows identical, full `r42` passing-name
+retention, and both source/packed browser matrices pass. Independent regression audit verifies
+source/tool/reference hashes and these results. All fourteen native binaries complete their
+nineteen result suites: 181,927 passes, retaining all 181,891 immutable-base and 181,922 u6 passes
+with zero lost/absent/unrun names. Both independent agents issue source-bound LOCAL printer-unit
+PASS verdicts; these are no formal R188 or overall language-service acceptance. The actual packed
+root declaration check passes with 65 required service members and `skipLibCheck: false`.
+An initial additional check incorrectly value-imported `index.d.ts` and failed TS2846; its evidence
+is preserved. The corrected scratch harness changes only its virtual package root to the installed
+package and exercises the real root export without changing assertions. The frozen facade separately passes all 56 runtime tests on the
+preserved pre-repair size WASM, including the optional real-reference boundary tests.
+
+The original-JavaScript boundary audit remains **STOP** with seven reachable routes: JSON,
+isolated entity-name, isolated JSDoc comment and type parsing, module resolution, printing and
+transformation. The plan grants no blanket printer or JSDoc exception. Existing Rust-built nodes
+printed by classic writers describe the implementation gap, not accepted compiler delegation.
+Close lexical call paths through Rust as well as public namespace paths. JSON needs a dedicated
+syntax-only detached-source action; isolated parser actions need detached-node encoding.
+Resolution also needs ordered failed/affecting lookup locations. Checker display writers
+must retain structured parts and symbol callbacks; arbitrary edit/snippet trees additionally need
+Rust tree encoding. Standalone transformations require the previously documented context ABI.
+Scanner-based editing and synthetic factories remain distinct from these compiler operations.
+
+An isolated JSON lexical-delegation prototype is preserved under
+`u7/json-boundary-prototype/`. Node 22.23.3 repeats the preserved Node 26 diagnostic exactly.
+All 138 no-cursor comparisons match core AST kinds, spans, text, flags and UTF-16 maps, but none
+matches the complete source snapshot: parent visibility, counts and literal/list metadata differ.
+Parse diagnostics match 96/138; Rust validates some JSON earlier than the classic syntax-only
+entry. Two configuration-conversion fixtures change diagnostic priority or span; their host traces
+still match. Invalid-input recovery also makes the private syntax cursor observable. This is
+measured evidence against shipping a one-line redirect, not a closure result. Static caller tracing
+establishes that the private cursor-bearing call is unreachable after the main parser guard;
+the public two-argument wrapper never forwards a cursor. The next JSON unit needs a dedicated
+syntax-only `parseJsonText` operation with a detached source lease. Preserve validation for
+`createSourceFile(..., ScriptKind.JSON)` and existing native consumers. Export actual parser
+counts, expose recorded `multiLine`, and preserve classic recovery-array metadata and parentless
+visibility without changing shared registry/program wrappers or filtering diagnostic codes.
+No production JSON changes have been made.
+
+Read-only profiling on current-head release code attributes cold completions to AST wrapper
+materialization and per-version node-index sorting. In 502 completion samples, 249 pass through
+`findPrecedingToken`, 252 through `classicChildren`, 223 through `wrap`, and 84 through first
+`NodeIndexTable::get_index`; these are overlapping inclusive counts. JSON decoding accounts for
+eight samples. Thirty bridge calls transfer about 4.2 KiB of JSON per completion. Warm same-version
+completions are much cheaper. Edits encode each retained source tree twice (`parseDocument`, then
+program `getSourceFile`), and the second payload is discarded after identity lookup. The five
+extra filesystem probes occur once per build, not during completions. The preserved 11.295 ms
+versus 0.465 ms completion and 11.385 ms versus 5.614 ms edit medians are a preliminary paired
+baseline. Concurrent-work diagnostic profiles are not final timing evidence; no performance
+speedup has been implemented or claimed.
+
+After the frozen unit's audit and push, test the bounded wrapper-allocation repair in
+`classic-ast.js`: reuse immutable field-layout descriptions by complete node shape and defer
+per-node method/deletion collections. Keep eager child arrays and per-source wrapper identity.
+A separate source-descriptor unit can remove redundant program AST encoding, with full payload
+fetch on a genuine cache miss; retain library metadata and cross-program diagnostic identity.
+Measure frozen base/candidate packages with identical WASM profile/options using six fresh-process
+triplets, alternating base/candidate/TypeScript 6.0.3 order. Report process-level median/p95
+and separate count-only/CPU-profile attribution. None of these planned repairs has been implemented.
+
 ## Native regression repair after r35
 
 Source `8523cc943d120e31b43a7f2e6879d2e9d3df333b` repairs the protected-test losses
@@ -378,6 +492,33 @@ delegation. Package metadata lookup can fall from strict `JSON.parse` into origi
 static reachability, not a claim that a roster case executed the parser fallback. Resolution must
 become Rust-owned and the JSON parser bypass must close; current guards do not prove the full
 no-JavaScript-compiler/parser requirement.
+
+The subsequent read-only `r42` investigation confirms the same thirteen failing rename occurrences
+and exposes a larger resolver seam. Native `DefaultResolver` in
+`crates/ts_goport/src/frontend/module/resolver_p1.rs:638` supports Node16/NodeNext/Bundler,
+while Classic/Node10 are absent. Native missing-directory branches return early where TypeScript
+6.0.3 records suffix/package/index candidates without invoking `fileExists`. Callback logs therefore
+cannot substitute for ordered lookup arrays. Add native metadata at `resolver_p2.rs:719`
+(`try_file_lookup`) and `:991` (`get_package_json_info`), including cache hits and omitted callbacks;
+preserve duplicates, alternate-pass paths, and primary/fallback concatenation order.
+
+The live moved-importer branch is pinned `typescript.js:144872`, invoking lexical resolution with
+no cache/mode; `:144900` consumes failed locations in order. Other live lexical callers include
+module-specifier services and import-attribute code fixes. Direct exported Classic/Node10/Bundler
+and type-reference resolver families also need Rust routing. Existing native module `Arc` and
+reference `Rc` caches must retain result-object identity, missing-result distinctions and separate
+undefined/CommonJS/ESNext mode keys. The frozen program-resolution snapshot alone cannot resolve
+arbitrary post-move imports. A dedicated synchronous resolution-host adapter must preserve direct
+`fileExists`, `directoryExists`, `readFile`, `realpath`, trace and exception behavior; the generic
+stat bridge's file-then-directory probes are not the classic callback contract.
+
+This is a complete operation, not a thin response-field fix. Scope includes native resolver/cache/
+result types, `classic_resolutions.rs`, graph and host transport, and matching classic JS adapters;
+the generator owner redirects lexical and public families afterward. Syntax-only package JSON
+parsing is a dependency. Verify five strategies, modes, redirects, missing directories, suffix and
+package order, paths/rootDirs, malformed JSON, symlinks/casing, callback traces, duplicate metadata,
+cache hit/readonly/clear behavior, program isolation, and both pre-/post-move rename results.
+Retain every unchanged roster occurrence; no repair or recovery count is claimed yet.
 
 A separate static boundary audit found additional bypasses: syntactic comment classifications
 call the lexical original isolated-JSDoc parser; isolated entity-name/JSDoc parse APIs also remain
@@ -926,8 +1067,9 @@ Deviations:
   port's own default is ES2026. Classic's other defaults follow from the target as in the port.
 - The default library is the port's name for the target in the host's library directory; a
   host whose `getDefaultLibFileName` names another file gets the port's name.
-- Resolutions carry no `failedLookupLocations`, `affectingLocations` or
-  `resolutionDiagnostics`: the port does not keep them. Library resolution order puts `lib`
+- Classic resolution responses omit `failedLookupLocations`, `affectingLocations` and
+  `resolutionDiagnostics`. Native module/type-reference results already retain diagnostics;
+  the wrapper drops them. Native state still lacks the two ordered lookup arrays. Library resolution order puts `lib`
   entries first and the rest in program file order, where classic records discovery order.
   Automatic type directives follow `types` order, then name.
 - Server units now hold about 5.4 GiB RSS at their peak in the roster (2.8 before): libraries are

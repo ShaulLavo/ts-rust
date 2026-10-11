@@ -94,7 +94,7 @@ test("its types need no lib dom", async () => {
     const files = {
         "/c/package.json": '{ "type": "module" }',
         "/c/a.ts": [
-            'import { loadModule, tsc } from "ts-rust-wasm";',
+            'import { loadModule, tsc } from "ts-rust-wasm/lsp";',
             'import { memoryFileSystem, runTsc } from "ts-rust-wasm/core";',
             "const module = await loadModule(new Uint8Array(8));",
             "runTsc(module, { fs: memoryFileSystem() });",
@@ -102,7 +102,7 @@ test("its types need no lib dom", async () => {
             "",
         ].join("\n"),
     };
-    for (const name of ["package.json", "index.d.ts", "core.d.ts"]) {
+    for (const name of ["package.json", "lsp.d.ts", "core.d.ts"]) {
         files[`/c/node_modules/ts-rust-wasm/${name}`] = readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
     }
     for (const lib of ["es2022", "es2022,dom"]) {

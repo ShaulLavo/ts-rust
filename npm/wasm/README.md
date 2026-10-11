@@ -24,7 +24,7 @@ npx tsc-wasm -p tsconfig.json
 ```
 
 ```js
-import { tsc } from "ts-rust-wasm";
+import { tsc } from "ts-rust-wasm/lsp";
 
 const { exitCode, stdout } = await tsc(["-p", "tsconfig.json"]);
 ```
@@ -33,7 +33,7 @@ In memory (Node, browsers and Deno). `files` maps absolute paths to text. The re
 file after the run, emitted ones included:
 
 ```js
-import { tsc } from "ts-rust-wasm";
+import { tsc } from "ts-rust-wasm/lsp";
 
 const { exitCode, diagnostics, files } = await tsc(["-p", "/app"], {
     files: {
@@ -51,9 +51,8 @@ const { exitCode, diagnostics, files } = await tsc(["-p", "/app"], {
 tsc's usual text.
 
 In a browser, call `tsc` from a module Web Worker, as `examples/browser` does, so that a run does not
-block the page. It also works on the page's main thread. A Safari worker has a small stack and no
-JSPI: a run there fails at about 230 terms of `1 + 1 + ...`, or at a chain of 200 method calls.
-Chrome and Firefox workers reach about 1,000 to 1,500 terms, and Safari's main thread about 7,000.
+block the page. It also works on the page's main thread. Engine stack limits differ; the
+compatibility plan records source-bound stress checks for each supported execution realm.
 Serve `ts_rust.wasm` as `application/wasm`, so that it compiles while it downloads.
 To try the example, run `python3 -m http.server -d npm/wasm` and open
 `http://localhost:8000/examples/browser/`.
@@ -61,14 +60,31 @@ To try the example, run `python3 -m http.server -d npm/wasm` and open
 `runTsc` (on the calling thread) and `runTscAsync` (a promise) from `ts-rust-wasm/core` take any
 `HostFileSystem` and a compiled module, for hosts that keep files elsewhere.
 
-## Editor language service
+## Classic language service
 
-The current interface uses asynchronous LSP requests. The required drop-in contract for classic
-`ts.createLanguageService(host)` is tracked in [the compatibility plan](TYPESCRIPT_API_PLAN.md).
-That contract includes synchronous calls, host callbacks and TypeScript result objects. It is
-not implemented by the interface below. `npm run check:typescript-api -- <reference-directory>`
-checks the current declarations against a classic TypeScript package and reports the remaining
-type incompatibilities.
+The root entry exposes TypeScript 6.0.3's classic namespace and declarations. Import evaluation
+loads and compiles the WASM asset. `createLanguageService` and its ordinary methods then run
+synchronously on the calling thread. Node and browser imports select their own asset loaders.
+Browsers require ESM imports and a size-profile WASM build.
+
+```js
+import * as ts from "ts-rust-wasm";
+
+const registry = ts.createDocumentRegistry();
+const service = ts.createLanguageService(host, registry);
+const diagnostics = service.getSemanticDiagnostics("/app/index.ts");
+const program = service.getProgram();
+service.dispose();
+```
+
+The [compatibility plan](TYPESCRIPT_API_PLAN.md) records remaining result differences, host and
+transformer limitations, and original-JavaScript boundary gaps. Matching declarations does not
+establish complete runtime parity. `npm run check:typescript-api -- <reference-directory>`
+checks both factories and the returned service against the pinned classic package.
+
+## Asynchronous editor transport
+
+`ts-rust-wasm/lsp` exposes asynchronous LSP requests and the `tsc` convenience function.
 
 `createLanguageService` keeps an in-memory project in its own WebAssembly instance. In browsers,
 call it in a module Web Worker so requests do not block the page. The Node entry owns a persistent
@@ -76,7 +92,7 @@ worker with a 256 MB stack, configurable through `stackSizeMb`. The core entry r
 thread. Bun uses that calling-thread path because its workers ignore the stack-size setting.
 
 ```js
-import { createLanguageService } from "ts-rust-wasm";
+import { createLanguageService } from "ts-rust-wasm/lsp";
 
 const service = await createLanguageService({
     cwd: "/app",

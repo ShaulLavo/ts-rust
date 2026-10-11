@@ -11,19 +11,31 @@ if (!reference) {
 const require = createRequire(import.meta.url);
 const root = resolve(reference);
 const ts = require(join(root, "lib/typescript.js"));
+if (ts.version !== "6.0.3") throw new Error(`expected TypeScript 6.0.3, found ${ts.version}`);
 const declaration = join(root, "lib/typescript.d.ts");
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const candidate = process.argv[3] ? resolve(process.argv[3]) : join(packageRoot, "index.js");
+const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+// Self-reference resolves the actual root export, including its types condition.
+const candidate = process.argv[3] ? resolve(process.argv[3]) : manifest.name;
 const fileName = join(packageRoot, "__typescript_api_contract__.mts");
 const text = `
 import type * as ts from ${JSON.stringify(declaration)};
-import { createLanguageService } from ${JSON.stringify(candidate)};
-const factory: typeof ts.createLanguageService = createLanguageService;
-declare const service: Awaited<ReturnType<typeof createLanguageService>>;
-const replacement: ts.LanguageService = service;
+import classic, * as replacement from ${JSON.stringify(candidate)};
+const defaultFactory: typeof ts.createLanguageService = classic.createLanguageService;
+const defaultRegistryFactory: typeof ts.createDocumentRegistry = classic.createDocumentRegistry;
+const factory: typeof ts.createLanguageService = replacement.createLanguageService;
+const registryFactory: typeof ts.createDocumentRegistry = replacement.createDocumentRegistry;
+declare const host: ts.LanguageServiceHost;
+const registry: ts.DocumentRegistry = registryFactory();
+const service: ts.LanguageService = replacement.createLanguageService(host, registry);
+const snapshot: ts.IScriptSnapshot = replacement.ScriptSnapshot.fromString("");
+const parts: typeof ts.displayPartsToString = replacement.displayPartsToString;
+const target: typeof ts.ScriptTarget = replacement.ScriptTarget;
+const kind: typeof ts.SyntaxKind = replacement.SyntaxKind;
+service.dispose();
 `;
 const options = {
-    strict: true, noEmit: true, skipLibCheck: true,
+    strict: true, noEmit: true, skipLibCheck: false,
     target: ts.ScriptTarget.ES2022,
     module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext,
 };
@@ -46,5 +58,5 @@ function visit(node) {
     ts.forEachChild(node, visit);
 }
 visit(source);
-console.log(JSON.stringify({ referenceVersion: ts.version, requiredMembers: Array.from(members), diagnostics }, null, 2));
+console.log(JSON.stringify({ referenceVersion: ts.version, candidate, factories: ["createLanguageService", "createDocumentRegistry"], requiredMembers: Array.from(members), diagnostics }, null, 2));
 process.exitCode = diagnostics.length ? 1 : 0;

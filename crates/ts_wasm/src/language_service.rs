@@ -325,6 +325,12 @@ fn instance_command(request: &Value, payload: &[u8]) -> Result<String, ServiceEr
                 .map(|value| value.to_string())
                 .map_err(ServiceError::InvalidParams)
         }
+        Some("sourceIdentifiers") => {
+            let id = lease_id(request, "source", "source file lease is required")?;
+            crate::classic_sources::with_sources(|sources| sources.identifiers(id))
+                .map(|value| value.to_string())
+                .map_err(ServiceError::InvalidParams)
+        }
         Some("releaseSource") => {
             let id = lease_id(request, "source", "source file lease is required")?;
             crate::classic_sources::with_sources(|sources| sources.release(id));

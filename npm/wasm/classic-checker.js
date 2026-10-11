@@ -12,6 +12,9 @@ function translateBits(flags, source, destination) {
     return result;
 }
 
+/** The checker member that answers a parsed node's binder symbol. */
+export const nodeSymbolKey = Symbol("nodeSymbol");
+
 // Internal classic flags (types.ts): SymbolFormatFlags and InternalNodeBuilderFlags.
 const symbolFormatWriteComputedProps = 1 << 4;
 const symbolFormatDoNotIncludeSymbolChain = 1 << 5;
@@ -258,6 +261,14 @@ export function createTypeChecker(lease, resolveNode) {
     // Classic runs the callback with the token set for its checker's own polling. The Rust
     // checker does not poll a classic token yet, so work inside the callback runs to its end.
     checker.runWithCancellationToken = (token, callback) => callback(checker);
+    const nodeSymbols = new WeakMap();
+    checker[nodeSymbolKey] = (node, local) => {
+        const key = local ? "localSymbol" : "symbol";
+        let symbols = nodeSymbols.get(node);
+        if (!symbols) nodeSymbols.set(node, symbols = {});
+        if (!(key in symbols)) symbols[key] = query("getNodeSymbol", { location: location(node), local });
+        return symbols[key];
+    };
     const typeOf = type => ({ type: handle(type, "type"), origin: objectHandles.get(type)?.origin });
     checker.isImplementationOfOverload = nodeIn => {
         const node = parseTree(nodeIn, "isFunctionLike");

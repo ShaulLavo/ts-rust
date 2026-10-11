@@ -106,6 +106,12 @@ impl ClassicChecker {
             "symbolToString" => Ok(json!(checker.symbol_to_string_exported(symbol))),
             "signatureToString" => Ok(json!(checker.signature_to_string(signature))),
             "getFullyQualifiedName" => Ok(json!(checker.get_fully_qualified_name_exported(symbol))),
+            // The binder's `node.symbol` and `node.localSymbol`.
+            "getNodeSymbol" => Ok(self.symbol_ref(if request["local"].as_bool() == Some(true) {
+                location.local_symbol()
+            } else {
+                location.symbol()
+            })),
             "isUnknownSymbol" => Ok(json!(checker.is_unknown_symbol(symbol))),
             "isUndefinedSymbol" => Ok(json!(checker.is_undefined_symbol(symbol))),
             "isArgumentsSymbol" => Ok(json!(checker.is_arguments_symbol(symbol))),

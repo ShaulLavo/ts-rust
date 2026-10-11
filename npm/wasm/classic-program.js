@@ -1,11 +1,18 @@
 import { nodeHandle } from "./classic-ast.js";
 import { materializeSourceFile, resolveSourceNode } from "./classic-source-files.js";
-import { createTypeChecker } from "./classic-checker.js";
+import { createTypeChecker, nodeSymbolKey } from "./classic-checker.js";
+import { useNodeSymbols } from "./classic-ast.js";
 import { createModeAwareCache } from "./classic-resolutions.js";
 import { SyntaxKind } from "./classic-enums.js";
 import { classicNamespace } from "./classic-module.js";
 
 const programs = new WeakMap();
+// The program that last answered each source file: its checker interns the file's binder symbols.
+const filePrograms = new WeakMap();
+useNodeSymbols((node, property) => {
+    const program = filePrograms.get(node.getSourceFile())?.deref();
+    return program?.getTypeChecker()[nodeSymbolKey](node, property === "localSymbol");
+});
 const leases = new WeakMap();
 // A held value must not reach its lease, or the lease never collects: it holds the
 // caches and a release function, never the channel, whose host callbacks can reach
@@ -51,16 +58,23 @@ export function createProgramGraph(channel, handle, settings = {}) {
 
     function getSourceFile(fileName) {
         let file = files.get(fileName);
-        if (file) return file;
+        if (file) {
+            filePrograms.set(file, programReference);
+            return file;
+        }
         const response = graph("getSourceFile", { fileName });
         if (!response) return undefined;
         file = files.get(response.fileName);
-        if (file) return file;
+        if (file) {
+            filePrograms.set(file, programReference);
+            return file;
+        }
         file = materializeSourceFile(channel.instance, response);
         // A bundled library has no host version, as a classic host has none for a file it does not own.
         if (file.resolvedPath === undefined) file.version = undefined;
         files.set(response.fileName, file);
         metadata.set(file, response);
+        filePrograms.set(file, programReference);
         return file;
     }
 
@@ -220,7 +234,8 @@ export function createProgramGraph(channel, handle, settings = {}) {
         getConfigFileParsingDiagnostics: () => diagnostics("getConfigFileParsingDiagnostics"),
         getDeclarationDiagnostics: file => diagnostics("getDeclarationDiagnostics", file),
     };
-    cache.set(handle, new WeakRef(program));
+    const programReference = new WeakRef(program);
+    cache.set(handle, programReference);
     return program;
 }
 

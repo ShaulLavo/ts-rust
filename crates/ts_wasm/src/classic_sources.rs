@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use serde_json::{Value, json};
 use ts_goport::api::encoder;
+use ts_goport::astdata::SyntaxKind;
 use ts_goport::core::Node;
 use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::parser::{
@@ -163,9 +164,44 @@ impl Sources {
         }))
     }
 
+    /// Go `collectIdentifiersForSourceFile`: the texts of a file's identifiers and literals,
+    /// classic `SourceFile.identifiers`.
+    pub fn identifiers(&self, id: u32) -> Result<Value, String> {
+        fn collect(node: Node, names: &mut std::collections::BTreeSet<&'static str>) -> bool {
+            if matches!(
+                node.kind(),
+                SyntaxKind::Identifier
+                    | SyntaxKind::PrivateIdentifier
+                    | SyntaxKind::StringLiteral
+                    | SyntaxKind::NumericLiteral
+                    | SyntaxKind::BigIntLiteral
+                    | SyntaxKind::NoSubstitutionTemplateLiteral
+            ) {
+                names.insert(node.text());
+            }
+            node.for_each_child(|child| collect(child, names));
+            false
+        }
+        let source = self
+            .files
+            .get(&id)
+            .ok_or("source file lease has been released")?;
+        let mut names = std::collections::BTreeSet::new();
+        collect(source.file.root, &mut names);
+        Ok(Value::Array(
+            names
+                .into_iter()
+                .map(crate::classic_strings::string_value)
+                .collect(),
+        ))
+    }
+
     pub fn resolve(&self, location: &Value) -> Result<Node, String> {
         if location.is_null() {
             return Ok(Node::NIL);
+        }
+        if let Some(token) = location.get("token") {
+            return self.resolve_token(token);
         }
         let source = location["source"]
             .as_u64()
@@ -194,6 +230,38 @@ impl Sources {
             return Err("node handle does not match the source file".into());
         }
         Ok(node)
+    }
+
+    /// A token of a parsed node, as `getChildren` makes them: the file's token cache entry
+    /// for its kind and UTF-16 span under that parent.
+    fn resolve_token(&self, token: &Value) -> Result<Node, String> {
+        let parent = self.resolve(&token["parent"])?;
+        let kind = token["nativeKind"]
+            .as_u64()
+            .and_then(|kind| u16::try_from(kind).ok())
+            .and_then(|kind| SyntaxKind::try_from(kind).ok())
+            .ok_or("token kind is not a syntax kind")?;
+        let offset = |key: &str| -> Result<i32, String> {
+            token[key]
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| format!("token {key} is required"))
+        };
+        let file = ts_goport::ast::get_source_file_of_node(parent);
+        let positions = ts_goport::ast::source_file_get_position_map(file);
+        let pos = positions.utf16_to_utf8(offset("pos")?);
+        let end = positions.utf16_to_utf8(offset("end")?);
+        if pos < parent.pos() || end > parent.end() || pos > end {
+            return Err("token span is outside its parent".into());
+        }
+        Ok(ts_goport::ast::source_file_get_or_create_token(
+            file,
+            kind,
+            pos,
+            end,
+            parent,
+            ts_goport::flags::TokenFlags::NONE,
+        ))
     }
 
     pub fn origin(&self, id: u32) -> Option<(usize, u32)> {

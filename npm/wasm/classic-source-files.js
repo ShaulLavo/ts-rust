@@ -1,4 +1,7 @@
 import { decodeSourceFile, nodeLease, resolveNodeHandle } from "./classic-ast.js";
+import { getNamedDeclarations } from "./classic-source-file-members.js";
+
+const namedDeclarations = new WeakMap();
 
 const sources = new WeakMap();
 const release = new FinalizationRegistry(({ instance, source, token }) => {
@@ -34,9 +37,23 @@ export function materializeSourceFile(instance, response) {
         file.parseDiagnostics = (response.parseDiagnostics ?? []).map(diagnostic => withFile(diagnostic, file));
         // TypeScript 6.0.3 ignores `no-default-lib` references; its parser sets this false.
         file.hasNoDefaultLib = false;
+        addSourceFileMembers(file, instance, response.source);
         lease.file = new WeakRef(file);
     }
     return file;
+}
+
+/** SourceFileObject's `identifiers` (read once from Rust) and `getNamedDeclarations`. */
+function addSourceFileMembers(file, instance, source) {
+    Object.defineProperty(file, "identifiers", {
+        configurable: true, enumerable: true,
+        get() {
+            const identifiers = new Map(instance.call({ action: "sourceIdentifiers", source }).map(name => [name, name]));
+            Object.defineProperty(file, "identifiers", { configurable: true, enumerable: true, writable: true, value: identifiers });
+            return identifiers;
+        },
+    });
+    file.getNamedDeclarations = () => getNamedDeclarations(file, namedDeclarations);
 }
 
 /** A classic `DiagnosticWithLocation` of `file`. */

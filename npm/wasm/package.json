@@ -39,6 +39,7 @@
         "classic-registry.js",
         "classic-paths.js",
         "classic-source-files.js",
+        "classic-source-file-members.js",
         "classic-ast.js",
         "classic-node-fields.js",
         "native-ast.js",

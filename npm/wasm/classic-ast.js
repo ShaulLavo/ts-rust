@@ -4,6 +4,12 @@ import { SyntaxKind, NodeFlags, TokenFlags, ModifierFlags,
 import { nodeFields } from "./classic-node-fields.js";
 
 const nativeNodes = new WeakMap();
+let nodeSymbol = () => undefined;
+
+/** Sets how a parsed node answers classic `symbol` and `localSymbol`: the binder's symbols, as a checker interns them. */
+export function useNodeSymbols(resolver) {
+    nodeSymbol = resolver;
+}
 const kindNames = {
     EndOfFile: "EndOfFileToken", JSDoc: "JSDocComment", JSDocAnyType: "JSDocAllType",
     JSTypeAliasDeclaration: "TypeAliasDeclaration", JSImportDeclaration: "ImportDeclaration",
@@ -112,6 +118,12 @@ export function nodeLease(node) {
 
 export function nodeHandle(node) {
     const data = nativeNodes.get(node);
+    // A token `getChildren` made names its parsed parent; the compiler makes the same token.
+    if (data && !data.synthetic && !(data.node instanceof RemoteNode) && data.node.parent instanceof RemoteNode) {
+        const parent = data.node.parent;
+        return { token: { parent: { index: parent.index, fileName: data.root.fileName, nativeKind: parent.kind, source: data.lease?.source },
+            nativeKind: data.node.kind, pos: data.node.pos, end: data.node.end }, source: data.lease?.source };
+    }
     if (!data || data.synthetic || !(data.node instanceof RemoteNode)) throw new TypeError("Node is not backed by this compiler");
     return { index: data.node.index, fileName: data.root.fileName, nativeKind: data.node.kind, source: data.lease?.source };
 }
@@ -177,6 +189,7 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         const keys = () => Reflect.isExtensible(overrides) ? Array.from(new Set(fields.filter(field => !deleted.has(field)).concat(Reflect.ownKeys(overrides)))) : Reflect.ownKeys(overrides);
         const get = property => {
             if (Object.hasOwn(overrides, property)) return Reflect.get(overrides, property, node);
+            if ((property === "symbol" || property === "localSymbol") && !synthetic && !deleted.has(property)) return nodeSymbol(node, property);
             if (deleted.has(property) || !allowed.has(property)) return Reflect.get(overrides, property, node);
             const value = read(valueNode, overrides, property);
             if (typeof value !== "function") return value;

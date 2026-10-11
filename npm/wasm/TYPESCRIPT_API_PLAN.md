@@ -147,6 +147,70 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Native regression repair after r35
+
+Source `8523cc943d120e31b43a7f2e6879d2e9d3df333b` repairs the protected-test losses
+found by the local comparison of `9f6ee6d1` with `291a002b` (still present at `94c71d7b`):
+
+- Regenerated `binder/lib_bind.bin` with the unchanged `generate_lib_bind_snapshot` test.
+  The binder source extraction in `891c14ca` changed its source hash without changing native
+  lib binding. All three regenerated sections are byte-identical to the earlier sections
+  except their first eight source-key bytes. New blob SHA-256
+  `225d43908dbb7c68f94a9fced14f4978988ed226c5883336906f1d771a2de23d`.
+  The generator passed with Rust 1.98.1, release profile, running alone.
+- The native test host handles `Op::PollCancellation` with an empty successful response,
+  matching a runtime host without a cancellation callback. Its new test checks the public
+  host-call result. The previously missing match prevented native `ts_wasm` tests compiling.
+
+Evidence is under `/work/tmp/tsrust-ls-probes/u5/`. The complete local protected build and
+comparison finished in `protected-repair`, using Rust 1.93.0, all 14 test binaries including
+`ts_wasm`, Go pin `673a5f17d713`, and the preserved local base result
+(`/work/tmp/goport-protected-base/results/results.json`, SHA-256
+`76a034e680ac0b9e934b832452206aa0c1d6016798c70d7086cd28ace9aeaf0e`).
+The comparison retained **181,891** base passing suite/name entries, with **0 lost, 0 absent,
+0 unrun**, no incomplete suites, and one new passing cancellation-host test. Both native
+`ts_wasm` tests passed. Candidate results SHA-256:
+`30d69bec893d6ffed4325d5e1ffaa044b2be0d80befad3752f6d20d517c4225c`.
+Its crates tree is `35e9e0253d06b19a0e5c5457a1fd8dc1a1c521a7`; binary-manifest SHA-256:
+`28f01c96e6a8f8000c9df574fc273437c26c47d99182c9a812c4f29052ac72a4`.
+The local scratch runner only adapts pin paths and sandbox destinations; the preliminary
+runner that excluded `ts_wasm` is not used. Independent reviewer `af9b8b5f413b1cdc5` and
+regression auditor `a3455239e0083b302` both returned source-bound **PASS** verdicts for this
+narrow local fork repair, checking source identity, binary manifests, per-name retention,
+and normal closure. Earlier failing base-environment and old-head evidence remains preserved;
+neither verdict claims formal acceptance.
+
+Native-regressions gate limitation: the local branch base has 181,891 passing suite/name
+entries, but it is not the last accepted R188 source. The saved R188 protected result,
+gate and oracle evidence live on Theo's unreachable hosts and are absent locally. The existing
+full candidate runner names that unavailable remote home. Fork development uses the complete
+source-bound local test comparison, independent review, and corpus/baseline checks; it does
+not accept a revision into Theo's main or replace his saved accepted base. The formal gate,
+bound Query/Hono runs, LSP/API oracles and np-suite remain unrun. The local comparison is the
+available fork regression check, not evidence that these unrun formal checks passed.
+
+Fresh release-WASM roster `r36` completed at this repair source: **7,482/7,853**
+(fourslash 5,958, services 1,524), with zero lost or gained passing names against `r35`.
+Runtime tests passed **50/50**. Module SHA-256:
+`787ddc64276efaaca74272f65f022f24bc8e8ee501b2041fa079237af30a3b60`.
+The default-stack 5,000-term fixture still overflows in subtree facts during emit; construction,
+syntactic and semantic diagnostics, and quick info complete. Emit stack repair and public exports
+have not advanced. The unchanged-source ES2020 emit baseline contains 19,915 valid UTF-8 files
+from the original TypeScript 6.0.3 `src` and `tests/cases` (19,922 paths inventoried); its module
+copy and output hashes are preserved under `u5` for the next compiler comparison. The preceding
+ES5 corpus run is retained as preliminary target-choice evidence, not the supported-target proof.
+The 75 removed-TypeScript-Go-semantics cases below stay listed and out of scope.
+
+Browser/export preparation identified the remaining loading blocker: private `classic.js`
+statically imports the Node loader; package exports and declarations still describe the
+asynchronous editor service and do not expose `createDocumentRegistry`. The browser unit must
+share environment-neutral namespace setup, use environment-specific loaders, and test the
+actual exported synchronous facade with a size-profile module in all four browser/realm cells.
+Historical private-channel browser evidence is not a current-source facade gate. Its scratch
+harness failed to enforce the main-thread result; the new matrix must require both main and
+worker results. `scripts/check-typescript-api.mjs` also defaults to a missing `index.js` and
+must target the chosen public entry while checking both factories.
+
 ## Deep-expression stack check (r35)
 
 Injected run: **7,482 of 7,853** (fourslash 5,958, services 1,524), the same names as `r34`

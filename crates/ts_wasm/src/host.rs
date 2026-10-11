@@ -12,6 +12,7 @@
 //! | --- | --- | --- |
 //! | `Read` | path | the file bytes |
 //! | `Stat` | path (links followed) | `<kind> <size> <mtime ns>`, kind `f`, `d` or `o` (other) |
+//! | `FileExists`, `DirectoryExists` | path | empty when present, -1 when absent |
 //! | `ReadDir` | path | `<kind><name>` entries, each ended by NUL; kind `f`, `d`, `l` (link) or `o` |
 //! | `Realpath` | path | the real path |
 //! | `Write`, `Append` | path, NUL, data | empty |
@@ -43,6 +44,8 @@ pub enum Op {
     /// Classic's `cancellationToken.throwIfCancellationRequested()` on the request's token. The
     /// host holds the exception it throws until the request ends, and the call fails.
     PollCancellation = 10,
+    FileExists = 11,
+    DirectoryExists = 12,
 }
 
 thread_local! {
@@ -89,6 +92,8 @@ pub fn call(op: Op, request: &[u8]) -> Result<Vec<u8>, String> {
                     | Op::Realpath
                     | Op::SourceMetadata
                     | Op::GetSourceFile
+                    | Op::FileExists
+                    | Op::DirectoryExists
             ) {
                 READ_FAILED.with(|failed| failed.set(true));
             }
@@ -291,7 +296,7 @@ impl Fs for HostFs {
     }
 
     fn file_exists(&self, path: &str) -> bool {
-        self.common.file_exists(path)
+        call(Op::FileExists, &bytes(path)).is_ok()
     }
 
     fn read_file(&self, path: &str) -> (String, bool) {
@@ -334,7 +339,7 @@ impl Fs for HostFs {
     }
 
     fn directory_exists(&self, path: &str) -> bool {
-        self.common.directory_exists(path)
+        call(Op::DirectoryExists, &bytes(path)).is_ok()
     }
 
     fn get_accessible_entries(&self, path: &str) -> Entries {
@@ -396,6 +401,8 @@ pub mod test_host {
         let is_dir = map.keys().any(|key| key.starts_with(&prefix));
         match op {
             Op::Read => map.get(path).cloned(),
+            Op::FileExists => map.contains_key(path).then(Vec::new),
+            Op::DirectoryExists => is_dir.then(Vec::new),
             Op::Stat => match map.get(path) {
                 Some(bytes) => Some(format!("f {} 0", bytes.len()).into_bytes()),
                 None => is_dir.then(|| b"d 0 0".to_vec()),

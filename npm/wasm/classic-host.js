@@ -33,7 +33,7 @@ export function createHostServiceChannel(module, host, argumentsForSettings, doc
     let channel;
     let selectedGeneration;
     const generations = new Map();
-    let filesystemFacts = { stats: new Map(), directories: new Map(), realpaths: new Map(), reads: new Map() };
+    let filesystemFacts = { stats: new Map(), fileExists: new Map(), directoryExists: new Map(), directories: new Map(), realpaths: new Map(), reads: new Map() };
 
     function metadata(path) {
         const version = host.getScriptVersion(path);
@@ -99,6 +99,19 @@ export function createHostServiceChannel(module, host, argumentsForSettings, doc
             building ??= newBuild(settings, true);
             building.started = true;
             return getSourceFile(request);
+        },
+        fileExists(path) {
+            if (selectedGeneration) return selectedGeneration.facts.fileExists.get(path) ?? false;
+            const result = roots.has(path) || host.fileExists(path);
+            filesystemFacts.fileExists.set(path, result);
+            if (!result) absentFiles.add(path);
+            return result;
+        },
+        directoryExists(path) {
+            if (selectedGeneration) return selectedGeneration.facts.directoryExists.get(path) ?? !host.directoryExists;
+            const result = directoryProbablyExists(path);
+            filesystemFacts.directoryExists.set(path, result);
+            return result;
         },
         stat(path) {
             if (selectedGeneration) return selectedGeneration.facts.stats.get(path) ?? selectedGeneration.memory.stat(path);
@@ -194,7 +207,7 @@ export function createHostServiceChannel(module, host, argumentsForSettings, doc
         building = newBuild(nextSettings, !dropped);
         settings = nextSettings;
         settingsKey = documentRegistry.getKeyForCompilationSettings(settings);
-        filesystemFacts = { stats: new Map(), directories: new Map(), realpaths: new Map(), reads: new Map() };
+        filesystemFacts = { stats: new Map(), fileExists: new Map(), directoryExists: new Map(), directories: new Map(), realpaths: new Map(), reads: new Map() };
         return args;
     }
 

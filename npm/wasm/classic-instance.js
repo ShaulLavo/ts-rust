@@ -30,6 +30,8 @@ function createInstance(module) {
     const fs = {
         readFile: path => active.readFile(path),
         stat: path => active.stat(path),
+        get fileExists() { return active.fileExists?.bind(active); },
+        get directoryExists() { return active.directoryExists?.bind(active); },
         readDirectory: path => active.readDirectory(path),
         realpath: path => active.realpath?.(path),
         getSourceFile: request => active.getSourceFile(request),

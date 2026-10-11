@@ -323,6 +323,83 @@ unit: current generic stat probes call `fileExists` for directories. Package-sco
 must be investigated separately; removing those probes without proving equivalent behavior is
 outside the wrapper-allocation repair.
 
+### Typed existence bridge (u9, 2026-10-11)
+
+Private host operations 11 and 12 now carry file and directory existence intent; cancellation
+remains operation 10. Native dispatch, the synchronous runtime, shared-instance adapter and
+public classic `createProgram` adapter forward the separate callbacks with their receiver.
+Stat-only filesystem adapters retain their existing behavior. Classic hosts without
+`directoryExists` report directories present. Retained host generations store separate file
+and directory facts, including false results, without polling live callbacks.
+
+The initial private-adapter candidate passed its roster but still made 155 `fileExists` calls:
+the public program adapter was missing typed forwarding. That attempt and its evidence remain
+preserved under `u9-existence/typed-unit`; final proof uses `typed-unit-final` only. The final
+candidate makes 93 calls in every timing process, exactly 62 fewer than the frozen u8 baseline.
+`readFile=0`, `getScriptSnapshot=31` and `getScriptVersion=184` remain unchanged.
+
+Fresh Rust 1.98.1 size-profile WASM is 7,464,915 bytes, SHA-256
+`68213f32dcfa02bc995387fc6ed9e7bda6591b17bdd9b9bfaeec52525f0c35c3`.
+Final runtime tests pass 69/69 without skips; source and packed Chromium/WebKit main-thread/
+worker matrices each pass 4/4; packed Node and strict declarations pass (65 service members,
+zero diagnostics). The full unchanged roster runs all 7,853 identities, retaining 7,482 passes
+with zero lost, absent or recovered occurrences and the same 371 failures. The 75 exclusions
+are unchanged. All 19,915 original emit-corpus rows remain identical with no missing or changed
+sources. Rust 1.93.0 native `ts_wasm` tests pass 2/2, including typed file/directory assertions.
+No `ts_goport` source changed; the fourteen-binary native protected set was not freshly rerun,
+and its historical 181,927 passes are not fresh acceptance evidence. Formal R188 is **unrun**.
+Independent source review passes. The regression auditor confirms the exact evidence but
+raises a completeness STOP on the old emit comparator: two equally truncated streams can pass.
+A separate strict inventory guard now validates both full source inventories and hashes, requires
+the candidate completion record, and rejects manifest-only, one-row and missing-last-row streams.
+`emit-completeness.json` records 19,922 enumerated inputs, 19,915 readable identical rows and the
+seven unchanged non-UTF-8 exclusions. Earlier evidence and comparator results remain preserved;
+the independent auditor re-executes the strict guard, reproduces all truncation rejections and
+clears its completeness STOP. LOCAL u9 source review and regression gates pass. The strict
+inventory guard remains required evidence for later corpus comparisons; it grants no boundary
+waiver or formal compiler acceptance.
+
+Six sequential fresh-process triplets use Node 22.23.3, the unchanged 2,000-declaration,
+30-edit fixture and alternating arm order. No build, roster, corpus or profile overlaps these
+runs. Cells show across-process median / nearest-rank p95 of phase medians in milliseconds;
+module load remains separate and edit observations are not pooled.
+
+| Phase | Frozen u8 baseline | Typed candidate | TypeScript 6.0.3 |
+| --- | ---: | ---: | ---: |
+| Open | 66.701 / 73.801 | 64.510 / 76.442 | 61.545 / 101.503 |
+| Edit / program update | 23.145 / 27.190 | 23.892 / 28.563 | 6.599 / 6.704 |
+| Completions | 11.412 / 14.264 | 11.184 / 12.137 | 0.630 / 0.680 |
+| Quick info | 1.608 / 1.979 | 1.597 / 1.913 | 0.650 / 0.674 |
+| Diagnostics | 6.663 / 9.080 | 6.643 / 8.443 | 3.973 / 4.422 |
+| 20,000 line/position round trips | 14.738 / 20.621 | 14.090 / 22.969 | 4.537 / 6.003 |
+
+Module-load median / p95: 80.345 / 857.155 ms baseline, 83.633 / 542.034 ms candidate,
+149.390 / 174.178 ms reference. This unit proves fewer callbacks, not an edit speedup:
+edit median is 3.2% higher. Count-only timings are excluded. Final evidence is
+`/work/tmp/tsrust-ls-probes/u9-existence/typed-unit-final`, including frozen source hashes,
+complete roster comparison, raw process results and `replicates/summary.json`.
+
+The 4,140-assertion pinned TS 6.0.3 package-scope probe confirms ordinary `.d.ts/.ts/.tsx/.js/.jsx`
+lookup only for Node16 through NodeNext resolution or paths inside `node_modules`; fixed-format
+extensions determine their format before lookup. Bundler is outside that interval. Shared pinned
+Go intentionally collects scope metadata more broadly for dependency-symlink discovery and
+inclusion explanations. Preserve that native policy: do not blanket-guard `file_loader.rs` or
+use `SkipModuleResolution`. A future explicitly selected classic metadata policy must update
+both serial and parallel loading, before cache access, preserve fixed formats, and leave skipped
+ordinary-file implied format absent. Probe evidence is `u9-existence/probe`. No shared compiler
+policy change is included in u9.
+
+All seven original-JavaScript boundary routes still **STOP**. Dependency graphs have no unresolved
+imports, missing packed files or browser Node imports, but binder-factory initialization is
+observed and transitive closure remains unproved. Continue in order: non-encoding source
+descriptors in the three assigned files; end-to-end edit profiling and largest-cost repair;
+completion profiling and largest-cost repair; Rust-owned JSON/isolated parsing, resolution
+metadata, writers/synthesized trees and transform ABI; then the 371 failures, rename first.
+Read-only failure triage identifies 13 file-rename failures (11 after moving), missing ordered
+resolver lookup metadata plus Classic/Node10 resolution gaps; twelve array-hole breakpoint
+failures; and four direct missing-checker-member failures. These are investigation targets,
+not claimed recoveries or new exclusions.
+
 ## Native regression repair after r35
 
 Source `8523cc943d120e31b43a7f2e6879d2e9d3df333b` repairs the protected-test losses

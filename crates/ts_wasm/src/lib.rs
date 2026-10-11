@@ -287,6 +287,12 @@ mod tests {
                 "export const n: number = 'one';\n".to_string(),
             ),
         ]);
+        assert!(host::call(host::Op::FileExists, b"/p/a.ts").is_ok());
+        assert!(host::call(host::Op::DirectoryExists, b"/p/a.ts").is_err());
+        assert!(host::call(host::Op::FileExists, b"/p").is_err());
+        assert!(host::call(host::Op::DirectoryExists, b"/p").is_ok());
+        assert!(host::call(host::Op::FileExists, b"/missing").is_err());
+        assert!(host::call(host::Op::DirectoryExists, b"/missing").is_err());
         let (status, reply) = run(&format!("/p\0{FLAG_DIAGNOSTICS_JSON}\0-p\0."));
         assert_eq!(status, 2);
         assert!(

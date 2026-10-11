@@ -37,6 +37,8 @@ const OP_CHTIMES = 7;
 const OP_SOURCE_METADATA = 8;
 const OP_GET_SOURCE_FILE = 9;
 const OP_POLL_CANCELLATION = 10;
+const OP_FILE_EXISTS = 11;
+const OP_DIRECTORY_EXISTS = 12;
 
 const KIND_CHAR = { file: "f", directory: "d", symlink: "l", other: "o" };
 
@@ -70,6 +72,16 @@ function fsCall(fs, op, request) {
             const kind = stat.isDirectory ? "d" : stat.isFile === false ? "o" : "f";
             const ns = stat.mtimeNs ?? BigInt(Math.round((stat.mtimeMs ?? 0) * 1e6));
             return encoder.encode(`${kind} ${stat.size ?? 0} ${ns}`);
+        }
+        case OP_FILE_EXISTS: {
+            if (fs.fileExists) return fs.fileExists(text) ? new Uint8Array() : undefined;
+            const stat = fs.stat(text);
+            const exists = stat && !stat.isDirectory;
+            return exists ? new Uint8Array() : undefined;
+        }
+        case OP_DIRECTORY_EXISTS: {
+            const exists = fs.directoryExists ? fs.directoryExists(text) : !!fs.stat(text)?.isDirectory;
+            return exists ? new Uint8Array() : undefined;
         }
         case OP_READ_DIR: {
             const entries = fs.readDirectory(text);

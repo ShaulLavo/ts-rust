@@ -77,3 +77,36 @@ test("createProgram builds in Rust from the host's registry documents", async ()
     assert.deepEqual(released, [{ fileName: "/a.ts", hasSourceFileByPath: false, replaced: false }]);
     assert.equal(b.text, "export const value = 1;", "an old program's source file keeps its text");
 });
+
+test("createProgram binds typed existence callbacks and treats an omitted directory callback as true", async () => {
+    useCompiledModule(await loadModule());
+    for (const hasDirectoryCallback of [false, true]) {
+        const files = new Map([
+            ["/a.ts", { text: 'import { value } from "./b"; export const result = value;', version: "1" }],
+            ["/b.ts", { text: "export const value = 1;", version: "1" }],
+        ]);
+        const settings = { noLib: true, strict: true, target: 99 };
+        const registry = createDocumentRegistry(true, "/");
+        const { host } = compilerHost(files, registry, settings, []);
+        const fileProbes = [];
+        const directoryProbes = [];
+        host.fileExists = function (path) {
+            assert.equal(this, host);
+            fileProbes.push(path);
+            return files.has(path);
+        };
+        if (hasDirectoryCallback) {
+            host.directoryExists = function (path) {
+                assert.equal(this, host);
+                directoryProbes.push(path);
+                return path === "/";
+            };
+        }
+        const program = createProgram(["/a.ts"], settings, host);
+        assert.ok(program.getSourceFile("/b.ts"));
+        assert.deepEqual(program.getSemanticDiagnostics(program.getSourceFile("/a.ts")), []);
+        assert.ok(!fileProbes.includes("/"), "directory probes must bypass fileExists");
+        assert.ok(!fileProbes.includes("/node_modules/@types"), "type-root directory probes must bypass fileExists");
+        if (hasDirectoryCallback) assert.ok(directoryProbes.length > 0);
+    }
+});

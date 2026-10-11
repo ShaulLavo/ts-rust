@@ -23,6 +23,8 @@ export function createProgram(rootNamesOrOptions, options, host, oldProgram, con
     const requested = new Map();
     const fs = {
         readFile: path => host.readFile(path),
+        fileExists: path => host.fileExists(path),
+        directoryExists: path => !host.directoryExists || host.directoryExists(path),
         stat(path) {
             if (host.fileExists(path)) return { isDirectory: false, size: 0 };
             return !host.directoryExists || host.directoryExists(path) ? { isDirectory: true, size: 0 } : undefined;

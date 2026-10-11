@@ -39,6 +39,49 @@ impl ClassicChecker {
         }
     }
 
+    /// Classic `Program.getClassifiableNames`: the escaped names of the binder symbols declared
+    /// with a classifiable meaning (class, enum, type alias, interface, type parameter, module
+    /// or alias) in the files, as classic's binder collects them in `declareSymbol`.
+    pub fn classifiable_names(&self, files: &[Node]) -> Value {
+        fn collect(
+            node: Node,
+            checker: &Checker,
+            names: &mut std::collections::BTreeSet<String>,
+        ) -> bool {
+            let symbol = node.symbol();
+            if symbol.is_some()
+                && checker.sym(symbol).flags.intersects(
+                    SymbolFlags::CLASS
+                        | SymbolFlags::ENUM
+                        | SymbolFlags::TYPE_ALIAS
+                        | SymbolFlags::INTERFACE
+                        | SymbolFlags::TYPE_PARAMETER
+                        | SymbolFlags::MODULE
+                        | SymbolFlags::ALIAS,
+                )
+            {
+                names.insert(escape_symbol_name(&go_symbol_name(
+                    &checker.symbols,
+                    symbol,
+                )));
+            }
+            node.for_each_child(|child| collect(child, checker, names));
+            false
+        }
+        let mut checker = self.checker.borrow_mut();
+        ts_goport::program::catch_up_checker(&mut checker.symbols);
+        let mut names = std::collections::BTreeSet::new();
+        for &file in files {
+            collect(file, &checker, &mut names);
+        }
+        Value::Array(
+            names
+                .iter()
+                .map(|name| crate::classic_strings::string_value(name))
+                .collect(),
+        )
+    }
+
     pub fn request(&self, location: Node, request: &Value) -> Result<Value, String> {
         let method = request["method"]
             .as_str()

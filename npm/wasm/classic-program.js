@@ -172,6 +172,7 @@ export function createProgramGraph(channel, handle, settings = {}) {
 
     const program = {
         getRootFileNames: () => graph("getRootFileNames"),
+        getClassifiableNames: () => lease.classifiableNames ??= new Set(graph("getClassifiableNames")),
         getSourceFile,
         getSourceFiles: () => graph("getSourceFileNames").map(getSourceFile),
         getCompilerOptions: () => settings,

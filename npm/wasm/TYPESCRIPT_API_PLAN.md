@@ -149,6 +149,24 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Classifiable names and the current queue
+
+Injected run: **7,260 of 7,853** (fourslash 5,749, services 1,511), none lost against `r25` or
+`r16` (`r26`; 5.4 minutes, 4.3 GiB peak). `program.getClassifiableNames` is classic's set: the
+escaped names of binder symbols declared with a classifiable meaning (class, enum, type alias,
+interface, type parameter, module, alias), collected over each file's declaration nodes in the
+bridge. The port dropped Go's `ClassifiableNames` as unused, so no `ts_goport` change.
+
+Open from the requested order: cancellation polling (needs classic's poll sites in
+`ts_goport`'s builder and checker, with the independent review AGENTS.md requires; 5 services
+cases), custom transformers for `program.emit`, hover verbosity (`getEmitResolver`, the
+builder's verbosity level and maximum length; 11 cases plus truncation cases), and the
+classified TypeScript-Go semantic differences recorded in the batches below.
+
+Next by failing count (`r26`): code fixes not found (29), assertion `true` (29), quick info
+text (28), range text (13), completions not found (13), node kind mismatches 184/234 (13),
+undefined reads (12), `getSymbolWalker` (11), `getEmitResolver` (11), no signature help (9).
+
 ## Symbol identity across checkers
 
 Injected run: **7,247 of 7,853** (fourslash 5,736, services 1,511), none lost against `r24`

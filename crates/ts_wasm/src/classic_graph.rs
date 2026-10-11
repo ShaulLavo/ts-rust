@@ -90,6 +90,17 @@ impl Graphs {
                     .map(|file| file.file_name())
                     .collect::<Vec<_>>()
             )),
+            "getClassifiableNames" => {
+                let files: Vec<Node> = program
+                    .get_source_files()
+                    .iter()
+                    .map(|file| file.root)
+                    .collect();
+                let checker = owner
+                    .checker
+                    .get_or_init(|| crate::classic_checker::ClassicChecker::new(program, context));
+                Ok(checker.classifiable_names(&files))
+            }
             "getCurrentDirectory" => Ok(json!(program.get_current_directory())),
             "getImpliedNodeFormatForEmit"
             | "getEmitModuleFormatOfFile"

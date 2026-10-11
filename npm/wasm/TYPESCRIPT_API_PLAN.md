@@ -250,17 +250,78 @@ completions are much cheaper. Edits encode each retained source tree twice (`par
 program `getSourceFile`), and the second payload is discarded after identity lookup. The five
 extra filesystem probes occur once per build, not during completions. The preserved 11.295 ms
 versus 0.465 ms completion and 11.385 ms versus 5.614 ms edit medians are a preliminary paired
-baseline. Concurrent-work diagnostic profiles are not final timing evidence; no performance
-speedup has been implemented or claimed.
+baseline. Concurrent-work diagnostic profiles are not final timing evidence; those exploratory
+runs establish no performance speedup.
 
-After the frozen unit's audit and push, test the bounded wrapper-allocation repair in
-`classic-ast.js`: reuse immutable field-layout descriptions by complete node shape and defer
-per-node method/deletion collections. Keep eager child arrays and per-source wrapper identity.
-A separate source-descriptor unit can remove redundant program AST encoding, with full payload
-fetch on a genuine cache miss; retain library metadata and cross-program diagnostic identity.
-Measure frozen base/candidate packages with identical WASM profile/options using six fresh-process
-triplets, alternating base/candidate/TypeScript 6.0.3 order. Report process-level median/p95
-and separate count-only/CPU-profile attribution. None of these planned repairs has been implemented.
+The bounded wrapper-allocation repair is now implemented and frozen for verification in
+`classic-ast.js`: immutable field-layout descriptions use complete node shape, and method/deletion
+collections allocate on demand. Eager child arrays and per-source wrapper identity are unchanged.
+The six new focused contracts pass on both unchanged baseline and candidate; the complete runtime
+suite passes 62/62. Source and freshly packed packages pass Chromium/WebKit main-thread/worker
+verification. Independent source and benchmark-tool reviews pass within their stated scope.
+The full unchanged roster retains all 7,482 passing occurrences: 5,958 fourslash and 1,524 services,
+with zero recovered, lost, absent or unrun cases. The same 371 failures remain across 7,853 tests;
+the 75 removed-TypeScript-Go exclusions are unchanged. Six sequential fresh-process timing
+triplets are complete. Formal R188 remains unrun and all seven original-JS boundary routes remain
+STOP. The final independent regression audit passes for this local wrapper unit; it grants no
+formal compiler acceptance or boundary waiver. This verified unit is ready for fast-forward
+publication to the fork.
+
+Frozen candidate evidence is at `/work/tmp/tsrust-ls-probes/u8-performance/wrapper-unit`.
+Its `classic-ast.js` hash is `80d10c2251f1283b4d9b3e80da968f7846fbdc11a5b3edf57fa920ca906ae5a2`;
+freshly rebuilt WASM matches the baseline byte-for-byte. The portable editing comparison runner
+preserves the original workload and aggregates process results separately without pooling edits.
+
+### Wrapper-allocation measurements (2026-10-11)
+
+Node 22.23.3, six fresh processes per arm, 2,000 declarations and 30 edits per process. Odd
+triplets run base/candidate/reference; even triplets reverse that order. Baseline is frozen
+`0e4713d3`; both Rust-backed arms use byte-identical freshly rebuilt size-profile WASM. The
+reference is pinned TypeScript 6.0.3. No runtime checks or profiles overlap these timing runs.
+Each cell below is the across-process median / nearest-rank p95 of each process's phase median,
+in milliseconds. The frozen workload uses the upper middle of 30 observations within a process;
+the comparison runner averages the middle pair across the six processes. Edit observations are
+never pooled as independent process samples.
+
+| Phase | Frozen baseline | Wrapper candidate | TypeScript 6.0.3 |
+| --- | ---: | ---: | ---: |
+| Open | 64.116 / 77.987 | 61.442 / 68.623 | 55.534 / 57.564 |
+| Edit / program update | 21.138 / 22.476 | 21.633 / 22.220 | 6.168 / 6.310 |
+| Completions | 14.246 / 14.941 | 9.921 / 10.188 | 0.570 / 0.591 |
+| Quick info | 1.313 / 1.375 | 1.333 / 1.389 | 0.628 / 0.634 |
+| Diagnostics | 6.298 / 6.337 | 6.279 / 6.544 | 3.829 / 3.964 |
+| 20,000 line/position round trips | 13.233 / 21.097 | 14.312 / 14.783 | 4.474 / 5.053 |
+
+Completion median improves 30.4%; edit/program-update median does not improve (2.3% higher).
+The remaining completion gap versus TypeScript is approximately 17.4×. Module loading is separate:
+72.210 / 195.237 ms baseline, 74.614 / 636.958 ms candidate, 142.145 / 152.751 ms reference.
+Median across each process's completion p95 improves 24.224 → 19.800 ms (18.3%), while the
+corresponding diagnostic p95 rises 8.084 → 9.664 ms. Repeated line-map median rises 8.2%.
+These six-process results support a bounded completion improvement, not broad performance parity.
+
+Every baseline and candidate process makes `readFile=0`, `getScriptSnapshot=31`,
+`getScriptVersion=184`, and `fileExists=155` calls. Every reference process has the same counts
+except `fileExists=0`. Separate instrumented count-only runs match exactly: 15 bridge calls and
+1,002,303 response bytes on open; 10 calls and about 1,002,134 bytes per edit; 30 calls and about
+4,197 bytes per completion; 12 calls and about 1,093 bytes per quick info; 8 calls and 184 bytes
+per diagnostic phase. Line-map probes make zero bridge calls. The wrapper change reduces local
+allocation work; it removes neither the duplicated AST encoding nor filesystem probes.
+
+Timing evidence: `wrapper-unit/replicates/summary.json` and all 18 raw child results. Count evidence:
+`wrapper-unit/count-only/comparison.json`; its timings are excluded. Exploratory baseline timing
+that overlapped a profile remains preserved and excluded from these claims. The new packed root
+passes strict declaration checks (`skipLibCheck=false`, 65 members, zero diagnostics). Fresh
+boundary provenance/dependency checks find no unresolved imports, missing packed dependencies or
+browser Node imports, but the runtime tripwires still detect the seven original routes plus
+binder-factory setup at initialization; transitive closure is unproved. This is a boundary STOP,
+not a dependency or runtime-compiler acceptance.
+
+After this unit's verified publication, a separate source-descriptor unit can remove redundant
+program AST encoding, with full payload fetch on a genuine cache miss; retain library metadata
+and cross-program diagnostic identity. Typed file/directory callback intent is another separate
+unit: current generic stat probes call `fileExists` for directories. Package-scope metadata policy
+must be investigated separately; removing those probes without proving equivalent behavior is
+outside the wrapper-allocation repair.
 
 ## Native regression repair after r35
 

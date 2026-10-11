@@ -122,11 +122,27 @@ function viewKind(raw) {
     return heritageView(raw)?.kind ?? raw.kind;
 }
 
-function publicFields(raw) {
+// Layouts contain only immutable shape descriptions; nodes and their values stay source-local.
+const fieldLayouts = new Map();
+function publicLayout(raw, parsedRoot, synthetic) {
+    const projectedKind = viewKind(raw);
+    const literalMask = literalFieldMask(raw);
+    const key = `${raw.kind}:${projectedKind}:${literalMask}:${synthetic ? 2 : parsedRoot ? 1 : 0}`;
+    let layout = fieldLayouts.get(key);
+    if (layout) return layout;
     const renamed = nativeFieldNames.get(raw.kind);
-    const children = (childFields.get(viewKind(raw)) ?? []).flatMap(field => field === "postfixToken" ? ["questionToken", "exclamationToken"]
+    const children = (childFields.get(projectedKind) ?? []).flatMap(field => field === "postfixToken" ? ["questionToken", "exclamationToken"]
         : renamed?.has(field) ? [renamed.get(field)] : field ? [field] : []);
-    return Array.from(new Set(["pos", "end", "kind", "id", "flags", "modifierFlagsCache", "transformFlags", "parent", "original", "emitNode"].concat(children, extraProperties.get(raw.kind) ?? [], literalFields(raw), ["jsDoc"])));
+    const literals = (literalMask & 1 ? ["hasExtendedUnicodeEscape"] : []).concat(literalMask & 2 ? ["isUnterminated"] : []);
+    const fields = Object.freeze(Array.from(new Set(["pos", "end", "kind", "id", "flags", "modifierFlagsCache", "transformFlags", "parent", "original", "emitNode"].concat(children, extraProperties.get(raw.kind) ?? [], literals, ["jsDoc"]))));
+    const membership = Object.create(null);
+    const allowed = Object.create(null);
+    for (const field of fields) membership[field] = allowed[field] = true;
+    for (const method of nodeMethods) allowed[method] = true;
+    if (parsedRoot) for (const method of fileMethods) allowed[method] = true;
+    layout = Object.freeze({ fields, membership: Object.freeze(membership), allowed: Object.freeze(allowed) });
+    fieldLayouts.set(key, layout);
+    return layout;
 }
 
 const literalKinds = new Set([nativeSyntaxKind.StringLiteral, nativeSyntaxKind.NumericLiteral, nativeSyntaxKind.BigIntLiteral,
@@ -143,11 +159,11 @@ function literalTokenFlags(raw) {
 
 /** Classic `parseLiteralLikeNode` sets `isUnterminated` and `hasExtendedUnicodeEscape` only when true;
  * a string literal always has `hasExtendedUnicodeEscape` (`createStringLiteral`'s parameter). */
-function literalFields(raw) {
-    if (!literalKinds.has(raw.kind)) return [];
+function literalFieldMask(raw) {
+    if (!literalKinds.has(raw.kind)) return 0;
     const flags = literalTokenFlags(raw);
-    return (raw.kind === nativeSyntaxKind.StringLiteral || (flags & nativeTokenFlags.ExtendedUnicodeEscape) !== 0 ? ["hasExtendedUnicodeEscape"] : [])
-        .concat((flags & nativeTokenFlags.Unterminated) !== 0 ? ["isUnterminated"] : []);
+    return (raw.kind === nativeSyntaxKind.StringLiteral || (flags & nativeTokenFlags.ExtendedUnicodeEscape) !== 0 ? 1 : 0)
+        | ((flags & nativeTokenFlags.Unterminated) !== 0 ? 2 : 0);
 }
 
 function jsDocProperties(raw) {
@@ -341,10 +357,9 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         let node = nodes.get(value);
         if (node) return node;
         const overrides = {};
-        const methods = new Map();
-        const deleted = new Set();
-        const fields = publicFields(value);
-        const allowed = new Set(fields.concat(Array.from(nodeMethods), value === root && !synthetic ? Array.from(fileMethods) : []));
+        let methods;
+        let deleted;
+        const { fields, membership, allowed } = publicLayout(value, value === root && !synthetic, !!synthetic);
         // A synthesized identifier carries the symbol the node builder named it for.
         if (synthetic?.symbols.has(value.index)) overrides.symbol = synthetic.symbols.get(value.index);
         // The builder's emit flags, as classic's builder sets them with `setEmitFlags`.
@@ -361,16 +376,17 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
             if (leadingComments) overrides.emitNode.leadingComments = leadingComments;
             if (trailingComments) overrides.emitNode.trailingComments = trailingComments;
         }
-        const keys = () => Reflect.isExtensible(overrides) ? Array.from(new Set(fields.filter(field => !deleted.has(field)).concat(Reflect.ownKeys(overrides)))) : Reflect.ownKeys(overrides);
+        const keys = () => Reflect.isExtensible(overrides) ? Array.from(new Set(fields.filter(field => !deleted?.has(field)).concat(Reflect.ownKeys(overrides)))) : Reflect.ownKeys(overrides);
         const get = property => {
             if (Object.hasOwn(overrides, property)) return Reflect.get(overrides, property, node);
             // Builder output has positions only once textChanges assigns them; classic's own node
             // methods then scan its tokens (`createChildren`) from those positions.
             if (synthetic && syntheticChildMethods.has(property)) return classicNodePrototype(translateKind(valueNode.kind))[property];
-            if ((property === "symbol" || property === "localSymbol" || property === "locals") && !synthetic && !deleted.has(property)) return nodeSymbol(node, property);
-            if (deleted.has(property) || !allowed.has(property)) return Reflect.get(overrides, property, node);
+            if ((property === "symbol" || property === "localSymbol" || property === "locals") && !synthetic && !deleted?.has(property)) return nodeSymbol(node, property);
+            if (deleted?.has(property) || !allowed[property]) return Reflect.get(overrides, property, node);
             const value = read(valueNode, overrides, property);
             if (typeof value !== "function") return value;
+            methods ??= new Map();
             if (!methods.has(property)) methods.set(property, value);
             return methods.get(property);
         };
@@ -380,16 +396,16 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
             set: (_, property, replacement, receiver) => {
                 // An object made with `Object.create(node)` gets its own property, as an ordinary prototype gives.
                 if (receiver !== node) return Reflect.defineProperty(receiver, property, { configurable: true, enumerable: true, writable: true, value: replacement });
-                deleted.delete(property);
+                deleted?.delete(property);
                 return Reflect.set(overrides, property, replacement);
             },
-            has: (_, property) => (!deleted.has(property) && allowed.has(property)) || Reflect.has(overrides, property),
+            has: (_, property) => (!deleted?.has(property) && !!allowed[property]) || Reflect.has(overrides, property),
             ownKeys: keys,
-            getOwnPropertyDescriptor: (_, property) => Reflect.getOwnPropertyDescriptor(overrides, property) ?? (keys().includes(property)
+            getOwnPropertyDescriptor: (_, property) => Reflect.getOwnPropertyDescriptor(overrides, property) ?? (Reflect.isExtensible(overrides) && membership[property] && !deleted?.has(property)
                 ? { configurable: true, enumerable: true, writable: true, value: get(property) } : undefined),
             deleteProperty: (_, property) => {
                 if (!Reflect.deleteProperty(overrides, property)) return false;
-                deleted.add(property);
+                (deleted ??= new Set()).add(property);
                 return true;
             },
             preventExtensions: () => {

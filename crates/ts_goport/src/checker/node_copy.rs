@@ -344,6 +344,8 @@ impl Checker {
         b: &Rc<RefCell<NodeBuilderImpl>>,
     ) -> Rc<RefCell<RecoveryBoundary>> {
         self.check_not_canceled();
+        // PORT: Rust-only. Classic polls at the start of `createRecoveryBoundary`.
+        crate::checker::host_cancellation::poll();
         let ctx = nb_ctx(b);
         let bound = {
             let c = ctx.borrow();

@@ -149,6 +149,119 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Cancellation polls, classic AST views, symbol walker and hover verbosity (r27 to r32)
+
+Injected run: **7,402 of 7,853** (fourslash 5,878, services 1,524), none lost against `r26`
+or any run since (`r27` 7,322, `r28` 7,334, `r29` 7,371, `r30` 7,398, `r31` 7,402, `r32`; runs in
+`/work/tmp/tsrust-ls-probes/u3/`; the roster takes 5.4 minutes and peaks at 4.3 GiB). One `ts_goport` change (cancellation polls), with an
+independent read-only review: STOP on module order in `checker/mod.rs`, fixed, then ACCEPT
+(`goport-cancel2.diff` and `host_cancellation.rs` hashes in the review record below).
+
+Bridge changes (no `ts_goport` change):
+
+- Literal nodes have classic's `isUnterminated` and `hasExtendedUnicodeEscape` fields
+  (`parseLiteralLikeNode`), so string and path completions find an unterminated string.
+- The port's index symbol (a transient property with `CheckFlags::INDEX_SYMBOL`) reads as
+  classic's `Signature` symbol, and `getIndexInfosOfIndexSymbol` is Go's function with the
+  parent's members as siblings: quick info shows `(index) T[string]: V`.
+- Builder template parts leave `rawText` undefined, as classic's factory does.
+- Symbol `links.nameType` comes from the port's value links (implement-interface names of
+  remapped mapped-type members).
+- Go's reparsed JSDoc casts (`/** @type {T} */(e)` becomes an `as`/`satisfies` node in Go) are
+  transparent: classic sees the operand as the child and parent.
+- A JSDoc `@template` list has classic's range (Go's parser gives it an empty one).
+- `getContextualType` of a token in an array literal answers classic's element type
+  (`getContextualTypeForElementExpression` at index -1, with classic's inference blocking);
+  Go's `getContextualType` answers only an element.
+- `modifierFlagsCache` of a parsed node answers the value classic's `getModifierFlagsWorker`
+  stores; class member snippets read it directly.
+- `declare global` has `GlobalAugmentation`; Go keeps only the keyword, which the encoding loses.
+- The types of `implements` and of an interface's `extends` read as classic's
+  `ExpressionWithTypeArguments` (dotted names as property accesses); Go parses them as type
+  references.
+- `program.getCachedSemanticDiagnostics` answers a file's whole-file semantic diagnostics.
+- `checker.getSymbolWalker` is classic's walk (`symbolWalker.ts`) in the bridge crate over the
+  port's checker functions, results in id order. `accept` runs in JavaScript: the walk reports
+  symbols in visit order and walks again with each new rejection.
+- Builder requests take classic's `maximumLength`, `verbosityLevel` and `out` through Go's
+  `VerbosityContext`; `writeType`'s cut uses `maximumLength`. `getEmitResolver()` answers
+  `symbolToDeclarations` with Go's hover expansion (`expandSymbolForHover`). Builder output
+  keeps no symbol on declaration names, as classic's builder makes bare identifiers there.
+
+Cancellation: classic's checker and node builder call `throwIfCancellationRequested()` in
+`typeToTypeNodeWorker`, `createRecoveryBoundary`, `checkExpressionWorker` (class, function and
+arrow expressions) and `checkSourceElementWorker` (module, class, interface and function
+declarations). `ts_goport::checker::host_cancellation` adds a Rust-only poll at those four
+points; nothing is armed except during a bridge request that carries a classic token. The
+module cannot unwind (`panic = "abort"`), so the poll calls the token through a host operation
+(`Op::PollCancellation`): the token's exception is held, the poll disarms, the request finishes
+with consistent checker state, and the bridge then throws the token's own exception without
+invalidating the session. Tokens come from `runWithCancellationToken`, `getDiagnostics(file,
+token)` and the program's semantic, suggestion and declaration diagnostics. The services
+cancellation unit passes 5/5.
+
+Review record (independent read-only reviewer, one at a time): first candidate
+(`goport-cancel.diff` f6f42366…, `host_cancellation.rs` f80c26f9…) STOP: `host_cancellation`
+out of rustfmt's module order in `checker/mod.rs`; placement of all four polls confirmed
+against classic, no effect when unarmed, no classic poll site missing. Revised candidate
+(`goport-cancel2.diff` 7826f0c3…, `host_cancellation.rs` 47079df7…; the poll runs its closure
+with no borrow held) ACCEPT, with one note that the comment overstated disarming from inside
+the closure; the committed file narrows that comment and changes nothing else.
+
+Deviations: a cancelled request finishes its Rust work before the exception reaches the caller;
+`getRegionSemanticDiagnostics` returns the file's whole diagnostics for the region request (the
+port has no `checkSourceFileNodes`); `symbolToDeclarations` uses Go's fixed builder flags; the
+emit resolver has only `symbolToDeclarations`; display parts of reused source nodes (classic's
+`serializeExistingTypeNode`) differ where Go builds fresh nodes.
+
+Custom transformers (`program.emit` and `getEmitOutput` with `customTransformers` or a host's
+`getCustomTransformers`): not implemented; the call throws. Design: `before` transformers take
+and return classic `SourceFile` trees with a `TransformationContext`; `after` and
+`afterDeclarations` take the transformed JavaScript and declaration trees. Running them without
+the classic emitter needs (1) an encoder from arbitrary classic trees, including synthesized
+nodes and their `emitNode` data (comments, emit flags, helpers, source map ranges, `original`),
+into Rust syntax trees; (2) a `TransformationContext` over the Rust transformer pipeline
+(hoisting, helpers, `onSubstituteNode` and `onEmitNode` hooks, the emit resolver); (3) a classic
+view of the Rust pipeline's synthesized output for `after` transformers, encoded back through
+(1) for the Rust printer. Printing transformed trees with classic's printer is the classic
+emitter, which the no-fallback rule excludes. The design is sound but large: each part is new
+ABI and code, and no case of the 7,853 depends on it (the transform unit tests,
+`customTransforms.ts` and `transform.ts`, are outside the services suite).
+
+Classified, not changed (TypeScript-Go removed semantics; owner decision), by case (`r32`):
+
+| Group | Cases |
+| --- | --- |
+| Constructor functions get no `this`/`prototype` members | 29 (`convertFunctionToEs6Class*` 26, `getJavaScriptSyntacticDiagnostics24`, `jsDocFunctionSignatures7`, `jsDocFunctionSignatures8`) |
+| Closure `function(...)` JSDoc types | 12 (`getJavaScriptQuickInfo1`, `6`, `jsDocFunctionSignatures12`, `jsDocGenerics2`, `quickInfoJSDocFunctionNew`, `quickInfoJSDocFunctionThis`, `annotateWithTypeFromJSDoc4`, `16`, `23`, `getJavaScriptCompletions8`, `9`, `10`) |
+| `outFile` concatenation and AMD output | 12 |
+| Bare `?` JSDoc unknown type (Go reports TS1110) | 3 (`codeFixChangeJSDocSyntax1`, `18`, `19`) |
+| `@enum` | 3 (`quickInfoJSExport`, `quickInfoJsdocEnum`, `codeFixInferFromUsageExistingJSDoc`) |
+| CommonJS beyond `const x = require()` (`module.exports = require()`, an `exports` alias, exports in an IIFE) | 3 (`refactorConvertToEsModule_export_alias`, `refactorConvertToEsModule_export_moduleDotExportsEqualsRequire`, `javascriptModules22`) |
+| JS expando forms (`Object.defineProperty`, element-access declarations) | 3 (`quickInfoOnExpandoLikePropertyWithSetterDeclarationJs1`, `2`, `quickInfoElementAccessDeclaration`) |
+| `@typedef` without a type; hyphenated JSDoc property names | 2 (`quickInfoJsdocTypedefMissingType`, `jsDocTagsWithHyphen`) |
+
+That is 67 cases. TypeScript-Go design differences that are not removals, also unchanged:
+Go parses an exported class in a namespace outside `AwaitContext` (8 node-flag cases); Go's
+deterministic union order (`exhaustiveCaseCompletions8`, `quickinfoVerbosity2`,
+`quickinfoVerbosityTuple`, `quickInfoCanBeTruncated` in part); Go reports TS6198 for an unused
+array pattern (`codeFixUnusedIdentifier_parameter_all`); Go's index symbol takes the single
+applicable index info (`jsDocPropertyDescription11`); duplicate object-literal members stay
+separate symbols (`quickInfoTypeError`); a TS function expando gives no namespace meaning
+(`quickinfoVerbosityFunction`, `quickinfoVerbosityJs`); Go's builder reuses fewer source nodes
+and comments (`codeFixClassExtendAbstractMethodWithLongName`,
+`codeFixClassImplementInterfaceComments`, `codeFixClassImplementInterfaceNoTruncation`,
+`codeFixInferFromUsageNoTruncation`, `thisPredicateFunctionQuickInfo01`, `02`,
+`quickInfoTemplateTag`, `quickinfoVerbosityLibType`). These counts cover the groups examined in
+this batch, not every remaining failure.
+
+Next by failing count (`r32`, 451 failing): code fixes not found (29) and quick info text (21)
+are classified above; range text (12, 11 classified); undefined reads (12); the AwaitContext
+flags (8, classified); `import foo` texts (7); fix-all ids of
+`codeFixImportNonExportedMember_all*` (7); `checker.symbolIsValue` (6); bare debug failures
+(6); no completions (6); rename failures (6); and `getRegionSemanticDiagnostics` regions, which
+need a port of `checkSourceFileNodes`.
+
 ## Classifiable names and the current queue
 
 Injected run: **7,260 of 7,853** (fourslash 5,749, services 1,511), none lost against `r25` or
@@ -157,15 +270,8 @@ escaped names of binder symbols declared with a classifiable meaning (class, enu
 interface, type parameter, module, alias), collected over each file's declaration nodes in the
 bridge. The port dropped Go's `ClassifiableNames` as unused, so no `ts_goport` change.
 
-Open from the requested order: cancellation polling (needs classic's poll sites in
-`ts_goport`'s builder and checker, with the independent review AGENTS.md requires; 5 services
-cases), custom transformers for `program.emit`, hover verbosity (`getEmitResolver`, the
-builder's verbosity level and maximum length; 11 cases plus truncation cases), and the
-classified TypeScript-Go semantic differences recorded in the batches below.
-
-Next by failing count (`r26`): code fixes not found (29), assertion `true` (29), quick info
-text (28), range text (13), completions not found (13), node kind mismatches 184/234 (13),
-undefined reads (12), `getSymbolWalker` (11), `getEmitResolver` (11), no signature help (9).
+The open items this batch listed (cancellation, custom transformers, hover verbosity) are
+recorded in the section above.
 
 ## Symbol identity across checkers
 

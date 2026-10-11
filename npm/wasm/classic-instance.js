@@ -33,7 +33,19 @@ function createInstance(module) {
         readDirectory: path => active.readDirectory(path),
         realpath: path => active.realpath?.(path),
         getSourceFile: request => active.getSourceFile(request),
+        // Classic's checker polls; the exception the token throws ends the request.
+        pollCancellation() {
+            try { cancellation?.throwIfCancellationRequested(); }
+            catch (error) {
+                if (typeof error === "object" && error !== null) cancellations.add(error);
+                throw error;
+            }
+        },
     };
+    // Exceptions a cancellation poll threw: they end a request without invalidating its session.
+    const cancellations = new WeakSet();
+    // The classic cancellation token of the running request, if it has one.
+    let cancellation;
     const run = prepareRun(module, { fs, holdHostExceptions: true });
     let exports = run.attach(new WebAssembly.Instance(module, run.imports));
 
@@ -99,6 +111,14 @@ function createInstance(module) {
             if (failure === undefined && depth === 0) call({ action: "releaseSource", source });
         },
         parseDocument: (request, text) => call(Object.assign({ action: "parseDocument" }, request), undefined, text),
+        isCancellation: error => typeof error === "object" && error !== null && cancellations.has(error),
+        /** Runs `callback` with `token` as the running requests' cancellation token. */
+        withCancellation(token, callback) {
+            const previous = cancellation;
+            cancellation = token;
+            try { return callback(); }
+            finally { cancellation = previous; }
+        },
     };
 }
 

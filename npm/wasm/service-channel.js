@@ -14,7 +14,7 @@ export function createServiceChannel(module, options) {
         if (instance.isRunning(session)) throw new Error("language service cannot reenter a host callback");
         const { response, held } = instance.send(Object.assign({ session }, request), files);
         if (held) {
-            if (request.action !== "invalidate") call({ action: "invalidate" });
+            if (request.action !== "invalidate" && !instance.isCancellation(held.error)) call({ action: "invalidate" });
             throw held.error;
         }
         return result(response);

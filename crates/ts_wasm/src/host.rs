@@ -40,6 +40,9 @@ pub enum Op {
     Chtimes = 7,
     SourceMetadata = 8,
     GetSourceFile = 9,
+    /// Classic's `cancellationToken.throwIfCancellationRequested()` on the request's token. The
+    /// host holds the exception it throws until the request ends, and the call fails.
+    PollCancellation = 10,
 }
 
 thread_local! {

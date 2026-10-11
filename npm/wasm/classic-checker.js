@@ -60,9 +60,24 @@ export function createTypeChecker(lease, resolveNode) {
     const objectHandles = new WeakMap();
     const inputLeases = new WeakMap();
 
+    // Classic's `cancellationToken`, set by `runWithCancellationToken` and `getDiagnostics`; the
+    // Rust checker and node builder poll it where classic's do.
+    let cancellationToken;
     function query(method, params = {}) {
-        try { return decode(lease.channel.graph(lease.handle, method, params)); }
+        try {
+            if (!cancellationToken) return decode(lease.channel.graph(lease.handle, method, params));
+            params.cancellable = true;
+            return lease.channel.instance.withCancellation(cancellationToken, () => decode(lease.channel.graph(lease.handle, method, params)));
+        }
         finally { if (params.location) inputLeases.delete(params.location); }
+    }
+    function withCancellationToken(token, callback) {
+        try {
+            cancellationToken = token;
+            return callback();
+        } finally {
+            cancellationToken = undefined;
+        }
     }
 
     function location(node) {
@@ -436,9 +451,9 @@ export function createTypeChecker(lease, resolveNode) {
     checker.getUnmatchedProperties = (source, target, requireOptionalProperties, matchDiscriminantProperties) => query("getUnmatchedProperties", {
         type: handle(source, "type"), target: handle(target, "type"), requireOptionalProperties, matchDiscriminantProperties, origin: objectHandles.get(source)?.origin,
     }).values();
-    // Classic runs the callback with the token set for its checker's own polling. The Rust
-    // checker does not poll a classic token yet, so work inside the callback runs to its end.
-    checker.runWithCancellationToken = (token, callback) => callback(checker);
+    // Classic runs the callback with the token set for its checker's own polling. A Rust request
+    // that polls a cancelled token finishes its work, then throws the token's exception.
+    checker.runWithCancellationToken = (token, callback) => withCancellationToken(token, () => callback(checker));
     const nodeSymbols = new WeakMap();
     checker[nodeSymbolKey] = (node, local) => {
         const key = local ? "localSymbol" : "symbol";
@@ -561,7 +576,7 @@ export function createTypeChecker(lease, resolveNode) {
     checker.getTrueType = fresh => query("getTrueType", { fresh });
     checker.getFalseType = fresh => query("getFalseType", { fresh });
     checker.getWidenedLiteralType = type => query("getWidenedLiteralType", typeOf(type));
-    checker.getDiagnostics = sourceFile => query("getDiagnostics", { location: sourceFile === undefined ? undefined : location(sourceFile) }).map(lease.diagnostic);
+    checker.getDiagnostics = (sourceFile, token) => withCancellationToken(token, () => query("getDiagnostics", { location: sourceFile === undefined ? undefined : location(sourceFile) }).map(lease.diagnostic));
     checker.getGlobalDiagnostics = () => query("getGlobalDiagnostics").map(lease.diagnostic);
     // Classic `nodeBuilder`: Rust's node builder answers with synthesized nodes. It takes no symbol
     // tracker; a maximum length, verbosity level or `out` record goes to Go's verbosity context.

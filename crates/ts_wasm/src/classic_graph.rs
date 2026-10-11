@@ -70,6 +70,7 @@ impl Graphs {
         let method = request["method"]
             .as_str()
             .ok_or("graph method is required")?;
+        let _cancellation = CancellationPolls::arm(request["cancellable"].as_bool() == Some(true));
         match method {
             "setParseTarget" => {
                 let target = request["target"]
@@ -433,6 +434,29 @@ fn diagnostics(
         _ => unreachable!(),
     };
     Ok(Value::Array(diagnostics.iter().map(diagnostic).collect()))
+}
+
+/// Arms classic's checker and node builder polls (`ts_goport::checker::host_cancellation`) on
+/// the request's cancellation token while a request that has one runs.
+struct CancellationPolls(bool);
+
+impl CancellationPolls {
+    fn arm(cancellable: bool) -> Self {
+        if cancellable {
+            ts_goport::checker::host_cancellation::arm(Box::new(|| {
+                crate::host::call(crate::host::Op::PollCancellation, &[]).is_err()
+            }));
+        }
+        Self(cancellable)
+    }
+}
+
+impl Drop for CancellationPolls {
+    fn drop(&mut self) {
+        if self.0 {
+            ts_goport::checker::host_cancellation::disarm();
+        }
+    }
 }
 
 pub(crate) fn diagnostic(value: &Diagnostic) -> Value {

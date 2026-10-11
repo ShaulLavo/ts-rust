@@ -439,8 +439,13 @@ impl Checker {
             SyntaxKind::ParenthesizedExpression => {
                 return self.check_parenthesized_expression(node, check_mode);
             }
-            SyntaxKind::ClassExpression => return self.check_class_expression(node),
+            // PORT: Rust-only polls. Classic polls before checking these three kinds.
+            SyntaxKind::ClassExpression => {
+                crate::checker::host_cancellation::poll();
+                return self.check_class_expression(node);
+            }
             SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction => {
+                crate::checker::host_cancellation::poll();
                 return self.check_function_expression_or_object_literal_method(node, check_mode);
             }
             SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression => {

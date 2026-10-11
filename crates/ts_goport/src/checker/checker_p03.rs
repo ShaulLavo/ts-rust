@@ -338,6 +338,16 @@ impl Checker {
         // it is an AST store read, so it is read once for the unreachable
         // test and the switch.
         let kind = node.kind();
+        // PORT: Rust-only. Classic polls here for these four kinds.
+        if matches!(
+            kind,
+            SyntaxKind::ModuleDeclaration
+                | SyntaxKind::ClassDeclaration
+                | SyntaxKind::InterfaceDeclaration
+                | SyntaxKind::FunctionDeclaration
+        ) {
+            crate::checker::host_cancellation::poll();
+        }
         if !self.within_unreachable_code
             && self.compiler_options.allow_unreachable_code != Tristate::True
         {

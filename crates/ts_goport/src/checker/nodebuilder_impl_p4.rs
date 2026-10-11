@@ -190,6 +190,8 @@ impl Checker {
 
     // Go: checker/nodebuilderimpl.go:3299 typeToTypeNode
     pub fn type_to_type_node(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, t: TypeId) -> Node {
+        // PORT: Rust-only. Classic polls at the start of `typeToTypeNodeWorker`.
+        crate::checker::host_cancellation::poll();
         let ctx = nb_ctx(b);
         // PORT: Go uses two defers (typeStack pop after the push in the body,
         // and depth-- in the alias branch). The body reports whether it pushed

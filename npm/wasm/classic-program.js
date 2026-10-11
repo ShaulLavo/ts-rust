@@ -166,8 +166,12 @@ export function createProgramGraph(channel, handle, settings = {}) {
 
     lease.diagnostic = diagnostic;
 
-    function diagnostics(method, file) {
-        return graph(method, { fileName: typeof file === "string" ? file : file?.fileName }).map(diagnostic);
+    // A cancellation token reaches the Rust checker's polls for the duration of the request.
+    function diagnostics(method, file, cancellationToken) {
+        const params = { fileName: typeof file === "string" ? file : file?.fileName };
+        if (!cancellationToken) return graph(method, params).map(diagnostic);
+        params.cancellable = true;
+        return lease.channel.instance.withCancellation(cancellationToken, () => graph(method, params)).map(diagnostic);
     }
 
     const semanticDiagnostics = new Map();
@@ -246,17 +250,17 @@ export function createProgramGraph(channel, handle, settings = {}) {
         isSourceFileFromExternalLibrary: file => metadata.get(file)?.externalLibrary ?? false,
         getSyntacticDiagnostics: file => diagnostics("getSyntacticDiagnostics", file),
         getSemanticDiagnostics(file, cancellationToken, nodesToCheck) {
-            const result = diagnostics("getSemanticDiagnostics", file);
+            const result = diagnostics("getSemanticDiagnostics", file, cancellationToken);
             if (file && !nodesToCheck) semanticDiagnostics.set(typeof file === "string" ? file : file.fileName, result);
             return result;
         },
         // Classic's cache of a file's bind and check diagnostics, filled by a whole-file request.
         getCachedSemanticDiagnostics: file => semanticDiagnostics.get(file.fileName),
-        getSuggestionDiagnostics: file => diagnostics("getSuggestionDiagnostics", file),
+        getSuggestionDiagnostics: (file, cancellationToken) => diagnostics("getSuggestionDiagnostics", file, cancellationToken),
         getGlobalDiagnostics: () => diagnostics("getGlobalDiagnostics"),
         getOptionsDiagnostics: () => diagnostics("getOptionsDiagnostics"),
         getConfigFileParsingDiagnostics: () => diagnostics("getConfigFileParsingDiagnostics"),
-        getDeclarationDiagnostics: file => diagnostics("getDeclarationDiagnostics", file),
+        getDeclarationDiagnostics: (file, cancellationToken) => diagnostics("getDeclarationDiagnostics", file, cancellationToken),
     };
     programInternals.set(program, { graph, diagnostic });
     const programReference = new WeakRef(program);

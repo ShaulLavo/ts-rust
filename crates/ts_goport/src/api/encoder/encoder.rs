@@ -22,7 +22,7 @@ use crate::api::encoder::prelude::*;
 
 use crate::ast::node::{ChildField, for_each_child_field};
 use crate::ast::source_file_ls::{SourceFileDataKey, new_source_file_data_key};
-use crate::ast::store::{FileNodeReader, FileNodes, frozen_store_text_name};
+use crate::ast::store::{FileNodeReader, FileNodes, ScopedFileNodeReader, frozen_store_text_name};
 use crate::astdata::NodeData;
 use crate::frontend::core_binarysearch::binary_search_unique_func;
 use crate::frontend::parser::{ExternalModuleIndicatorOptions, ParsedSourceFile};
@@ -863,13 +863,24 @@ fn encode_tree(
         }
     }
 
-    // PERF: (apiperf2) the nodes of a published store file are encoded from
-    // their node data (`StoreFile`, `run_encode_tasks`).
+    // Completed stores use their node data without changing publication.
+    // Unpublished reads end before lazy JSDoc writes the same cell.
     let file_nodes = FileNodes::of(root_node.file_index()).filter(|_| !visitor_only());
-    let store_file = file_nodes.as_ref().map(|nodes| StoreFile {
-        file: root_node.file_index(),
-        nodes: nodes.reader(root_node.file_index()),
-    });
+    let scoped_nodes = (!visitor_only() && file_nodes.is_none())
+        .then(|| ScopedFileNodeReader::of(root_node.file_index()))
+        .flatten();
+    let store_file = file_nodes
+        .as_ref()
+        .map(|nodes| StoreFile {
+            file: root_node.file_index(),
+            nodes: StoreReader::Published(nodes.reader(root_node.file_index())),
+        })
+        .or_else(|| {
+            scoped_nodes.as_ref().map(|nodes| StoreFile {
+                file: root_node.file_index(),
+                nodes: StoreReader::Scoped(nodes),
+            })
+        });
     let fast = store_file.as_ref();
 
     // PORT: Go builds the visitor with only `Hooks` and sets `Visit` after;
@@ -961,14 +972,7 @@ fn encode_tree(
     }
     let kind = root_node.kind();
     let first = tasks.len();
-    collect_children(
-        root_node,
-        kind,
-        store_node_data(root_node, kind, fast),
-        &mut visitor,
-        fast,
-        &mut tasks,
-    );
+    collect_children(root_node, kind, &mut visitor, fast, &mut tasks);
     tasks[first..].reverse();
     run_encode_tasks(tasks, &mut visitor, fast);
 
@@ -1109,7 +1113,7 @@ fn visitor_only() -> bool {
     false
 }
 
-/// The published store file of the node that `encode_tree` encodes, whose
+/// The completed store file of the node that `encode_tree` encodes, whose
 /// nodes `run_encode_tasks` encodes from their node data.
 // PERF: (apiperf2) Go `encodeTree` walks the tree with `VisitEachChild`.
 // Here the visitor read each child field of a node three times (the
@@ -1118,7 +1122,28 @@ fn visitor_only() -> bool {
 // with a pin per read: the encoder took 3.7 times Go's cycles.
 struct StoreFile<'a> {
     file: usize,
-    nodes: FileNodeReader<'a>,
+    nodes: StoreReader<'a>,
+}
+
+enum StoreReader<'a> {
+    Published(FileNodeReader<'a>),
+    Scoped(&'a ScopedFileNodeReader),
+}
+
+impl StoreReader<'_> {
+    fn header(&self, node: Node) -> (SyntaxKind, TextRange, NodeFlags) {
+        match self {
+            Self::Published(nodes) => nodes.header(node),
+            Self::Scoped(nodes) => nodes.header(node),
+        }
+    }
+
+    fn with_data<R>(&self, node: Node, read: impl FnOnce(&NodeData) -> R) -> R {
+        match self {
+            Self::Published(nodes) => read(nodes.data(node)),
+            Self::Scoped(nodes) => nodes.with_data(node, read),
+        }
+    }
 }
 
 /// True when `run_encode_tasks` encodes the children of a node of kind `kind`
@@ -1128,21 +1153,6 @@ struct StoreFile<'a> {
 #[inline]
 fn walks_node_data(kind: SyntaxKind) -> bool {
     !is_js_doc_kind(kind) && kind != SyntaxKind::SyntaxList
-}
-
-/// The node data of `node`, of kind `kind`, when `run_encode_tasks` encodes it
-/// from its node data: a node of store file `fast` (`walks_node_data`).
-#[inline]
-fn store_node_data<'f>(
-    node: Node,
-    kind: SyntaxKind,
-    fast: Option<&StoreFile<'f>>,
-) -> Option<&'f NodeData> {
-    let fast = fast?;
-    if node.file_index() != fast.file || !walks_node_data(kind) {
-        return None;
-    }
-    Some(fast.nodes.data(node))
 }
 
 /// One step of `run_encode_tasks`: the parts of Go's recursive visit in
@@ -1157,19 +1167,38 @@ enum EncodeTask<'f> {
     Visit(Node),
     /// A list (the VisitNodes or VisitModifiers hook).
     List(NodeList),
-    /// A list of the node data of the store file.
+    /// A list of the immutable published node data, held by `FileNodes`.
     StoreList(&'f crate::astdata::NodeList),
+    /// A value-only list from a frozen unpublished store.
+    ScopedStoreList(QueuedStoreList),
     /// The end of a node or list visit: Go restores `prevIndex` and
     /// `parentIndex`.
     Exit { index: u32, parent_index: u32 },
 }
 
+/// Only handles and range values survive a store read. Lazy JSDoc may
+/// grow its owned node storage before this queued list is visited.
+struct QueuedStoreList {
+    nodes: Vec<Node>,
+    pos: i32,
+    end: i32,
+}
+
+impl QueuedStoreList {
+    fn new(list: &crate::astdata::NodeList, file: usize) -> Self {
+        Self {
+            nodes: list.nodes.iter().map(|&id| Node::new(file, id)).collect(),
+            pos: list.range.start.get() as i32,
+            end: list.range.end.get() as i32,
+        }
+    }
+}
+
 /// A node entered by `enter_node`: its entry is written and its children
 /// come next.
-struct EnteredNode<'f> {
+struct EnteredNode {
     flags: NodeFlags,
     kind: SyntaxKind,
-    data_node: Option<&'f NodeData>,
     data_word: u32,
     current_index: u32,
     save_parent_index: u32,
@@ -1177,20 +1206,18 @@ struct EnteredNode<'f> {
 
 /// The start of Go's visit of `node`: its entry, its link from the previous
 /// sibling and its index; `parentIndex` becomes the node.
-fn enter_node<'f>(
+fn enter_node(
     node: Node,
     visitor: &mut EncodeVisitor<'_>,
-    fast: Option<&StoreFile<'f>>,
-) -> EnteredNode<'f> {
+    fast: Option<&StoreFile<'_>>,
+) -> EnteredNode {
     // PERF: (apiperf2) a node of the store file reads its record once.
     let in_file = fast.filter(|fast| node.file_index() == fast.file);
     let (kind, loc, flags) = match in_file {
         Some(fast) => fast.nodes.header(node),
         None => (node.kind(), node.loc(), node.flags()),
     };
-    let data_node = in_file
-        .filter(|_| walks_node_data(kind))
-        .map(|fast| fast.nodes.data(node));
+    let data_file = in_file.filter(|_| walks_node_data(kind));
     let st = &mut visitor.ctx;
     st.node_count += 1;
     st.node_table.push(node);
@@ -1213,8 +1240,10 @@ fn enter_node<'f>(
     let pos = st.utf16(node_pos);
     let end = st.utf16(node_end);
     let parent_index = st.parent_index;
-    let data_word = match data_node {
-        Some(data) => store_node_data_word(node, kind, data, node_pos, node_end, st),
+    let data_word = match data_file {
+        Some(fast) => fast.nodes.with_data(node, |data| {
+            store_node_data_word(node, kind, data, node_pos, node_end, st)
+        }),
         None => get_node_data(
             node,
             &mut st.strs,
@@ -1244,7 +1273,6 @@ fn enter_node<'f>(
     EnteredNode {
         flags,
         kind,
-        data_node,
         data_word,
         current_index,
         save_parent_index,
@@ -1252,19 +1280,32 @@ fn enter_node<'f>(
 }
 
 /// Pushes a task for each child that Go `visitor.VisitEachChild(node)`
-/// visits, in Go's order: from the node data `data` of a node of store file
+/// visits, in Go's order: from the node data of a node of store file
 /// `fast` (`push_store_children`), else through the visitor, whose visit
 /// and hooks collect them. Returns the children mask of node data.
 fn collect_children<'f>(
     node: Node,
     kind: SyntaxKind,
-    data: Option<&'f NodeData>,
     visitor: &mut EncodeVisitor<'_>,
     fast: Option<&StoreFile<'f>>,
     tasks: &mut Vec<EncodeTask<'f>>,
 ) -> Option<u8> {
-    if let (Some(data), Some(fast)) = (data, fast) {
-        return Some(push_store_children(kind, data, fast, tasks));
+    if let Some(fast) = fast.filter(|fast| node.file_index() == fast.file && walks_node_data(kind))
+    {
+        return Some(match &fast.nodes {
+            StoreReader::Published(nodes) => push_store_children(
+                kind,
+                nodes.data(node),
+                fast.file,
+                tasks,
+                EncodeTask::StoreList,
+            ),
+            StoreReader::Scoped(nodes) => nodes.with_data(node, |data| {
+                push_store_children(kind, data, fast.file, tasks, |list| {
+                    EncodeTask::ScopedStoreList(QueuedStoreList::new(list, fast.file))
+                })
+            }),
+        });
     }
     debug_assert!(visitor.ctx.collected.is_empty());
     visitor.visit_each_child(node);
@@ -1308,20 +1349,36 @@ fn run_encode_tasks<'f>(
                 tasks.extend(nodes.iter().rev().map(EncodeTask::Visit));
             }
             EncodeTask::StoreList(list) => {
-                let fast = fast.expect("a store list has its store file");
-                let (index, parent_index) = enter_store_list(list, visitor, fast);
+                let file = fast.expect("a store list has its store file").file;
+                let pos = list.range.start.get() as i32;
+                let end = list.range.end.get() as i32;
+                let trailing = list
+                    .nodes
+                    .last()
+                    .is_some_and(|&id| Node::new(file, id).end() < end);
+                let (index, parent_index) =
+                    enter_store_list(pos, end, list.nodes.len(), trailing, visitor);
                 tasks.push(EncodeTask::Exit {
                     index,
                     parent_index,
                 });
-                // Go `visitor.VisitSlice(nodeList.Nodes)`.
-                let file = fast.file;
                 tasks.extend(
                     list.nodes
                         .iter()
                         .rev()
                         .map(|&id| EncodeTask::Visit(Node::new(file, id))),
                 );
+            }
+            EncodeTask::ScopedStoreList(list) => {
+                let trailing = list.nodes.last().is_some_and(|last| last.end() < list.end);
+                let (index, parent_index) =
+                    enter_store_list(list.pos, list.end, list.nodes.len(), trailing, visitor);
+                tasks.push(EncodeTask::Exit {
+                    index,
+                    parent_index,
+                });
+                // Go `visitor.VisitSlice(nodeList.Nodes)`.
+                tasks.extend(list.nodes.into_iter().rev().map(EncodeTask::Visit));
             }
             EncodeTask::Visit(node) => {
                 let entered = enter_node(node, visitor, fast);
@@ -1341,14 +1398,7 @@ fn run_encode_tasks<'f>(
                     );
                 }
                 let first = tasks.len();
-                let mask = collect_children(
-                    node,
-                    entered.kind,
-                    entered.data_node,
-                    visitor,
-                    fast,
-                    &mut tasks,
-                );
+                let mask = collect_children(node, entered.kind, visitor, fast, &mut tasks);
                 tasks[first..].reverse();
                 if let Some(mask) = mask
                     && entered.data_word & NODE_DATA_TYPE_MASK == NODE_DATA_TYPE_CHILDREN
@@ -1458,11 +1508,12 @@ fn store_node_data_word(
 /// `getChildrenPropertyMask(node)`: a bit per field, in field order, for a
 /// field that is not Go `nil` (a modifier list that is not empty, Go
 /// `hasModifiers`). `FullSignature` has no bit.
-fn push_store_children<'f>(
+fn push_store_children<'d, 'f>(
     kind: SyntaxKind,
-    data: &'f NodeData,
-    fast: &StoreFile<'f>,
+    data: &'d NodeData,
+    file: usize,
     tasks: &mut Vec<EncodeTask<'f>>,
+    mut list_task: impl FnMut(&'d crate::astdata::NodeList) -> EncodeTask<'f>,
 ) -> u8 {
     let mut mask: u8 = 0;
     let mut bit: u32 = 0;
@@ -1473,7 +1524,7 @@ fn push_store_children<'f>(
         }
         bit += 1;
     };
-    for_each_child_field(kind, fast.file, data, |child| match child {
+    for_each_child_field(kind, file, data, |child| match child {
         // Go `v.visitNode(child)`.
         ChildField::Node(child) => {
             field(child.is_some());
@@ -1490,7 +1541,7 @@ fn push_store_children<'f>(
         ChildField::List(list) => {
             field(list.is_some());
             if let Some(list) = list {
-                tasks.push(EncodeTask::StoreList(list));
+                tasks.push(list_task(list));
             }
         }
         // Go `v.visitModifiers(modifiers)`: the VisitModifiers hook.
@@ -1498,7 +1549,7 @@ fn push_store_children<'f>(
             let modifiers = modifiers.filter(|modifiers| !modifiers.list.nodes.is_empty());
             field(modifiers.is_some());
             if let Some(modifiers) = modifiers {
-                tasks.push(EncodeTask::StoreList(&modifiers.list));
+                tasks.push(list_task(&modifiers.list));
             }
         }
         ChildField::Ids(_) => unreachable!("a SyntaxList or a JSDoc node takes the visitor"),
@@ -1507,28 +1558,16 @@ fn push_store_children<'f>(
 }
 
 /// The start of the VisitNodes hook for a non-nil list of the node data of
-/// store file `fast`: its entry, and `parentIndex` becomes the list. Returns
+/// store file: its entry, and `parentIndex` becomes the list. Returns
 /// the list's index and the `parentIndex` to restore after its nodes.
 fn enter_store_list(
-    list: &crate::astdata::NodeList,
+    pos: i32,
+    end: i32,
+    len: usize,
+    has_trailing_comma: bool,
     visitor: &mut EncodeVisitor<'_>,
-    fast: &StoreFile<'_>,
 ) -> (u32, u32) {
-    let file = fast.file;
-    // Go `NodeList.Loc` and `HasTrailingComma` (the last node ends before
-    // the list).
-    let (pos, end) = (list.range.start.get() as i32, list.range.end.get() as i32);
-    let has_trailing_comma = list
-        .nodes
-        .last()
-        .is_some_and(|&last| Node::new(file, last).end() < end);
-    let current_index = begin_node_list(
-        &mut visitor.ctx,
-        pos,
-        end,
-        list.nodes.len(),
-        has_trailing_comma,
-    );
+    let current_index = begin_node_list(&mut visitor.ctx, pos, end, len, has_trailing_comma);
     let save_parent_index = visitor.ctx.parent_index;
     visitor.ctx.prev_index = 0;
     visitor.ctx.parent_index = current_index;
@@ -2302,10 +2341,9 @@ module.exports.z = "z";
             Some(FileNodes::Static(_)) => assert!(!freeable, "{file_name}: a static publish"),
             None => panic!("{file_name}: the file is not published"),
         }
-        let (walk, table) = encode_parsed_source_file(&file).expect("encode");
-        VISITOR_ONLY.with(|v| v.set(true));
-        let (visitor, visitor_table) = encode_parsed_source_file(&file).expect("encode");
-        VISITOR_ONLY.with(|v| v.set(false));
+        // Bypass the source-file table cache: each walk must supply its own table.
+        let (walk, table) = encode_tree(file.root, file.root, Some(&file)).expect("encode");
+        let (visitor, visitor_table) = encode_visitor_tree(&file);
         assert!(
             walk == visitor,
             "{file_name}: the node data walk and the visitor differ"
@@ -2320,6 +2358,308 @@ module.exports.z = "z";
         drop(file);
         // The pins of this thread hold a freeable version until here.
         crate::ast::release_file_version_pins();
+    }
+
+    fn parse_encoding_file(file_name: &str, text: &str, freeable: bool) -> Rc<ParsedSourceFile> {
+        let options = SourceFileParseOptions {
+            file_name: file_name.to_string(),
+            path: tspath::Path(file_name.to_string()),
+            ..Default::default()
+        };
+        let file = {
+            let _scope = freeable.then(crate::ast::store::enter_owned_parse);
+            parse_source_file(
+                &options,
+                FileText::new(text.to_string(), freeable),
+                crate::frontend::core_ext::ensure_script_kind_from_file_name(file_name),
+            )
+        };
+        if freeable {
+            assert!(file.version.set(FileVersion::new(file.store)).is_ok());
+        }
+        Rc::new(file)
+    }
+
+    fn encode_visitor_tree(file: &Rc<ParsedSourceFile>) -> (Vec<u8>, Rc<NodeIndexTable>) {
+        let previous = VISITOR_ONLY.with(|v| v.replace(true));
+        let encoded = encode_tree(file.root, file.root, Some(file));
+        VISITOR_ONLY.with(|v| v.set(previous));
+        encoded.expect("encode with visitor")
+    }
+
+    // Independent parses have different handles. Compare every table slot,
+    // including nil list entries and parent indices, without sharing caches.
+    fn table_shape(table: &NodeIndexTable) -> Vec<(u32, i32, i32, u32, u32)> {
+        table
+            .nodes
+            .iter()
+            .map(|&node| {
+                if node.is_nil() {
+                    return (0, 0, 0, 0, 0);
+                }
+                (
+                    node.kind() as u32,
+                    node.pos(),
+                    node.end(),
+                    node.flags().0,
+                    table.get_index(node.parent()),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_cold_encoding(
+        file_name: &str,
+        text: &str,
+        freeable: bool,
+        published: bool,
+        cold_doc_count: Option<usize>,
+    ) {
+        let mut outputs = Vec::new();
+        for visitor_only in [false, true] {
+            let file = parse_encoding_file(file_name, text, freeable);
+            let documented: Vec<Node> = file
+                .root
+                .statements()
+                .iter()
+                .filter(|node| node.flags().intersects(NodeFlags::HAS_JS_DOC))
+                .collect();
+            // The parser eagerly caches @see and @link; other TS docs stay lazy.
+            for &node in &documented {
+                let cached = crate::ast::store::file_store_js_doc(file.store, node);
+                assert_eq!(cached.is_some(), file.jsdoc_cache.contains_key(&node));
+                if let Some(expected) = file.jsdoc_cache.get(&node) {
+                    assert_eq!(
+                        cached.expect("eager cache").iter().collect::<Vec<_>>(),
+                        *expected
+                    );
+                }
+            }
+            if let Some(count) = cold_doc_count {
+                assert!(file.has_lazy_js_doc);
+                assert!(file.jsdoc_cache.is_empty());
+                assert_eq!(documented.len(), count);
+                for &node in &documented {
+                    assert!(crate::ast::store::file_store_js_doc(file.store, node).is_none());
+                }
+            }
+            if published {
+                crate::program::note_parsed_source_file(&file);
+                crate::program::publish_parsed_files("/");
+                assert!(FileNodes::of(file.store).is_some());
+                assert!(ScopedFileNodeReader::of(file.store).is_none());
+            } else {
+                assert!(FileNodes::of(file.store).is_none());
+                assert!(ScopedFileNodeReader::of(file.store).is_some());
+            }
+            if cold_doc_count.is_some() {
+                for &node in &documented {
+                    assert!(node.eager_js_doc(file.root).is_empty());
+                }
+            }
+            let (bytes, table) = if visitor_only {
+                encode_visitor_tree(&file)
+            } else {
+                encode_tree(file.root, file.root, Some(&file)).expect("encode cold store")
+            };
+            if cold_doc_count.is_some() {
+                for &node in &documented {
+                    let docs = node.eager_js_doc(file.root);
+                    assert!(!docs.is_empty());
+                    for doc in docs.iter() {
+                        assert_eq!(doc.parent(), node);
+                    }
+                }
+            }
+            // Same-tree comparisons use exact handles and fresh tables; only
+            // the independent cold comparison below normalizes the handles.
+            let (other_bytes, other_table) = encode_visitor_tree(&file);
+            assert_eq!(bytes, other_bytes, "{file_name}: exact bytes");
+            assert_eq!(
+                table.nodes, other_table.nodes,
+                "{file_name}: exact node table"
+            );
+            assert_eq!(table.nodes, build_node_index_table(file.root).nodes);
+            outputs.push((bytes, table_shape(&table)));
+            if !published {
+                // Release through the existing publication boundary, after
+                // the unpublished assertions and encodes have completed.
+                assert!(!crate::ast::store::is_published(file.store));
+                crate::program::note_parsed_source_file(&file);
+                crate::program::publish_parsed_files("/");
+            }
+            drop(file);
+            crate::ast::release_file_version_pins();
+        }
+        assert_eq!(
+            outputs[0], outputs[1],
+            "{file_name}: independent cold controls"
+        );
+    }
+
+    #[test]
+    fn frozen_unpublished_and_published_encodings_match_cold_visitors() {
+        for (i, (name, text)) in SAMPLES.iter().enumerate() {
+            for freeable in [false, true] {
+                for published in [false, true] {
+                    assert_cold_encoding(
+                        &format!("/scoped-encoder/{i}/{freeable}/{published}/{name}"),
+                        text,
+                        freeable,
+                        published,
+                        None,
+                    );
+                }
+            }
+        }
+        let docs = (0..64).map(|i| format!(
+            "/** @template T @param {{T}} value @returns {{T}} */\nexport function f{i}<T>(value: T): T {{ return value; }}\n"
+        )).collect::<String>();
+        for freeable in [false, true] {
+            for published in [false, true] {
+                assert_cold_encoding(
+                    &format!("/scoped-encoder/docs/{freeable}/{published}.ts"),
+                    &docs,
+                    freeable,
+                    published,
+                    Some(64),
+                );
+            }
+        }
+        let deep = format!(
+            "export const deep = {}1;\n/** doc */\nexport const mixed = {}a;\n",
+            "1 + ".repeat(1_000),
+            "a && b || c ?? ".repeat(100)
+        );
+        for freeable in [false, true] {
+            for published in [false, true] {
+                assert_cold_encoding(
+                    &format!("/scoped-encoder/deep/{freeable}/{published}.ts"),
+                    &deep,
+                    freeable,
+                    published,
+                    Some(1),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encoding_a_frozen_store_keeps_collateral_stores_unpublished() {
+        for freeable in [false, true] {
+            let file = parse_encoding_file(
+                "/scoped-encoder/target.ts",
+                "/** @param {number} x */\nexport function f(x: number) { return x; }",
+                freeable,
+            );
+            let collateral = parse_encoding_file(
+                "/scoped-encoder/collateral.ts",
+                "export const untouched = 1;",
+                freeable,
+            );
+            let pending = crate::ast::store::unpublished_file_ids();
+            let header = crate::ast::store::try_store_header(collateral.root);
+            let text = crate::ast::store::file_store_text(collateral.store);
+            let (collateral_bytes, collateral_table) = encode_visitor_tree(&collateral);
+            let (bytes, table) = encode_tree(file.root, file.root, Some(&file)).expect("encode");
+            assert_eq!(crate::ast::store::unpublished_file_ids(), pending);
+            assert!(!crate::ast::store::is_published(file.store));
+            assert!(!crate::ast::store::is_published(collateral.store));
+            assert_eq!(crate::ast::store::try_store_header(collateral.root), header);
+            assert_eq!(
+                &*crate::ast::store::file_store_text(collateral.store),
+                &*text
+            );
+            let (after_bytes, after_table) = encode_visitor_tree(&collateral);
+            assert_eq!(collateral_bytes, after_bytes);
+            assert_eq!(collateral_table.nodes, after_table.nodes);
+            let (visitor_bytes, visitor_table) = encode_visitor_tree(&file);
+            assert_eq!(visitor_bytes, bytes);
+            assert_eq!(visitor_table.nodes, table.nodes);
+            let shape = table_shape(&table);
+            let ordinary: Vec<Node> = table
+                .nodes
+                .iter()
+                .map(|&node| {
+                    if is_synthetic_node(node) {
+                        Node::NIL
+                    } else {
+                        node
+                    }
+                })
+                .collect();
+            crate::program::note_parsed_source_file(&file);
+            crate::program::note_parsed_source_file(&collateral);
+            crate::program::publish_parsed_files("/");
+            let (published_bytes, published_table) =
+                encode_tree(file.root, file.root, Some(&file)).expect("encode published");
+            assert_eq!(bytes, published_bytes);
+            assert_eq!(shape, table_shape(&published_table));
+            let published_ordinary: Vec<Node> = published_table
+                .nodes
+                .iter()
+                .map(|&node| {
+                    if is_synthetic_node(node) {
+                        Node::NIL
+                    } else {
+                        node
+                    }
+                })
+                .collect();
+            assert_eq!(ordinary, published_ordinary);
+            let (visitor_bytes, visitor_table) = encode_visitor_tree(&file);
+            assert_eq!(published_bytes, visitor_bytes);
+            assert_eq!(published_table.nodes, visitor_table.nodes);
+            assert_eq!(
+                published_table.nodes,
+                build_node_index_table(file.root).nodes
+            );
+            drop(file);
+            drop(collateral);
+            crate::ast::release_file_version_pins();
+        }
+    }
+
+    #[test]
+    fn scoped_lists_resolve_foreign_aliases_and_preserve_nil_and_empty_fields() {
+        use crate::ast::NodeFactory;
+        for freeable in [false, true] {
+            let _scope = freeable.then(crate::ast::store::enter_owned_parse);
+            let file = crate::ast::store::new_file_store("/scoped-encoder/aliases.ts", "");
+            let factory = NodeFactory::for_file(file);
+            let foreign = NodeFactory::new().new_identifier("foreign");
+            let syntax_list = factory.new_syntax_list(&[foreign]);
+            let list =
+                factory.new_node_list_with_loc(&[foreign, syntax_list], TextRange::new(0, 1));
+            let array = factory.new_array_literal_expression(list, false);
+            let nil = factory.new_variable_statement(
+                ModifierList::NIL,
+                factory.new_variable_declaration_list(NodeList::NIL, NodeFlags::NONE),
+            );
+            let empty = factory.new_variable_statement(
+                factory.new_modifier_list(&[]),
+                factory.new_variable_declaration_list(factory.new_node_list(&[]), NodeFlags::NONE),
+            );
+            let root = factory.new_block(factory.new_node_list(&[array, nil, empty]), false);
+            crate::ast::store::freeze_file_store(file);
+            let version = freeable.then(|| FileVersion::new(file));
+            assert!(ScopedFileNodeReader::of(file).is_some());
+            let (bytes, table) = encode_node(root, Node::NIL).expect("encode aliases");
+            let previous = VISITOR_ONLY.with(|v| v.replace(true));
+            let control = encode_node(root, Node::NIL);
+            VISITOR_ONLY.with(|v| v.set(previous));
+            let (control_bytes, control_table) = control.expect("visitor aliases");
+            assert_eq!(bytes, control_bytes);
+            assert_eq!(table.nodes, control_table.nodes);
+            assert!(table.nodes.contains(&foreign));
+            crate::program::publish_parsed_files("/");
+            let (published_bytes, published_table) =
+                encode_node(root, Node::NIL).expect("published aliases");
+            assert_eq!(bytes, published_bytes);
+            assert_eq!(table.nodes, published_table.nodes);
+            drop(version);
+            crate::ast::release_file_version_pins();
+        }
     }
 
     #[test]
@@ -2376,6 +2716,13 @@ module.exports.z = "z";
                     assert_same_encoding(&format!("/apiperf2/c{count}/static{name}"), &text, false);
                 }
                 assert_same_encoding(&format!("/apiperf2/c{count}/freeable{name}"), &text, true);
+                assert_cold_encoding(
+                    &format!("/apiperf2/c{count}/unpublished{name}"),
+                    &text,
+                    true,
+                    false,
+                    None,
+                );
             }
         }
         eprintln!("compared {count} corpus files");

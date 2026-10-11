@@ -527,6 +527,55 @@ and WASM gates below. No such production change is implemented at this checkpoin
    `BindingElement` where classic expects `OmittedExpression`. Four direct failures require
    `getAnyAsyncIterableType`, `getNullableType` and `writeTypePredicate`. No recovery is yet claimed.
 
+#### u11 scoped unpublished reader — verification in progress
+
+Status: **Approved; candidate implemented, acceptance pending.** Evidence is retained under
+`/work/tmp/tsrust-ls-probes/u11-unpublished`. The production reader resolves a frozen unpublished
+store once and confines each header/data read to a short borrow. Queued unpublished lists own
+handles and range values; lazy JSDoc runs after those borrows end. Published files retain their
+pinned reader/list fast path. No parse is bound or published early.
+
+The final focused source manifest is `focused-retry4/source-before.sha256`: encoder SHA-256
+`29646d633c3fda743168c549bcf5fac037ecafb2f9c4b4e30fe5240a224f3ed5`, store SHA-256
+`54c48b233450b8cea773d8fb78363f5154b5e0f235a317e2fe29e107603a48e2`. The focused encoder run
+passed **7/7**. Independent cold controls cover static/freeable × unpublished/published sources,
+64 genuinely lazy documented functions, deep chains, aliases and nil/empty list fields.
+Cross-publication comparisons preserve full payload bytes, table shapes and ordinary node identity;
+same-state comparisons preserve exact handles. A nested host-callback registry control is included.
+The separate reader guard passed 1/1; the optional encoding test compared all 64 inventoried,
+unchanged compiler fixtures through published static/freeable and unpublished freeable controls.
+
+Keep all attempts: the first compile failed on a test-only `NodeSlice` iterator call; retry2
+revealed invalid assertions about eagerly parsed `@see`/`@link` and synthetic JSDoc identity
+across publication; retry3 caught a test-only nonexistent `NodeSlice::is_nil` accessor. Retry4
+corrects the controls without changing production code or existing expectations. The independent
+reviewer confirmed the corrected cache/identity contracts. Final evidence-bound review is pending.
+
+Both unchanged snapshot generators passed 1/1; live parse/bind checks passed 2/2. Parse blob
+sections changed only their eight-byte source keys; bind regeneration was byte-identical.
+`focused-retry4/blob-delta.json` records the hashes and section comparisons.
+Fresh fourteen-binary local comparison, fresh
+WASM, full occurrence-qualified classic roster, runtime, source/packed browser matrices and original
+emit equality/completeness gates are **UNRUN** for this candidate. Baseline remains 7,482/7,853;
+no recovery or speedup is claimed. Formal R188 and its unavailable wider protected evidence remain
+**UNRUN** locally and are separate from these fork checks. All seven original-JavaScript boundary
+routes remain **STOP**.
+
+Timing is blocked by host load around 20, above the required 2. Do not disturb other workloads or
+accept overlapping timings. After correctness gates, obtain six fresh processes per arm on a quiet
+host, re-profile edits, repair the next demonstrated edit cause, then continue the completion unit.
+
+Read-only completion investigation identifies two separate costs for the next verified unit:
+`NodeIndexTable::get_index` lazily sorts indices using repeated global `get_node_id` map access.
+The workload edits before each completion, so this cold sort repeats per source version. Consider
+sorting/searching the existing full `Node` handle while preserving slots, nil/missing behavior,
+duplicates and per-source ownership; do not change global node IDs. Prove every lookup against the
+old result and retain old versions across edits before measuring. Of 303 exclusive diagnostic
+`wrap` samples, 257 follow token navigation through `classicChildren`, 18 follow semicolon detection,
+and six follow checker declaration decoding. A separate token-position optimization must retain
+public child-array semantics. Eager symbol loads are per newly interned object; disabling eager
+loads alone has no demonstrated saving and must not be presented as a repair.
+
 ## Native regression repair after r35
 
 Source `8523cc943d120e31b43a7f2e6879d2e9d3df333b` repairs the protected-test losses

@@ -1880,6 +1880,47 @@ impl<'a> FileNodeReader<'a> {
     }
 }
 
+/// Encoder-local reader of a completed store that has not been published.
+/// Each read ends before lazy JSDoc can write the store. Do not retain this
+/// reader across publication: publication makes its cell reusable.
+pub(crate) struct ScopedFileNodeReader {
+    file: usize,
+    store: StoreCell,
+}
+
+impl ScopedFileNodeReader {
+    /// Resolves the thread's store cell once, accepting only frozen stores.
+    #[must_use]
+    pub(crate) fn of(file: usize) -> Option<Self> {
+        if is_published(file) {
+            return None;
+        }
+        let store = unpublished_store(file)?;
+        if !store.borrow().frozen {
+            return None;
+        }
+        Some(Self { file, store })
+    }
+
+    #[inline]
+    pub(crate) fn header(&self, node: Node) -> (SyntaxKind, TextRange, NodeFlags) {
+        debug_assert_eq!(node.file_index(), self.file);
+        let store = self.store.borrow();
+        let index = slot_index(node);
+        let record = &store.records[index];
+        (store.kinds[index], record.loc(), record.flags())
+    }
+
+    /// The result is independent of the borrow's lifetime, so no node or
+    /// list data can escape. The encoder performs no host callbacks here.
+    #[inline]
+    pub(crate) fn with_data<R>(&self, node: Node, read: impl FnOnce(&NodeData) -> R) -> R {
+        debug_assert_eq!(node.file_index(), self.file);
+        let store = self.store.borrow();
+        read(store.slot_ast_node(slot_index(node)))
+    }
+}
+
 /// The handle of slot `index` in store `file`. Does not resolve aliases.
 const fn handle(file: usize, index: u32) -> Node {
     Node(((file as u64) << 32) | (index as u64 + 1))
@@ -6384,6 +6425,29 @@ pub fn is_nil_list_range(range: &crate::astdata::text::TextRange) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_file_reader_rejects_unfinished_and_published_stores() {
+        for owned in [false, true] {
+            let _scope = owned.then(enter_owned_parse);
+            let file = new_file_store("/scoped-reader.ts", "x");
+            let node = NodeFactory::for_file(file).new_identifier("x");
+            assert!(ScopedFileNodeReader::of(file).is_none());
+            set_node_loc(node, TextRange::new(0, 1));
+            freeze_file_store(file);
+            let version = owned.then(|| super::super::FileVersion::new(file));
+            {
+                let reader = ScopedFileNodeReader::of(file).expect("a frozen unpublished store");
+                assert_eq!(reader.header(node), (node.kind(), node.loc(), node.flags()));
+                assert!(reader.with_data(node, |data| matches!(data, NodeData::Identifier(_))));
+            }
+            crate::program::publish_parsed_files("/");
+            assert!(ScopedFileNodeReader::of(file).is_none());
+            assert!(FileNodes::of(file).is_some());
+            drop(version);
+            super::super::release_file_version_pins();
+        }
+    }
 
     #[test]
     fn parser_factory_writes_into_the_file_store() {

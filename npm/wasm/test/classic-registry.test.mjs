@@ -6,6 +6,7 @@ import { createHostServiceChannel } from "../classic-host.js";
 import { createProgramGraph } from "../classic-program.js";
 import { createDocumentRegistry, createLanguageServiceSourceFile } from "../classic-registry.js";
 import { ScriptSnapshot } from "../classic-utilities.js";
+import { nodeLease, unwrapNode } from "../classic-ast.js";
 
 const settings = { noLib: true, strict: true };
 const args = (_, names) => ["--noLib", "--strict"].concat(names);
@@ -157,6 +158,45 @@ test("a registry wrapper can serve a source file another registry parsed, as the
         const declaration = cached.statements[0].declarationList.declarations[0];
         assert.equal(program.getTypeChecker().getSymbolAtLocation(declaration.name).getDeclarations()[0], declaration);
     } finally { service.dispose(); }
+});
+
+test("a nested host parse keeps its encoding and lazy JSDoc across outer publication", async () => {
+    const module = await loadModule();
+    useCompiledModule(module);
+    const target = project(files);
+    const snapshot = target.host.getScriptSnapshot;
+    let nested;
+    let bytes;
+    target.host.getScriptSnapshot = path => {
+        if (path === "/b.ts" && !nested) {
+            nested = createLanguageServiceSourceFile("/nested.ts", ScriptSnapshot.fromString(
+                "/** First declaration. */ export const first = 1;\n/** Second declaration. */ export const second = 2;",
+            ), 99, "1", true, 3);
+            const raw = unwrapNode(nested);
+            bytes = new Uint8Array(raw.view.buffer, raw.view.byteOffset, raw.view.byteLength).slice();
+            assert.equal(nested.statements[0].jsDoc[0].comment, "First declaration.");
+            assert.equal(nested.statements[1].jsDoc[0].comment, "Second declaration.");
+        }
+        return snapshot(path);
+    };
+    const service = createHostServiceChannel(module, target.host, args);
+    try {
+        const program = programOf(service);
+        assert.ok(nested, "the outer program invoked the nested parse");
+        assert.equal(program.getSourceFile("/b.ts").text, files["/b.ts"]);
+        assert.deepEqual(diagnosticCodes(service), []);
+        const lease = nodeLease(nested);
+        assert.deepEqual(lease.instance.source(lease.source).data, bytes);
+        assert.equal(nested.statements[0].jsDoc[0].parent, nested.statements[0]);
+        assert.equal(nested.statements[1].jsDoc[0].parent, nested.statements[1]);
+        edit(target, "/a.ts", files["/a.ts"] + "\nexport const later = result;");
+        const edited = programOf(service).getSourceFile("/a.ts");
+        assert.notEqual(edited, program.getSourceFile("/a.ts"));
+        assert.equal(edited.text, target.text.get("/a.ts"));
+        assert.deepEqual(lease.instance.source(lease.source).data, bytes);
+    } finally {
+        service.dispose();
+    }
 });
 
 test("registry documents follow classic acquire, update and release", async () => {

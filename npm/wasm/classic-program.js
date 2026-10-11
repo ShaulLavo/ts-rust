@@ -201,6 +201,13 @@ export function createProgramGraph(channel, handle, settings = {}) {
         typesPackageExists: packageName => getPackagesMap().has(classicNamespace().getTypesPackageName(packageName)),
         packageBundlesTypes: packageName => !!getPackagesMap().get(packageName),
         getCommonSourceDirectory: () => facts().commonSourceDirectory,
+        getFileIncludeReasons() {
+            if (lease.includeReasons) return lease.includeReasons;
+            const reasons = classicNamespace().createMultiMap();
+            for (const [path, values] of graph("getFileIncludeReasons")) reasons.set(path, values);
+            return lease.includeReasons = reasons;
+        },
+        getModeForResolutionAtIndex: (file, index) => graph("getModeForResolutionAtIndex", { fileName: file.fileName, index }) ?? undefined,
         get usesUriStyleNodeCoreModules() { return facts().usesUriStyleNodeCoreModules ?? undefined; },
         get redirectTargetsMap() {
             if (lease.redirectTargets) return lease.redirectTargets;

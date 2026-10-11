@@ -171,8 +171,20 @@ export function createTypeChecker(lease, resolveNode) {
             getName: () => symbolName(object),
             getEscapedName: () => object.escapedName,
             getDeclarations: () => object.declarations,
+            // Classic `SymbolTable`s, read once: a Map from escaped name to symbol.
+            get members() { return symbolTable(object, false); },
+            get exports() { return symbolTable(object, true); },
             ...symbolDocumentationMembers(object),
         }), origin, true);
+    }
+
+    const symbolTables = new WeakMap();
+    function symbolTable(object, exports) {
+        if (!(exports ? object.hasExports : object.hasMembers)) return undefined;
+        let tables = symbolTables.get(object);
+        if (!tables) symbolTables.set(object, tables = {});
+        const key = exports ? "exports" : "members";
+        return tables[key] ??= new Map(query("getSymbolTable", { symbol: handle(object, "symbol"), exports, origin: objectHandles.get(object)?.origin }));
     }
 
     function signature(id, origin) {

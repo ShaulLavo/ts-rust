@@ -105,6 +105,23 @@ impl Graphs {
             "getSourceFile" => Self::source_file(&owner, &request["fileName"]),
             "getResolutions" => Ok(crate::classic_resolutions::resolutions(program)),
             "getProgramFacts" => Ok(program_facts(program)),
+            "getFileIncludeReasons" => Ok(file_include_reasons(program)),
+            "getModeForResolutionAtIndex" => {
+                let name = request["fileName"]
+                    .as_str()
+                    .ok_or("fileName must be a string")?;
+                let file = program
+                    .get_source_file(name)
+                    .ok_or("file is not part of the program")?;
+                let index = request["index"].as_u64().ok_or("index is required")?;
+                let index = usize::try_from(index).map_err(|error| error.to_string())?;
+                let mode = program.get_mode_for_resolution_at_index(file.root, index);
+                Ok(if mode.0 == 0 {
+                    Value::Null
+                } else {
+                    json!(mode.0)
+                })
+            }
             "getSyntacticDiagnostics"
             | "getSemanticDiagnostics"
             | "getSuggestionDiagnostics"
@@ -223,6 +240,50 @@ impl Graphs {
         result["externalLibrary"] = json!(program.is_source_file_from_external_library(&file));
         Ok(result)
     }
+}
+
+/// Classic `getFileIncludeReasons`: each file's reasons as classic `FileIncludeReason`s, with
+/// classic's `FileIncludeKind` numbers.
+fn file_include_reasons(program: &NewProgram) -> Value {
+    use ts_goport::frontend::compiler::{FileIncludeData, FileIncludeKind};
+    let reasons = program.get_include_reasons();
+    let mut paths = reasons.keys().collect::<Vec<_>>();
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    let entries = paths
+        .into_iter()
+        .map(|path| {
+            let values = reasons[path]
+                .iter()
+                .filter_map(|reason| {
+                    let kind = match reason.kind {
+                        FileIncludeKind::IMPORT => 3,
+                        FileIncludeKind::REFERENCE_FILE => 4,
+                        FileIncludeKind::TYPE_REFERENCE_DIRECTIVE => 5,
+                        FileIncludeKind::LIB_REFERENCE_DIRECTIVE => 7,
+                        FileIncludeKind::ROOT_FILE => 0,
+                        FileIncludeKind::LIB_FILE => 6,
+                        FileIncludeKind::AUTOMATIC_TYPE_DIRECTIVE_FILE => 8,
+                        _ => return None,
+                    };
+                    let mut value = json!({"kind": kind});
+                    match &reason.data {
+                        FileIncludeData::Index(index) => value["index"] = json!(index),
+                        FileIncludeData::ReferencedFile(data) => {
+                            value["file"] = json!(data.file.0);
+                            value["index"] = json!(data.index);
+                        }
+                        FileIncludeData::AutomaticTypeDirectiveFile(data) => {
+                            value["typeReference"] = json!(data.type_reference);
+                        }
+                        _ => {}
+                    }
+                    Some(value)
+                })
+                .collect::<Vec<_>>();
+            json!([path.0, values])
+        })
+        .collect::<Vec<_>>();
+    Value::Array(entries)
 }
 
 /// Program-wide values classic keeps on its program object.

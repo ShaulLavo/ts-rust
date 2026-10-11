@@ -10,7 +10,8 @@ use ts_goport::binder::go_symbol_name;
 use ts_goport::checker::{Checker, InternalNodeBuilderFlags, LiteralValue, NodeBuilderFlags};
 use ts_goport::core::{IndexInfoId, Node, SignatureId, SymbolId, TypeId, TypePredicateId};
 use ts_goport::flags::{
-    ContextFlags, SignatureKind, SymbolFlags, TypeFlags, TypePredicateKind, UnionReduction,
+    CheckFlags, ContextFlags, SignatureKind, SymbolFlags, TypeFlags, TypePredicateKind,
+    UnionReduction,
 };
 use ts_goport::frontend::compiler::NewProgram;
 use ts_goport::gostd::Context;
@@ -74,6 +75,31 @@ impl ClassicChecker {
             "getRootSymbols" => Ok(self.symbol_refs(&checker.get_root_symbols(symbol))),
             "getShorthandAssignmentValueSymbol" => {
                 Ok(self.symbol_ref(checker.get_shorthand_assignment_value_symbol(location)))
+            }
+            // A symbol's `members` or `exports` table as classic `SymbolTable` entries.
+            "getSymbolTable" => {
+                let data = checker.sym(symbol);
+                let table = if request["exports"].as_bool() == Some(true) {
+                    data.exports
+                } else {
+                    data.members
+                };
+                if table.is_nil() {
+                    return Ok(Value::Null);
+                }
+                Ok(Value::Array(
+                    checker
+                        .symbols
+                        .entries(table)
+                        .into_iter()
+                        .map(|(name, member)| {
+                            json!([
+                                crate::classic_strings::string_value(&escape_symbol_name(&name)),
+                                self.symbol_ref(member)
+                            ])
+                        })
+                        .collect(),
+                ))
             }
             "getExportsOfModule" => {
                 Ok(self.symbol_refs(&checker.get_exports_of_module_exported(symbol)))
@@ -183,34 +209,35 @@ impl ClassicChecker {
             "getExportSymbolOfSymbol" => {
                 Ok(self.symbol_ref(checker.get_export_symbol_of_symbol(symbol)))
             }
-            "getPropertySymbolOfDestructuringAssignment" => Ok(self.symbol_ref(
-                checker.get_property_symbol_of_destructuring_assignment(location),
-            )),
+            "getPropertySymbolOfDestructuringAssignment" => {
+                Ok(self
+                    .symbol_ref(checker.get_property_symbol_of_destructuring_assignment(location)))
+            }
             "getTypeOfAssignmentPattern" => {
                 Ok(self.type_ref(checker.get_type_of_assignment_pattern(location)))
             }
-            "getSuggestedSymbolForNonexistentSymbol" => {
-                Ok(self.symbol_ref(checker.get_suggested_symbol_for_nonexistent_symbol(
+            "getSuggestedSymbolForNonexistentSymbol" => Ok(self.symbol_ref(
+                checker.get_suggested_symbol_for_nonexistent_symbol(
                     location,
                     string(request, "name")?,
                     symbol_flags(request)?,
-                )))
-            }
-            "getSuggestedSymbolForNonexistentModule" => Ok(self.symbol_ref(
-                checker.get_suggested_symbol_for_nonexistent_module(location, symbol),
+                ),
             )),
+            "getSuggestedSymbolForNonexistentModule" => Ok(self
+                .symbol_ref(checker.get_suggested_symbol_for_nonexistent_module(location, symbol))),
             "isTypeParameterPossiblyReferenced" => Ok(json!(
                 checker.is_type_parameter_possibly_referenced(t, location)
             )),
-            "getResolvedSymbol" => Ok(self.symbol_ref(checker.get_resolved_symbol_exported(location))),
-            "getTypeOnlyAliasDeclaration" => {
-                Ok(node_ref(checker.get_type_only_alias_declaration_exported(symbol)))
+            "getResolvedSymbol" => {
+                Ok(self.symbol_ref(checker.get_resolved_symbol_exported(location)))
             }
+            "getTypeOnlyAliasDeclaration" => Ok(node_ref(
+                checker.get_type_only_alias_declaration_exported(symbol),
+            )),
             "getSymbolFlags" => Ok(json!(checker.get_symbol_flags_exported(symbol).0)),
             "getLocalTypeParametersOfClassOrInterfaceOrTypeAlias" => Ok(self.type_refs(
-                &checker.get_local_type_parameters_of_class_or_interface_or_type_alias_exported(
-                    symbol,
-                ),
+                &checker
+                    .get_local_type_parameters_of_class_or_interface_or_type_alias_exported(symbol),
             )),
             "tryGetMemberInModuleExports" => Ok(self.symbol_ref(
                 checker.try_get_member_in_module_exports(string(request, "name")?, symbol),
@@ -441,9 +468,9 @@ impl ClassicChecker {
             "getNonOptionalType" => Ok(self.type_ref(checker.get_non_optional_type(t))),
             "isNullableType" => Ok(json!(checker.is_nullable_type(t))),
             "getWidenedType" => Ok(self.type_ref(checker.get_widened_type(t))),
-            "typeHasCallOrConstructSignatures" => {
-                Ok(json!(checker.type_has_call_or_construct_signatures_exported(t)))
-            }
+            "typeHasCallOrConstructSignatures" => Ok(json!(
+                checker.type_has_call_or_construct_signatures_exported(t)
+            )),
             "getAllPossiblePropertiesOfTypes" => {
                 let types = self.handles(request, "types", &self.types)?;
                 Ok(self.symbol_refs(&checker.get_all_possible_properties_of_types(&types)))
@@ -799,7 +826,16 @@ impl ClassicChecker {
             return Value::Null;
         }
         let data = checker.sym(symbol);
-        json!({"id": symbol.0, "flags": data.flags.0, "escapedName": crate::classic_strings::string_value(&escape_symbol_name(&go_symbol_name(&checker.symbols, symbol))),
+        let mut links = Value::Null;
+        if data.flags.intersects(SymbolFlags::TRANSIENT) {
+            let target = checker
+                .value_symbol_links
+                .try_get_by_id(&checker.symbols, symbol)
+                .map_or(SymbolId::NIL, |links| links.target);
+            links = json!({"checkFlags": classic_check_flags(data.check_flags), "target": self.symbol_ref(target)});
+        }
+        json!({"id": symbol.0, "flags": data.flags.0, "links": links,
+            "hasMembers": data.members.is_some(), "hasExports": data.exports.is_some(), "escapedName": crate::classic_strings::string_value(&escape_symbol_name(&go_symbol_name(&checker.symbols, symbol))),
             "declarations": data.declarations.iter().copied().map(node_ref).collect::<Vec<_>>(), "valueDeclaration": node_ref(data.value_declaration),
             "parent": self.symbol_ref(data.parent), "exportSymbol": self.symbol_ref(data.export_symbol)})
     }
@@ -860,6 +896,37 @@ fn signature_kind(request: &Value) -> Result<SignatureKind, String> {
         1 => Ok(SignatureKind::CONSTRUCT),
         _ => Err("signature kind must be Call or Construct".into()),
     }
+}
+
+/// Classic `CheckFlags` for the port's: the same flags by name; the port's own flags
+/// (write containment, discriminant caching, index symbols) have no classic bit.
+fn classic_check_flags(flags: CheckFlags) -> u32 {
+    const BITS: [(CheckFlags, u32); 21] = [
+        (CheckFlags::INSTANTIATED, 1 << 0),
+        (CheckFlags::SYNTHETIC_PROPERTY, 1 << 1),
+        (CheckFlags::SYNTHETIC_METHOD, 1 << 2),
+        (CheckFlags::READONLY, 1 << 3),
+        (CheckFlags::READ_PARTIAL, 1 << 4),
+        (CheckFlags::WRITE_PARTIAL, 1 << 5),
+        (CheckFlags::HAS_NON_UNIFORM_TYPE, 1 << 6),
+        (CheckFlags::HAS_LITERAL_TYPE, 1 << 7),
+        (CheckFlags::CONTAINS_PUBLIC, 1 << 8),
+        (CheckFlags::CONTAINS_PROTECTED, 1 << 9),
+        (CheckFlags::CONTAINS_PRIVATE, 1 << 10),
+        (CheckFlags::CONTAINS_STATIC, 1 << 11),
+        (CheckFlags::LATE, 1 << 12),
+        (CheckFlags::REVERSE_MAPPED, 1 << 13),
+        (CheckFlags::OPTIONAL_PARAMETER, 1 << 14),
+        (CheckFlags::REST_PARAMETER, 1 << 15),
+        (CheckFlags::DEFERRED_TYPE, 1 << 16),
+        (CheckFlags::HAS_NEVER_TYPE, 1 << 17),
+        (CheckFlags::MAPPED, 1 << 18),
+        (CheckFlags::STRIP_OPTIONAL, 1 << 19),
+        (CheckFlags::UNRESOLVED, 1 << 20),
+    ];
+    BITS.iter()
+        .filter(|(bit, _)| flags.intersects(*bit))
+        .fold(0, |result, (_, classic)| result | classic)
 }
 
 /// Classic `isImplementationOfOverload`: a function-like declaration with a body whose symbol

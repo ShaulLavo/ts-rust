@@ -149,6 +149,35 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Symbols, nodes and formatting objects (unit 4, third batch)
+
+Injected run: **6,546 of 7,853** (fourslash 5,058, services 1,488), none lost against the
+previous batch (`r10` to `r14` in `/work/tmp/tsrust-ls-probes/u3/`, WASM 82d1925a6e2a6381, peak
+RSS 2.8 GiB).
+
+- Parsed nodes answer `symbol` and `localSymbol` with the binder's symbols, interned by the
+  checker of the program that last returned the node's file. Tokens that `getChildren` makes
+  reach the checker as the file's token cache entries (Go `GetOrCreateToken`).
+- Source files have `identifiers` (Go's collected names) and `getNamedDeclarations` (ported).
+- Symbols have classic `members` and `exports` tables (Maps by escaped name, read once) and,
+  for transient symbols, `links` with classic `checkFlags` (translated by name) and `target`.
+- Node position methods (`getStart`, `getEnd`, `getText`, ...) are classic NodeObject's over the
+  node's own `pos` and `end`; an object derived with `Object.create(node)` gets its own
+  properties, so textChanges' position-assigned copies format correctly.
+- Program: `getFileIncludeReasons` (classic kinds) and `getModeForResolutionAtIndex`.
+- Checker: module export walks, export symbols, destructuring members, symbol suggestions,
+  predicates, accessibility chains, contextual types, constant values, literal types, and the
+  rest listed in the commits of this batch.
+
+Deviations: a symbol's binder identity is per checker (a symbol from another program's checker is
+another object); `identifiers` holds every literal text as Go collects them (classic interns only
+property-name literals); `links` carries only `checkFlags` and `target`.
+
+Next by failing count (`r14`): per-case undefined reads (117), `getModuleResolutionCache` (104),
+`Could not find source file` (75), quick info text (51), range text (48), unbacked nodes (42),
+`program.emit` (36, unit 5), types of another checker (36), `createSymbol`,
+`getIndexInfosAtLocation`, `getSymbolOfExpando`, `getParameterIdentifierInfoAtPosition`.
+
 ## Node builder, display parts and program host members (unit 4, second batch)
 
 Injected run: **3,685 of 7,853** (fourslash 2,460, services 1,225), none lost against the

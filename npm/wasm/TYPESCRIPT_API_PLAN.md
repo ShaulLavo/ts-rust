@@ -405,7 +405,9 @@ not claimed recoveries or new exclusions.
 
 The verified u9 unit was published fast-forward to the fork as
 `1b65f8c1cabea895ad3250aba207bfb616e2efc7`; the remote tip was checked.
-The next runtime unit changes only `classic_sources.rs`, `classic_graph.rs` and
+The descriptor unit was published fast-forward as
+`fdf9d34879d9b120412c0c6a70e57f247902861f`; the remote tip was checked.
+This runtime unit changes only `classic_sources.rs`, `classic_graph.rs` and
 `classic-source-files.js` in production. Program source requests retain the same lease and
 return its ID, filename and per-program library flags without encoding the tree. Materialization
 first checks the instance/source lease cache; a live file returns immediately. A genuine miss
@@ -469,6 +471,38 @@ observed and transitive closure unproved. Dependency checks still report no unre
 missing packed files or browser Node imports.
 
 #### Approved continuation after u10
+
+Context-limited checkpoint: u9 and u10 are source-reviewed, regression-audited and pushed.
+Units for the remaining edit repair, completion repair, boundary closure and 371 failure
+recoveries are still open. No background build or reviewer remains pending at this checkpoint.
+
+The edit-cost observation now has a known-good control in the same diagnostic directory:
+`publication-control.mjs`, `.json`, `.cpuprofile` and `publication-control-phases.json`.
+It encodes the identical source lease thirty times before and thirty times after `getProgram`;
+source identity, fixture hash and the 500,760-byte payload length agree. Before publication,
+1,098 phase samples include 1,048 `encode_tree`, 392 `get_node_data` and 352 `collect_children`;
+after publication, 230 include 194, 5 and 25 respectively, with 15 `push_store_children`.
+These are diagnostic stack observations, not accepted timing measurements or a speedup claim.
+
+Independent bounded design review identifies why the existing fast path misses standalone
+classic parses: `parse_document` acquires an unpublished store and immediately encodes it,
+while `FileNodes::of` supplies only published stores. Do not substitute `acquire_bound`: it
+also binds and changes binder timing. Do not call `publish_parsed_files` before encoding:
+it drains every pending store on the thread, including collateral stores, and classic parsing
+can be nested inside a program host callback. A standalone parse also has no host publication
+cwd/case-sensitivity contract. Keep the current publication and retention boundaries.
+
+The next implementation should add an encoder reader for completed frozen unpublished stores,
+resolving the store cell once and using short scoped reads for headers, ordinary node data and
+child/list metadata. No borrowed node data or store-list reference may escape into the task
+stack. Finish each store borrow before `node.js_doc`: lazy JSDoc writes the same store.
+Reuse the existing data-word and child-field logic, retaining visitor handling for JSDoc,
+`SyntaxList` and nodes outside that store. Do not eagerly parse JSDoc, bind during parsing,
+clone the whole tree or redesign AST ownership. Compare exact payload bytes and node indices
+against the existing visitor for static/freeable, unpublished/published, lazy-JSDoc and nested
+host-callback cases. This necessarily changes shared `ts_goport` support and therefore needs
+fresh native fourteen-binary zero-loss evidence before publication, in addition to all classic
+and WASM gates below. No such production change is implemented at this checkpoint.
 
 1. Finish the end-to-end edit-cost unit. The named diagnostic profile in
    `u10-descriptors/profile-debug` uses a different name-retaining WASM and overlaps correctness

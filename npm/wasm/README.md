@@ -51,10 +51,11 @@ const { exitCode, diagnostics, files } = await tsc(["-p", "/app"], {
 tsc's usual text.
 
 In a browser, call `tsc` from a module Web Worker, as `examples/browser` does, so that a run does not
-block the page. It also works on the page's main thread. Arithmetic and comma chains with 5,000
-operators, including unreachable arithmetic, are tested in Chromium and WebKit on both the main
-thread and module workers. Other deeply nested syntax and recursive expression shapes can still
-exhaust the stack.
+block the page. It also works on the page's main thread. Type checking (`--noEmit`) of arithmetic
+and comma chains with 5,000 operators, including unreachable code, is tested in Chromium and
+WebKit on the main thread and in module workers. Emit and other deeply nested syntax still recurse
+and can exhaust the stack. For example, emitting a 2,500-operator arithmetic chain overflowed
+Node 26's main-thread stack in this build.
 Serve `ts_rust.wasm` as `application/wasm`, so that it compiles while it downloads.
 To try the example, run `python3 -m http.server -d npm/wasm` and open
 `http://localhost:8000/examples/browser/`.
@@ -116,30 +117,14 @@ Repeated reads share the current program. Auto-import completions and completion
 resolution need additional host integration. Invalid circular `extends` chains use a native error-path
 parser that retains configuration allocations until the service is disposed.
 
-The position converters keep one line map per file for the current program. File changes release
-those maps together with the program, so token, symbol and reference results use the current text.
-
-`dispose` releases the instance, and repeated disposal is safe. Rejected parameters leave the
-service usable. A WebAssembly trap ends that service; dispose it and create a new service.
-Each service and each `tsc` run has an independent instance, even when they share a compiled module.
-The `ts-rust-wasm/core` entry takes a compiled module as its first `createLanguageService` argument.
-
-After building the module, `npm test` runs the compiler controls and the persistent-service
-sequence. Serve `npm/wasm` and open `examples/language-service/` to run the same sequence in a
-browser worker, including compiler and DOM-library controls. The existing worker stack limits
-also apply to language-service requests.
-
-`node bench/language-service.mjs [wasm-source]` measures position-heavy requests on two synthetic
-file sizes, reporting result counts, request time and source-file reads. Compare the same fixtures
-and build profile on the same machine. The Node tests bound source reads independently of token
-and reference counts and verify that an edit refreshes positions.
+See [examples/language-service/](examples/language-service/) for a browser-worker example.
 
 ## How it works
 
 - `crates/ts_wasm` is the module: `tsc` and editor services from `ts_goport` for `wasm32-wasip1`.
-  The previous compiler-only module, built with the `wasm` cargo profile (opt-level z, fat LTO)
-  and wasm-opt, measured 4.2 MB (1.8 MB gzip, 1.5 MB brotli) with
-  Rust 1.98.1. Rust 1.93.0 makes it 2% bigger, with the same output. The libs are in it as one
+  The default build with Rust 1.98.1 is 6.21 MB (2.60 MB gzip, 2.07 MB brotli), including the
+  language service. The previous compiler-only module measured 4.2 MB (1.8 MB gzip, 1.5 MB
+  brotli). The libs are in it as one
   LZMA stream (0.31 MB), and the diagnostic message texts are packed too.
   `scripts/wasm/order-functions.mjs` puts similar functions next to each other, so gzip and
   brotli find more matches. `scripts/wasm/build.sh` tells how to build a module that checks 13

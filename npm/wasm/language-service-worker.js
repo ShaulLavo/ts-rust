@@ -6,7 +6,7 @@ function sendError(id, error) {
 }
 
 try {
-    const service = await createLanguageService(workerData.module, workerData.options);
+    const service = await createLanguageService(workerData.module, { ...workerData.options, jspi: false });
     parentPort.on("message", async ({ id, method, args }) => {
         try {
             const result = await service[method](...args);

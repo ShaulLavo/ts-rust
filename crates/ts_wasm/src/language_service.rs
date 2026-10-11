@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use ts_goport::api::proto::new_diagnostic_responses;
-use ts_goport::ast::{FileText, source_file_text};
+use ts_goport::ast::{FileText, source_file_file_name, source_file_text};
 use ts_goport::core::Diagnostic;
 use ts_goport::execute::tsc::{System, SystemParseConfigHost, new_os_system};
 use ts_goport::frontend::compiler::{self, ProgramOptions};
@@ -126,6 +126,8 @@ enum Method {
     SemanticTokensRange,
 }
 
+type LineMaps = Rc<RefCell<HashMap<String, Rc<lsconv::LSPLineMap>>>>;
+
 pub struct Service {
     cwd: String,
     args: Vec<String>,
@@ -133,6 +135,7 @@ pub struct Service {
     language: Option<ls::LanguageService>,
     previous_program: Option<Rc<compiler::NewProgram>>,
     parse_cache: Rc<ParseCache>,
+    line_maps: LineMaps,
 }
 
 impl Service {
@@ -169,10 +172,12 @@ impl Service {
             language: None,
             previous_program: None,
             parse_cache: project::new_parse_cache(project::RefCountCacheOptions::default()),
+            line_maps: Rc::default(),
         })
     }
 
     fn invalidate(&mut self) {
+        self.line_maps.borrow_mut().clear();
         let Some(language) = self.language.take() else {
             return;
         };
@@ -184,7 +189,12 @@ impl Service {
 
     fn language(&mut self) -> Result<&ls::LanguageService, ServiceError> {
         if self.language.is_none() {
-            self.language = Some(build_language(&self.cwd, &self.args, &self.parse_cache)?);
+            self.language = Some(build_language(
+                &self.cwd,
+                &self.args,
+                &self.parse_cache,
+                self.line_maps.clone(),
+            )?);
             if let Some(program) = self.previous_program.take() {
                 ls_program::release_program(&program);
             }
@@ -199,9 +209,10 @@ impl Service {
             .map_err(|_| ServiceError::MethodNotFound(method.into()))?;
         let mut params = params.clone();
         let context = self.context.clone();
+        let line_maps = self.line_maps.clone();
         let language = self.language()?;
         let _guard = language.enter_program();
-        normalize_document(language, &mut params)?;
+        normalize_document(language, &line_maps, &mut params)?;
         dispatch(language, &context, method, &params)
     }
 }
@@ -262,6 +273,7 @@ fn build_language(
     cwd: &str,
     args: &[String],
     cache: &Rc<ParseCache>,
+    line_maps: LineMaps,
 ) -> Result<ls::LanguageService, ServiceError> {
     let sys = new_os_system().map_err(|status| {
         ServiceError::Internal(format!("cannot initialize host: {}", status.code()))
@@ -292,7 +304,6 @@ fn build_language(
     );
     let fs = program.host().fs();
     let lines_fs = fs.clone();
-    let line_maps = RefCell::new(HashMap::<String, Rc<lsconv::LSPLineMap>>::new());
     let converters = lsconv::new_converters(lsproto::PositionEncodingKind::UTF16, move |name| {
         if let Some(lines) = line_maps.borrow().get(name).cloned() {
             return Some(lines);
@@ -404,6 +415,7 @@ impl ls::Host for LanguageHost {
 
 fn normalize_document(
     language: &ls::LanguageService,
+    line_maps: &LineMaps,
     params: &mut Value,
 ) -> Result<(), ServiceError> {
     let uri = params
@@ -420,7 +432,13 @@ fn normalize_document(
         return Err("document is not part of the program".into());
     }
     let text = source_file_text(file);
-    let lines = lsconv::compute_lsp_line_starts(&text);
+    let name = source_file_file_name(file);
+    let lines = line_maps.borrow().get(name).cloned();
+    let lines = lines.unwrap_or_else(|| {
+        let lines = lsconv::compute_lsp_line_starts(&text);
+        line_maps.borrow_mut().insert(name.into(), lines.clone());
+        lines
+    });
     if let Some(position) = params.get_mut("position") {
         normalize_position(&text, &lines, position)?;
     }

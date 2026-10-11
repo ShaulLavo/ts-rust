@@ -16,7 +16,7 @@ test("persistent language services update, navigate, isolate and dispose", async
 });
 
 test("Node service checks a deep expression without JSPI", async () => {
-    const text = `export const deep = ${"1 + ".repeat(5_000)}1;`;
+    const text = `export const deep = ${"(".repeat(5_000)}1${")".repeat(5_000)};`;
     const service = await createLanguageService({ args: ["--strict", "/deep.ts"], files: { "/deep.ts": text } });
     try {
         const result = await service.request("textDocument/diagnostic", { textDocument: { uri: "file:///deep.ts" } });
@@ -113,6 +113,12 @@ function rawService(module) {
     for (const entry of WebAssembly.Module.imports(module)) {
         imports[entry.module] ??= {};
         imports[entry.module][entry.name] = () => { throw new Error(`unexpected import during initialization: ${entry.module}.${entry.name}`); };
+        if (entry.module === "wasi_snapshot_preview1" && entry.name === "random_get") {
+            imports[entry.module][entry.name] = (ptr, length) => {
+                new Uint8Array(instance.exports.memory.buffer, ptr >>> 0, length >>> 0).fill(0);
+                return 0;
+            };
+        }
     }
     instance = new WebAssembly.Instance(module, imports);
     return text => {

@@ -330,7 +330,7 @@ export async function createLanguageService(module, options = {}) {
     const fs = memoryFileSystem(files);
     const run = prepareRun(module, { ...options, fs });
     let exports = run.attach(await WebAssembly.instantiate(module, run.imports));
-    let invoke = asyncWasmCall(exports.ts_service);
+    let invoke = asyncWasmCall(exports.ts_service, options.jspi);
     let queue = Promise.resolve();
     let disposal;
     let failure;
@@ -402,8 +402,8 @@ export async function createLanguageService(module, options = {}) {
     };
 }
 
-function asyncWasmCall(fn) {
-    const useJspi = typeof WebAssembly.promising === "function" && typeof document === "undefined";
+function asyncWasmCall(fn, jspi = true) {
+    const useJspi = jspi && typeof WebAssembly.promising === "function" && typeof document === "undefined";
     return useJspi ? WebAssembly.promising(fn) : fn;
 }
 

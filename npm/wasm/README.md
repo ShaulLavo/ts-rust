@@ -55,7 +55,8 @@ block the page. It also works on the page's main thread. Type checking (`--noEmi
 and comma chains with 5,000 operators, including unreachable code, is tested in Chromium and
 WebKit on the main thread and in module workers. Emit and other deeply nested syntax still recurse
 and can exhaust the stack. For example, emitting a 2,500-operator arithmetic chain overflowed
-Node 26's main-thread stack in this build.
+Node 26's main-thread stack in this build. Type checking 5,000-term logical or coalescing chains
+such as `&&` and `??` can also exhaust Node's calling-thread stack.
 Serve `ts_rust.wasm` as `application/wasm`, so that it compiles while it downloads.
 To try the example, run `python3 -m http.server -d npm/wasm` and open
 `http://localhost:8000/examples/browser/`.
@@ -144,7 +145,7 @@ See [examples/language-service/](examples/language-service/) for a browser-worke
 - `scripts/wasm/diff.mjs` compares the module with the native tsgo on Query core, Hono, the
   multiprog fixtures and more, and `scripts/wasm/corpus.mjs` on the TypeScript compiler test cases.
   Exit codes, output and emitted files are byte-identical.
-- The native `--lsp` service is available through `createLanguageService` above.
+- The native language service API is exposed through `createLanguageService` above.
 - Not supported: `--watch`, `--pprofDir`, `--api`, diagnostics as JSON with `--build`, and
   plugins or content mappers that start processes. `--locale` gives English: the module has no
   message catalogs, to keep it small. With `--generateTrace`, a panic in the trace's type display

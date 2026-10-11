@@ -37,6 +37,8 @@ impl Binder {
             && !is_logical_or_coalescing_assignment_operator(expression.operator)
     }
 
+    // Go: binder/binder.go:576 bind
+    // PORT: WASM uses explicit frames to preserve binding order on a small stack.
     pub(super) fn bind_binary_iteratively(&mut self, node: Node) {
         let mut work = vec![self.enter_binary_frame(node)];
         while let Some(frame) = work.last_mut() {
@@ -66,6 +68,8 @@ impl Binder {
         }
     }
 
+    // Go: binder/binder.go:1645 bindChildren
+    // PORT: Unreachable expressions keep the original child visits and flags.
     fn binary_initial_stage(&mut self, node: Node) -> Stage {
         if self.current_flow != self.unreachable_flow {
             return Stage::Left;
@@ -80,6 +84,8 @@ impl Binder {
         }
     }
 
+    // Go: binder/binder.go:2240 bindBinaryExpressionFlow
+    // PORT: Each frame runs child visits and flow effects in the original order.
     fn step_binary_frame(&mut self, frame: &mut Frame) -> Step {
         match &mut frame.stage {
             Stage::Left => {

@@ -1807,6 +1807,8 @@ impl Binder {
         false
     }
 
+    // Go: binder/binder.go:621 bind (BinaryExpression)
+    // PORT: The declaration step is shared by native recursion and the WASM walk.
     #[inline]
     pub(super) fn bind_binary_declaration(&mut self, node: Node, expression: &BinaryView) {
         match get_binary_assignment_declaration_kind(expression) {

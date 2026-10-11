@@ -16,6 +16,8 @@ on:
       - "Cargo.lock"
       - "UPSTREAM.json"
       - "scripts/upstream/pin.py"
+      - "scripts/wasm/**"
+      - "npm/wasm/**"
       - ".github/workflows/ci.yml"
 
 permissions:
@@ -52,6 +54,28 @@ jobs:
           cargo run --locked --quiet -p ts_ast_codegen -- check-ast crates/ts_goport/src/astdata/ast_generated.rs
       # The packages of the revision quality step (candidate.sh): 0 warnings.
       - run: cargo clippy --locked -p ts_goport -p goport_util -p goport_lsproto --all-targets -- -D warnings
+
+  wasm:
+    name: WebAssembly build and tests
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Build the WebAssembly module
+        run: WASM_PROFILE=release WASM_OPT=none scripts/wasm/build.sh
+      - name: Test the WebAssembly package
+        working-directory: npm/wasm
+        run: npm test
 
   test:
     name: test (${{ matrix.runner }})

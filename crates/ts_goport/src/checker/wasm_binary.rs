@@ -27,6 +27,8 @@ impl Checker {
             ))
     }
 
+    // Go: checker/checker.go:12575 checkBinaryLikeExpression
+    // PORT: WASM uses explicit frames for the same left-to-right type checks.
     pub(super) fn check_binary_iteratively(&mut self, node: Node, mode: CheckMode) -> TypeId {
         let mut work = vec![self.enter_binary_check(node)];
         loop {
@@ -44,6 +46,8 @@ impl Checker {
         }
     }
 
+    // Go: checker/checker.go:7759 checkExpressionEx
+    // PORT: Each frame retains the per-expression state until its operands finish.
     fn enter_binary_check(&mut self, node: Node) -> Frame {
         let trace = self.tracer.map(|tracer| {
             tracer.push(

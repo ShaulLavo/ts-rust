@@ -1815,7 +1815,7 @@ mod tests {
                 file_name: "/binary-printer.ts".to_string(),
                 ..Default::default()
             },
-            source.as_str(),
+            crate::ast::file_version::FileText::new(source.clone(), true),
             ScriptKind::TS,
         );
         let mut printer = new_printer(PrinterOptions::default(), PrintHandlers::default(), None);

@@ -114,8 +114,8 @@ Calls are serialized per service. The next request after a change rebuilds the p
 its imports and configuration, while reusing unchanged parsed files through the native parse cache.
 The old program is released after the replacement acquires those files; superseded parses are freed.
 Repeated reads share the current program. Auto-import completions and completion/code-action item
-resolution need additional host integration. Invalid circular `extends` chains use a native error-path
-parser that retains configuration allocations until the service is disposed.
+resolution need additional host integration. Circular `extends` chains report configuration errors;
+requests recover after the configuration is repaired.
 
 See [examples/language-service/](examples/language-service/) for a browser-worker example.
 

@@ -92,6 +92,16 @@ impl<'a> EditorConfig<'a> {
 }
 
 impl ExtendedConfigCache for EditorConfig<'_> {
+    fn get_extended_config_for_cycle(
+        &self,
+        file_name: &str,
+        path: &Path,
+        resolution_stack: &[Path],
+        host: &dyn ParseConfigHost,
+    ) -> Rc<ExtendedConfigCacheEntry> {
+        self.get_extended_config(file_name, path, resolution_stack, host)
+    }
+
     fn get_extended_config(
         &self,
         file_name: &str,

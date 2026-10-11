@@ -226,6 +226,24 @@ pub trait ExtendedConfigCache {
         resolution_stack: &[Path],
         host: &dyn ParseConfigHost,
     ) -> Rc<ExtendedConfigCacheEntry>;
+
+    // Cycles bypass cached results so an in-progress entry is never reacquired.
+    // Hosts can still reuse owned source parses through this path.
+    fn get_extended_config_for_cycle(
+        &self,
+        file_name: &str,
+        path: &Path,
+        resolution_stack: &[Path],
+        host: &dyn ParseConfigHost,
+    ) -> Rc<ExtendedConfigCacheEntry> {
+        Rc::new(parse_extended_config(
+            file_name,
+            path.clone(),
+            resolution_stack,
+            host,
+            None,
+        ))
+    }
 }
 
 // Go: tsoptions/tsconfigparsing.go:157 ExtendedConfigCacheEntry

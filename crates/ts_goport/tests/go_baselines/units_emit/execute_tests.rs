@@ -344,6 +344,19 @@ fn assert_has_circularity_diagnostic(cmd: &ParsedCommandLine) -> Result<(), Stri
 fn test_extended_config_cache_extends_circularity() {
     let mut t = Subtests::new("TestExtendedConfigCacheExtendsCircularity");
 
+    t.run("root self-referencing extends", || {
+        let cmd = parse_with_cache(&[
+            (
+                "/project/tsconfig.json",
+                r#"{"extends": "./tsconfig.json"}"#,
+            ),
+            ("/project/main.ts", "// Hello World!"),
+        ])
+        .ok_or("expected non-nil ParsedCommandLine")?;
+        assert_eq!(cmd.extended_source_files(), &["/project/tsconfig.json"]);
+        assert_has_circularity_diagnostic(&cmd)
+    });
+
     t.run("self-referencing extends", || {
         // Regression test: a tsconfig extends cycle should produce an error,
         // not a deadlock when using the tsc ExtendedConfigCache.
@@ -353,6 +366,7 @@ fn test_extended_config_cache_extends_circularity() {
             ("/project/main.ts", "// Hello World!"),
         ])
         .ok_or("expected non-nil ParsedCommandLine")?;
+        assert_eq!(cmd.extended_source_files(), &["/project/base.json"]);
         assert_has_circularity_diagnostic(&cmd)
     });
 
@@ -364,6 +378,10 @@ fn test_extended_config_cache_extends_circularity() {
             ("/project/main.ts", "// Hello World!"),
         ])
         .ok_or("expected non-nil ParsedCommandLine")?;
+        assert_eq!(
+            cmd.extended_source_files(),
+            &["/project/other.json", "/project/tsconfig.json"]
+        );
         assert_has_circularity_diagnostic(&cmd)
     });
 
@@ -376,6 +394,10 @@ fn test_extended_config_cache_extends_circularity() {
             ("/project/main.ts", "// Hello World!"),
         ])
         .ok_or("expected non-nil ParsedCommandLine")?;
+        assert_eq!(
+            cmd.extended_source_files(),
+            &["/project/Base.json", "/project/base.json"]
+        );
         assert_has_circularity_diagnostic(&cmd)
     });
 

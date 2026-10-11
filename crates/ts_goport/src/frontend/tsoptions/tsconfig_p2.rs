@@ -199,18 +199,20 @@ fn get_extended_config(
         host.fs().use_case_sensitive_file_names(),
     );
 
-    // Bypass the cache when we detect a cycle in the resolution stack.
-    // The cache locks entries during parsing, and a cycle would cause the same goroutine
-    // to re-lock the same entry, resulting in a deadlock. Let parseConfig handle the
-    // circularity error via its own resolution stack check.
     let cache_entry: Rc<ExtendedConfigCacheEntry> = match extended_config_cache {
-        Some(cache) if !resolution_stack.contains(&extended_config_path) => cache
-            .get_extended_config(
+        Some(cache) if resolution_stack.contains(&extended_config_path) => cache
+            .get_extended_config_for_cycle(
                 extended_config_file_name,
                 &extended_config_path,
                 resolution_stack,
                 host,
             ),
+        Some(cache) => cache.get_extended_config(
+            extended_config_file_name,
+            &extended_config_path,
+            resolution_stack,
+            host,
+        ),
         _ => Rc::new(parse_extended_config(
             extended_config_file_name,
             extended_config_path,

@@ -138,8 +138,9 @@ The public factory runs the pinned classic `createLanguageService` dispatch from
 `src/services/services.ts`, bundled with explicit source provenance. Its compiler entry points
 are replaced: `createProgram` builds a Rust program, `createLanguageServiceSourceFile` and
 `updateLanguageServiceSourceFile` decode Rust parses, and `getTypeChecker` returns the
-Rust-backed checker. The classic parser, binder, checker and emitter stay guarded and throw if
-reached. Each classic service algorithm then works exactly as far as the Rust-backed program,
+Rust-backed checker. Five original compiler entry points throw when reached; the boundary audit
+below records alternate parser, resolver, printer and transform paths still requiring closure.
+Each classic service algorithm then works exactly as far as the Rust-backed program,
 source-file, symbol, type and signature objects satisfy its dependencies. A dependency that
 cannot be bridged moves its algorithm into Rust.
 
@@ -200,6 +201,212 @@ from the original TypeScript 6.0.3 `src` and `tests/cases` (19,922 paths invento
 copy and output hashes are preserved under `u5` for the next compiler comparison. The preceding
 ES5 corpus run is retained as preliminary target-choice evidence, not the supported-target proof.
 The 75 removed-TypeScript-Go-semantics cases below stay listed and out of scope.
+
+The next emit unit (`u6`) assigns the facts evaluator and focused tests exclusively to one
+writer, with fresh independent review and regression audit. Its comparison tools preserve
+classic test occurrences (7,482 passes include three duplicated titles) and every corpus row,
+including 170 no-output files. Positive controls retain the whole reference; deliberate
+single-output-byte and duplicate-test regressions are rejected. Default-stack cold/warm emit
+controls pass at 100 and 1,000 operators with byte-identical TypeScript 6.0.3 output, while
+5,000 operators still fail before the facts repair. The completed evaluator diff has independent
+static review with no blocking findings at `node.rs` SHA-256
+`bafa16904093310533e9d489f1003c5a6fcbb605923c1a9622673d06e77f4fb4`.
+Its static atomic cache reference is stable and retains no node-data or TLS borrow; raw publication,
+dependency order, member-name repropagation and skipped-child behavior were reviewed explicitly.
+Release focused tests pass 16/16 at compiler commit `7f3a75459afab2be645b90f64bb3268c2e2a49ed`;
+complete source-bound runtime gates remain pending. Committing the node source exposed its parser
+snapshot key dependency, so the first queued gate runs were cancelled before runtime and retained.
+The unchanged ignored parser generator refreshed `lib_parse.bin` at
+`7480fbfb68bd148d6a7c0058ba29d8087c687cc0` (crates tree
+`6941f00f750b834ae1ce3d4c5db20ac4eef1fc60`). Both sections remain byte-identical after their first
+eight source-key bytes; blob SHA-256 is
+`609837bdb62d0b59537a17f3811073e8344d3fbe183182e69bcfebdc78d34a0c`.
+Fresh gates use `u6/verified` with both immutable local-base and repaired-u5 comparisons.
+Roster `r37` retained all 7,482 passing occurrences out of 7,853, with zero lost, absent or gained;
+the full runtime suite passed 50/50. The refreshed module SHA-256 is
+`82947be6892a17788c9864e0c366d9a22c4cd32d11aa903ae05b1d3810951a51`.
+The unchanged emit corpus failed: 19,913/19,915 rows identical, two stress fixtures changed from
+emitted output to stack exceptions, and no source or coverage changes. Those losses block pushing
+this unit. Exact standalone default-stack controls also fail on the saved pre-facts module
+(in facts), while the candidate fails in linked references; neither control erases the saved
+successful corpus rows. A complete original-baseline repeat is retained separately under
+`u6/verified/protected-runtime-retry`; engine tiering is an unconfirmed explanation.
+All 14 protected binaries built, but the first native runtime launch stopped before executing
+any suite because its separate tool checkout could not resolve the candidate commit. A local Git
+fetch corrected object visibility without changing tool source. The complete source-bound retry
+then closed normally: all 14 binaries, 181,905 passing entries and 3,623 ignored, no incomplete
+suites. Comparisons retained 181,891 local-base passes and all 181,892 repaired-u5 passes, with
+zero lost, absent or unrun; the thirteen new facts tests pass. Results SHA-256 is
+`3194d6acf15a64640384ba2be0848a0412add00583df3af3c22ebb258cf9b89a`.
+The failed launch and original corpus results are preserved; native retention does not clear
+the corpus/deep-operation STOP.
+This is not an accepted compiler unit. The refreshed release module is 19,381,756 bytes.
+Its actual default-stack 5,000-operator emit now fails in
+`checker/emit_resolver_p2.rs::mark_linked_references_recursively_visit`, reached through the
+recursive child callback. Subtree-facts recursion is absent from this new observed stack.
+Construction, diagnostics and quick info still pass; 100/1,000 cold/warm emit remains exact to
+TypeScript 6.0.3. The complete deep-emit comparator correctly fails at 5,000, and disposal trap
+is recorded separately. Linked-reference traversal is the next demonstrated stack repair;
+transformer/printer paths remain potential later exposures, not currently observed failures.
+Both independent roles issued interim STOP for the two lost corpus outputs and incomplete deep
+operation. The full exact old-module corpus repeat also loses those two outputs, but the original
+successful rows remain protected without a flake waiver. The same sole writer now owns only
+`checker/emit_resolver_p2.rs` and its focused tests for a bounded regression repair of the measured
+linked-reference walk. The same reviewer/auditor remain assigned; facts/snapshot hashes stay
+frozen. This is repair within the blocked batch, with complete fresh gates required before push.
+
+The bounded linked-reference worker is now implemented with an owned DFS stack and four
+same-file real-checker tests. Independent static review found no blocking code findings against
+pinned Go preorder, child order, import skips, root exclusion and checker ownership. Root's
+first release-test compile failed before execution on two test-only `EndOfFileToken` spellings;
+those were corrected to the repository's `EndOfFile` variant, with the original failed launch
+preserved in `u6/linked-focused`. The reviewer verified production code is byte-unchanged;
+corrected file SHA-256 is `f39a7ced487cdd94f84ee607787278d2a6beaab11ce055e56a4cb296d219b3a3`.
+The two release retries on that corrected source (`u6/linked-focused-2` and the separate
+backtrace run) execute three passing controls and one failing deep fixture. The actual stack
+is `is_jsx_tag_name` reading a nil parent: factory child ownership does not create parent links.
+Root added only parent-link setup before marking; independent review verified unchanged
+production and deep assertions. Fresh `u6/linked-focused-3` passes all four tests serially.
+
+The linked-reference repair is frozen locally at `95d61edb47d4e1a656f3e6118d7dcd1891432020`,
+crates tree `ac134eeab746ad1d1d80839217d7b08f5eedc3c5`, with fresh gates under
+`u6/linked-verified` and roster label `r38`. It is unpushed and unaccepted. The actual default-stack
+probe now gets beyond facts and linked-reference traversal, then overflows at 5,000 in
+`transformers/moduletransforms/es_module::visit_in` through
+`visit_each_child_binary_expression`. 100/1,000 cold/warm output remains exact. Disposal after
+the trap still fails. The same writer completed the bounded diagnosis of this newly observed transformer barrier.
+Frozen gates have closed; the next repair is limited to the two structural binary-transform
+paths described below. No corpus recovery, full emit success or STOP closure is claimed.
+
+Fresh frozen-source results now retain all 7,482 classic passing occurrences (5,958 fourslash,
+1,524 services), with 371 failures and no lost/absent/gained identities; full runtime tests pass
+50/50. The original 19,915-row corpus still differs only on the same two protected stress rows:
+19,913 identical, no missing/changed sources, outputs 19,745 → 19,743. Both exact CLI controls
+now overflow in `ConstEnumInliningTransformer::visit` through the same generic binary-child
+visitor. Saved module SHA-256 is `65e97010546b1b8c7b1b8dd1015b995577a5e1b402cd6f4b019922871cde94a8`;
+corpus SHA-256 is `515d7bf5945f78bc690732b278f74c2c6e008cda0346948187a8380cd8a2b509`.
+The complete fourteen-binary native runtime closed normally with **181,909 passing entries**,
+3,623 ignored and no incomplete suites. Comparisons retain all 181,891 local-base passes and
+181,892 repaired-u5 passes, with zero lost/absent/unrun and respectively 18/17 new passing names.
+Results SHA-256 is `ce2540d73152340c868642928c52a0654bc4938d4ace1c4c2de174452c3d66de`;
+binary-manifest SHA-256 is `979fa5f98b4b295969461b0d1b8f9203463005b11a6b0d61f9f7e33de159f895`.
+The same independent auditor verified all source/binary bindings and per-name retention, clearing
+the missing-native-evidence blocker only. Its source-bound verdict remains STOP for the corpus
+and deep emit failures. The WASM gate closes `FAIL rc=1`; no previous failure is erased.
+
+Read-only diagnosis identifies a bounded shared binary continuation for the two demonstrated
+transformers, preserving Go's modifiers → left → optional type → operator → right traversal and
+postorder factory updates. Nonbinary callbacks must retain real const-enum replacement/pruning
+and ES-module import/require rewriting/finalization. It is explicitly opt-in for structural
+binary callbacks with empty override hooks; generic `ast::visitor` behavior stays unchanged.
+Existing subtree facts do not prove safe pruning for either whole transformer. Independent
+Go-alignment design review found no blocking issue in this narrow boundary, while retaining STOP.
+After normal frozen-gate closure, the sole writer owns `transformers/utilities.rs`,
+`transformers/moduletransforms/es_module.rs` and `transformers/inliners/const_enum.rs`, including
+focused tests in those files. Root retains integration, execution, state, commits and pushes.
+The pre-edit hypothesis and exact expected recoveries are recorded in state note
+`classic-wasm-u6-binary-repair-preflight`: default-stack 5,000-operator synchronous emit and both
+original corpus stress outputs must recover byte-identically, with all retained gates rerun.
+Consecutive binary-chain safety is the bounded claim; any later observed barrier remains a failure
+requiring its own diagnosis. Generic visitor changes, subtree-facts pruning and speculative printer
+repairs are outside this patch.
+
+The three-file draft now implements the owned binary continuation and adds thirteen
+`binary_transform_` tests covering deep geometry, static/scoped handles, ordering, replacement
+pruning, metadata, real-checker enum values and module rewriting/finalization. The same reviewer
+found no blocking static correctness issue; this is no runtime PASS. First complete serial library
+compile (`u6/binary-library-1`) failed before executing tests on two test-only `NodeList.to_vec`
+accesses. Root changed only those accesses to `NodeList.nodes().get(0)` and preserved the failed
+source/log. The corrected draft is frozen by hashes under `u6/binary-library-2`; a fresh complete
+serial release library retry failed (427 passed, three failed, two ignored). Two new controls
+had invalid setup assumptions: a stored field-backed empty modifier list differs from its
+factory input handle, and initial program parsing uses static storage. Root preserved that run
+and corrected only fixture setup: compare the saved stored list identity, retain nil/present-empty
+and location checks, and force an owned direct parse with explicit storage-tier and existing
+cold/warm/oracle checks. The unchanged formatter test also lacked documented `TS_GO_REPO`;
+the preceding frozen binary reproduces its exact missing-path failure without that variable and
+passes with the pinned fixture path (`u6/binary-format-base-controls`). A fresh complete serial
+run (`u6/binary-library-3`) uses corrected fixtures and that existing pinned input. Production is
+unchanged. This fresh complete run passed: **430 passed, zero failed, two ignored** (8.76s).
+The same independent reviewer verified both fixture corrections and the environment controls
+with no blocking finding or weakened traversal assertion. Failed runs remain preserved;
+no waiver, runtime recovery or acceptance is claimed.
+
+Root froze this compiler-only repair at `ae233dc3acffb9b6ef22fe71049d3e5531cb8bbc`
+(crates tree `946ff19d0db1930a5a4d7f497be0126308a68455`). Fresh source-bound full gates
+are running under `u6/binary-verified`, classic label `r39`: runtime, default-stack deep
+cold/warm/disposal, both exact CLI stress cases, unchanged classic roster and original
+emit corpus, plus all fourteen native binaries and retention against local/u5/linked bases.
+The early runtime portion has now completed: **50/50 runtime tests**, and real synchronous
+facade program/diagnostics/quick-info/cold emit/warm emit/disposal pass at 100, 1,000 and
+5,000 operators on Node 22.23.3 with the default stack; all compared outputs match the
+unchanged TypeScript 6.0.3 reference. Both exact CLI stress fixtures again produce outputs
+identical in source hash, exit code, file name, length and SHA-256 to their original successful
+corpus rows (`early-runtime-note.json`). The complete unchanged `r39` classic roster has also closed: **7,482/7,853 retained**
+(fourslash **5,958**, services **1,524**), zero lost/absent/gained or added/removed identities;
+371 failures remain. The strict original emit corpus has now closed **PASS: 19,915/19,915
+identical rows and 19,745/19,745 outputs**, zero changed/missing/source-changed rows,
+including restoration of both original stress outputs. `wasm.status` is `DONE`.
+All-fourteen native checks have now closed `DONE`: **181,922 passing entries, 3,623 ignored**,
+19 covered suites, no incomplete suites. Per-name comparisons retain all 181,891 local-base,
+181,892 repaired-u5 and 181,909 linked-source passes, with respectively 31, 30 and 13 new
+passing entries; zero recovered/lost/absent/unrun/new-failed entries and no maps. All 24 native
+manifest entries and six source hashes verified. Results SHA-256:
+`480968752d981f2265237a185944b048be55184fd1bbaed8c908a16d9f3cd14c`; binary manifest:
+`327d0310627226cf4715a286b9446cb5ef88f0b414dceda8562bf7b2385da500`.
+The same independent reviewer and auditor both returned source-bound **PASS** for this exact
+bounded local regression repair. The native/corpus/deep regression STOP is **closed** on
+`ae233dc3`/`946ff19d`; all failed earlier runs stay preserved without waiver or retroactive PASS.
+This is **not formal R188 or overall language-service acceptance**. Current-fork Query/Hono,
+LSP/API oracles, np-suite and full quality remain unavailable/unrun; historical accepted state
+is unchanged. Browser loading/public exports, remaining classic repairs, performance and
+original-JavaScript compiler-entry closure remain separate outstanding work.
+Native, runtime, classic, corpus and deep outcomes above
+remain results of the preceding linked-source commit and cannot be carried forward to this draft.
+
+Read-only `r36` rename investigation finds 29 family cases, 16 passing and 13 failing. Eleven
+fail in the harness's second, post-move check; their first check passes. The classic algorithm
+uses ordered `failedLookupLocations` to recover the old import target after moving it, but the
+Rust resolution wrapper supplies none. Six truncated content mismatches beginning with a reference
+directive do not establish a triple-slash defect. The `_amd` and `_preferences` failures occur
+before the move and separately require legacy resolution analysis; neither is newly excluded.
+Recovery counts and exact returned edits remain unverified until the ordered focused run.
+The moved-importer branch has an additional no-fallback boundary gap: generated
+`getEditsForFileRename` calls its lexical original JavaScript `resolveModuleName`, without Rust
+delegation. Package metadata lookup can fall from strict `JSON.parse` into original
+`Parser.parseJsonText2`, which bypasses the guarded `Parser.parseSourceFile`. This is demonstrated
+static reachability, not a claim that a roster case executed the parser fallback. Resolution must
+become Rust-owned and the JSON parser bypass must close; current guards do not prove the full
+no-JavaScript-compiler/parser requirement.
+
+A separate static boundary audit found additional bypasses: syntactic comment classifications
+call the lexical original isolated-JSDoc parser; isolated entity-name/JSDoc parse APIs also remain
+on the candidate namespace. Editor `ChangeTracker` text and Rust-checker display writers reach
+the original `createPrinter().writeNode` pipeline, which the `emitFiles` guard does not cover.
+Namespace compiler transforms and standalone declaration diagnostics can likewise enter original
+transformation code. These are source-demonstrated routes, not new runtime fallback measurements;
+namespace exposure is distinct from the still-unpublished package exports. Rust-backed isolated
+parsing/printing boundaries and original-entry guards are required before claiming no fallback.
+Scanner-based editor algorithms, synthetic node factories and external reference harnesses are
+separate from these compiler paths. The original main binder/checker entries and full-file
+`Program.emit` delegation remain covered by the inspected guards/bridge.
+
+A preliminary fixed-workload control is preserved in `u6/performance-baseline-manifest.json`:
+real TypeScript 6.0.3 and the pre-facts candidate both finish construction, open, 30 edits,
+completions, quick info, diagnostics, and 20,000 line-position round trips on Node 22.23.3.
+This is one paired baseline, not the replicated final performance gate. Both use 31 snapshot
+callbacks and zero `readFile` callbacks; the candidate adds 155 `fileExists` calls. The existing
+LSP line-map benchmark on the same preserved module makes zero file reads for warm semantic
+tokens and document symbols at 1,000 and 4,000 rows. References still make 1,001 and 4,001 reads;
+those counts are recorded separately. Read-only ownership investigation confirms the converter
+and line-map cache survive warm requests. The remaining per-reference read occurs earlier in
+`LanguageService::get_script`, through WASM `LanguageHost::read_file`; the retained program text
+is not reused at that host boundary. Pinned Go makes the same logical read through a snapshot
+that reuses file content. This identifies the bridge seam, not a measured repair. An isolated
+comparison must hold one source base and vary only the earlier line-map callback; comparing
+whole commits also varies wrappers/error handling. Classic line-position round trips and snapshot
+counts exercise another path. The earlier cache speedup is not yet isolated by a before/after-source
+comparison.
 
 Browser/export preparation identified the remaining loading blocker: private `classic.js`
 statically imports the Node loader; package exports and declarations still describe the
@@ -309,9 +516,10 @@ expando. Go reports an unused `infer` or JSDoc type parameter as TS6196 on its n
 classic reports TS6133 on the `infer` node, so classic's fix fails in `deleteNodeInList` (6
 `codeFixUnusedIdentifier_*` cases; a design difference, not a removal).
 
-Next by failing count (`r34`, 371 failing): `getEditsForFileRename*` triple-slash edits (6),
-`breakpointValidationDestructuring*` baselines (12 in four groups), "found 2 codefixes" (5),
-JS export assignment errors in modules (4), and `getRegionSemanticDiagnostics` regions.
+Next in the requested order (`r36`, 371 failing): `getEditsForFileRename*` (13 failures;
+11 post-move and two pre-move resolution cases), `breakpointValidationDestructuring*` baselines
+(12 in four groups), "found 2 codefixes" (5), JS export assignment errors in modules (4),
+and `getRegionSemanticDiagnostics` regions.
 
 ## Cancellation polls, classic AST views, symbol walker and hover verbosity (r27 to r32)
 

@@ -264,8 +264,8 @@ with zero recovered, lost, absent or unrun cases. The same 371 failures remain a
 the 75 removed-TypeScript-Go exclusions are unchanged. Six sequential fresh-process timing
 triplets are complete. Formal R188 remains unrun and all seven original-JS boundary routes remain
 STOP. The final independent regression audit passes for this local wrapper unit; it grants no
-formal compiler acceptance or boundary waiver. This verified unit is ready for fast-forward
-publication to the fork.
+formal compiler acceptance or boundary waiver. The verified runtime unit was published
+fast-forward to the fork as `7995aa63`; the remote SHA was checked after pushing.
 
 Frozen candidate evidence is at `/work/tmp/tsrust-ls-probes/u8-performance/wrapper-unit`.
 Its `classic-ast.js` hash is `80d10c2251f1283b4d9b3e80da968f7846fbdc11a5b3edf57fa920ca906ae5a2`;

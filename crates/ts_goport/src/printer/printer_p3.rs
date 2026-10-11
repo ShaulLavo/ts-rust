@@ -1815,7 +1815,7 @@ mod tests {
                 file_name: "/binary-printer.ts".to_string(),
                 ..Default::default()
             },
-            &source,
+            source.as_str(),
             ScriptKind::TS,
         );
         let mut printer = new_printer(PrinterOptions::default(), PrintHandlers::default(), None);
@@ -2072,7 +2072,7 @@ mod tests {
                 source,
                 ScriptKind::TS,
             );
-            let root = file.root.statements().nodes().get(0).expression();
+            let root = file.root.statements().get(0).expression();
             let context = new_emit_context();
             for preserve in [false, true] {
                 let expected = snapshot(root, file.root, &context, true, preserve);

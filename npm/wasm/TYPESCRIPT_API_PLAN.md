@@ -598,6 +598,24 @@ The largest exclusive leaf is `sbrk` (**148 samples**); 53 of these follow
 changing this native-corpus heuristic, adding a pathname-global cache, or weakening immutable-version
 ownership. The next edit repair and its measurements are pending.
 
+Independent read-only allocation diagnosis found existing operation-local plumbing:
+`sourceFileLease(file, instance)` can identify the retained predecessor, and
+`file_store_slot_count` supplies exact nil/alias/node slot demand. Factory `node_count` and encoded
+table length are not substitutes. A bounded experiment may copy predecessor scalar facts before
+releasing the source-table borrow, then pass a private allocation hint through the document parse
+closure, separate from cache keys/options. Cold/native parses, immutable old versions, publication,
+post-parse shrinking and freeable ownership stay unchanged; never steal the predecessor's vectors.
+Do not seed an arbitrary predecessor capacity and then double it: 12,000→24,000 can exceed the
+baseline 4,988→9,976→19,952 ladder, recreating the documented factscol1b/R173 OOM hazard.
+An initial experiment should choose only an existing baseline ladder rung, keeping independent
+ordinary column growth; leave identifier-cardinality reservation unchanged. Even this cannot prove
+memory parity when a tiny edit changes token density. Before taking a production change, measure
+actual capacities/growth events/copied bytes and peak/live memory for every column, including
+`build_links` and `OwnedAst.cell_of`; cover density changes, shrink/replacement, Unicode/deep/broken
+syntax, aliases, nested parsing, separate registries/instances and retained versions. Retain
+memory-constrained controls and all shared-code gates. Current stack samples alone do not justify
+shipping a reservation change; the allocation experiment and accepted timing remain unrun.
+
 The distributable's separate `count-only/counts.json` confirms exactly **30 `parseDocument`
 requests for 30 edits**, carrying **15,023,120 binary response bytes** in total; it does not expose
 a duplicate-parse route. Completion makes **900 graph requests**, including 210 `getSymbolData`
@@ -644,6 +662,10 @@ Read-only preparation for later units (no candidate changes or closure claimed):
   validating diagnostics afterward. Cover parentless visibility, actual node/identifier counts,
   identifier-map membership/order, recovery-list ranges, multiline/Unicode flags and empty JSON
   pragma/reference metadata. The historical u7 prototype is incomplete and is not current proof.
+- Fresh frozen-roster inventory still contains **13 failing / 16 passing** `getEditsForFileRename`
+  cases. After rename, useful filename-prefix investigation groups include 51 `codeFix`, 39
+  `quickInfo`, 30 `goToDefinition`, 21 `jsdoc`, and 15 each `completion` and `breakpoint` failures.
+  These labels classify test names, not independent root causes; recoveries remain zero.
 
 ## Native regression repair after r35
 

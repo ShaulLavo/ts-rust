@@ -31,6 +31,11 @@ function getParseTreeNode(node, nodeTest) {
     }
 }
 
+/** Classic checker's `canHaveConstantValue`. */
+function canHaveConstantValue(node) {
+    return node.kind === SyntaxKind.EnumMember || node.kind === SyntaxKind.PropertyAccessExpression || node.kind === SyntaxKind.ElementAccessExpression;
+}
+
 /** Classic `symbolName`. */
 function symbolName(symbol) {
     const name = symbol.valueDeclaration?.name;
@@ -73,6 +78,7 @@ export function createTypeChecker(lease, resolveNode) {
         if (value.$signature) return signature(value.$signature, value.origin);
         if (value.$node) return resolveNode(value.$node);
         if (value.$indexInfo) return indexInfo(value);
+        if (value.$typePredicate) return typePredicate(value);
         if (value.$synthetic) return decodeSyntheticNode(value.$synthetic, new Map(value.symbols.map(([index, symbol]) => [index, decode(symbol)])));
         return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, decode(item)]));
     }
@@ -88,6 +94,16 @@ export function createTypeChecker(lease, resolveNode) {
         if (value.components) info.components = decode(value.components);
         indexInfos.set(key, info);
         return info;
+    }
+
+    const typePredicates = new Map();
+    function typePredicate(value) {
+        const key = String(value.$typePredicate);
+        let predicate = typePredicates.get(key);
+        if (predicate) return predicate;
+        predicate = { kind: value.kind, parameterName: value.parameterName, parameterIndex: value.parameterIndex, type: decode(value.type) };
+        typePredicates.set(key, predicate);
+        return predicate;
     }
 
     /** The checker's id of `object`, or undefined for an object it does not own. */
@@ -202,7 +218,7 @@ export function createTypeChecker(lease, resolveNode) {
     }
     // Classic public methods take the parse-tree node of a synthesized one (`getParseTreeNode`,
     // optionally with a node test) and answer a default when there is none.
-    const parseTree = (node, test) => getParseTreeNode(node, test && (candidate => classicNamespace()[test](candidate)));
+    const parseTree = (node, test) => getParseTreeNode(node, typeof test === "function" ? test : test && (candidate => classicNamespace()[test](candidate)));
     const errorType = () => query("getErrorType");
     for (const [method, test, missing] of [
         ["getTypeAtLocation", undefined, errorType],
@@ -308,6 +324,52 @@ export function createTypeChecker(lease, resolveNode) {
     checker.getUnionType = (types, reduction = 1) => query("getUnionType", { types: types.map(type => handle(type, "type")), reduction });
     checker.isTypeAssignableTo = (source, target) => query("isTypeAssignableTo", Object.assign(typeOf(source), { target: handle(target, "type") }));
     // Classic checks the file, here without polling the token, and answers its diagnostics.
+    const symbolOf = symbol => ({ symbol: handle(symbol, "symbol"), origin: objectHandles.get(symbol)?.origin });
+    const signatureOf = signature => ({ signature: handle(signature, "signature"), origin: objectHandles.get(signature)?.origin });
+    checker.tryGetMemberInModuleExports = (name, symbol) => query("tryGetMemberInModuleExports", Object.assign(symbolOf(symbol), { name }));
+    checker.getTypePredicateOfSignature = signature => query("getTypePredicateOfSignature", signatureOf(signature));
+    checker.isDeclarationVisible = node => query("isDeclarationVisible", { location: location(node) });
+    checker.getExpandedParameters = (signature, skipUnionExpanding) => query("getExpandedParameters", Object.assign(signatureOf(signature), { skipUnionExpanding }));
+    checker.hasEffectiveRestParameter = signature => query("hasEffectiveRestParameter", signatureOf(signature));
+    checker.getJsxFragmentFactory = node => query("getJsxFragmentFactory", { location: location(node) });
+    checker.getJsxIntrinsicTagNamesAt = node => query("getJsxIntrinsicTagNamesAt", { location: location(node) });
+    checker.isContextSensitive = node => query("isContextSensitive", { location: location(node) });
+    checker.getAccessibleSymbolChain = (symbol, enclosing, flags, useOnlyExternalAliasing) => query("getAccessibleSymbolChain",
+        Object.assign(symbolOf(symbol), { location: enclosing === undefined ? undefined : location(enclosing), meaning: meaning(flags), useOnlyExternalAliasing }));
+    checker.isTypeInvalidDueToUnionDiscriminant = (contextualType, obj) => query("isTypeInvalidDueToUnionDiscriminant", Object.assign(typeOf(contextualType), { location: location(obj) }));
+    checker.getContextualTypeForArgumentAtIndex = (nodeIn, argIndex) => {
+        const node = parseTree(nodeIn, "isCallLikeExpression");
+        return node && query("getContextualTypeForArgumentAtIndex", { location: location(node), index: argIndex });
+    };
+    checker.getContextualTypeForObjectLiteralElement = nodeIn => {
+        const node = parseTree(nodeIn, "isObjectLiteralElementLike");
+        return node ? query("getContextualTypeForObjectLiteralElement", { location: location(node) }) : undefined;
+    };
+    checker.getContextualTypeForJsxAttribute = nodeIn => {
+        const node = parseTree(nodeIn, "isJsxAttributeLike");
+        return node && query("getContextualTypeForJsxAttribute", { location: location(node) });
+    };
+    checker.getTypeOfPropertyOfContextualType = (type, name) => query("getTypeOfPropertyOfContextualType", Object.assign(typeOf(type), { name }));
+    checker.getSymbolsOfParameterPropertyDeclaration = (parameterIn, parameterName) => {
+        const parameter = parseTree(parameterIn, "isParameter");
+        if (parameter === undefined) throw new Error("Debug Failure. Cannot get symbols of a synthetic parameter that cannot be resolved to a parse-tree node.");
+        return query("getSymbolsOfParameterPropertyDeclaration", { location: location(parameter), name: parameterName });
+    };
+    checker.getMemberOverrideModifierStatus = (node, member, memberSymbol) => query("getMemberOverrideModifierStatus",
+        Object.assign(symbolOf(memberSymbol), { location: location(node), member: location(member) }));
+    checker.resolveExternalModuleName = moduleSpecifierIn => {
+        const moduleSpecifier = parseTree(moduleSpecifierIn, "isExpression");
+        return moduleSpecifier && query("resolveExternalModuleName", { location: location(moduleSpecifier) });
+    };
+    checker.getConstantValue = nodeIn => {
+        const node = parseTree(nodeIn, canHaveConstantValue);
+        return node ? query("getConstantValue", { location: location(node) }) : undefined;
+    };
+    checker.getStringLiteralType = value => query("getStringLiteralType", { value });
+    checker.getNumberLiteralType = value => query("getNumberLiteralType", { value });
+    checker.getTrueType = fresh => query("getTrueType", { fresh });
+    checker.getFalseType = fresh => query("getFalseType", { fresh });
+    checker.getWidenedLiteralType = type => query("getWidenedLiteralType", typeOf(type));
     checker.getDiagnostics = sourceFile => query("getDiagnostics", { location: sourceFile === undefined ? undefined : location(sourceFile) }).map(lease.diagnostic);
     checker.getGlobalDiagnostics = () => query("getGlobalDiagnostics").map(lease.diagnostic);
     // Classic `nodeBuilder`: Rust's node builder answers with synthesized nodes. The builder

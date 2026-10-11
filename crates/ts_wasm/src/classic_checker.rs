@@ -7,9 +7,11 @@ use ts_goport::api::{encoder, proto};
 use ts_goport::ast::{escape_symbol_name, get_source_file_of_node, is_part_of_type_node};
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::binder::go_symbol_name;
-use ts_goport::checker::{Checker, InternalNodeBuilderFlags, NodeBuilderFlags};
-use ts_goport::core::{IndexInfoId, Node, SignatureId, SymbolId, TypeId};
-use ts_goport::flags::{ContextFlags, SignatureKind, SymbolFlags, TypeFlags, UnionReduction};
+use ts_goport::checker::{Checker, InternalNodeBuilderFlags, LiteralValue, NodeBuilderFlags};
+use ts_goport::core::{IndexInfoId, Node, SignatureId, SymbolId, TypeId, TypePredicateId};
+use ts_goport::flags::{
+    ContextFlags, SignatureKind, SymbolFlags, TypeFlags, TypePredicateKind, UnionReduction,
+};
 use ts_goport::frontend::compiler::NewProgram;
 use ts_goport::gostd::Context;
 use ts_goport::program::ls_program;
@@ -107,11 +109,13 @@ impl ClassicChecker {
             "signatureToString" => Ok(json!(checker.signature_to_string(signature))),
             "getFullyQualifiedName" => Ok(json!(checker.get_fully_qualified_name_exported(symbol))),
             // The binder's `node.symbol` and `node.localSymbol`.
-            "getNodeSymbol" => Ok(self.symbol_ref(if request["local"].as_bool() == Some(true) {
-                location.local_symbol()
-            } else {
-                location.symbol()
-            })),
+            "getNodeSymbol" => Ok(
+                self.symbol_ref(if request["local"].as_bool() == Some(true) {
+                    location.local_symbol()
+                } else {
+                    location.symbol()
+                }),
+            ),
             "isUnknownSymbol" => Ok(json!(checker.is_unknown_symbol(symbol))),
             "isUndefinedSymbol" => Ok(json!(checker.is_undefined_symbol(symbol))),
             "isArgumentsSymbol" => Ok(json!(checker.is_arguments_symbol(symbol))),
@@ -153,6 +157,126 @@ impl ClassicChecker {
                 Ok(json!(checker.contains_arguments_reference(location)))
             }
             "nodeBuilder" => self.build_node(&mut checker, location, t, symbol, signature, request),
+            "tryGetMemberInModuleExports" => Ok(self.symbol_ref(
+                checker.try_get_member_in_module_exports(string(request, "name")?, symbol),
+            )),
+            "getTypePredicateOfSignature" => {
+                let predicate = checker.get_type_predicate_of_signature_exported(signature);
+                Ok(self.type_predicate(&checker, predicate))
+            }
+            "isDeclarationVisible" => {
+                let resolver = checker.get_emit_resolver();
+                Ok(json!(
+                    resolver.is_declaration_visible(&mut checker, location)
+                ))
+            }
+            "getExpandedParameters" => Ok(Value::Array(
+                checker
+                    .get_expanded_parameters_exported(
+                        signature,
+                        request["skipUnionExpanding"].as_bool().unwrap_or(false),
+                    )
+                    .iter()
+                    .map(|parameters| self.symbol_refs(parameters))
+                    .collect(),
+            )),
+            "hasEffectiveRestParameter" => Ok(json!(
+                checker.has_effective_rest_parameter_exported(signature)
+            )),
+            "getJsxFragmentFactory" => {
+                let entity = checker.get_jsx_fragment_factory_entity(location);
+                Ok(if entity.is_nil() {
+                    Value::Null
+                } else {
+                    json!(ts_goport::ast::get_first_identifier(entity).text())
+                })
+            }
+            "getJsxIntrinsicTagNamesAt" => {
+                Ok(self.symbol_refs(&checker.get_jsx_intrinsic_tag_names_at(location)))
+            }
+            "isContextSensitive" => Ok(json!(checker.is_context_sensitive_exported(location))),
+            "getAccessibleSymbolChain" => {
+                let chain = checker.get_accessible_symbol_chain_exported(
+                    symbol,
+                    location,
+                    symbol_flags(request)?,
+                    request["useOnlyExternalAliasing"]
+                        .as_bool()
+                        .unwrap_or(false),
+                );
+                // Classic answers undefined for no chain.
+                Ok(if chain.is_empty() {
+                    Value::Null
+                } else {
+                    self.symbol_refs(&chain)
+                })
+            }
+            "isTypeInvalidDueToUnionDiscriminant" => Ok(json!(
+                checker.is_type_invalid_due_to_union_discriminant(t, location)
+            )),
+            "getContextualTypeForArgumentAtIndex" => {
+                let index = request["index"].as_i64().map_or(Ok(0), i32::try_from);
+                Ok(
+                    self.type_ref(checker.get_contextual_type_for_argument_at_index_exported(
+                        location,
+                        index.map_err(|error| error.to_string())?,
+                    )),
+                )
+            }
+            "getContextualTypeForObjectLiteralElement" => Ok(self.type_ref(
+                checker.get_contextual_type_for_object_literal_element_exported(
+                    location,
+                    ContextFlags::NONE,
+                ),
+            )),
+            "getContextualTypeForJsxAttribute" => {
+                Ok(self.type_ref(checker.get_contextual_type_for_jsx_attribute_exported(location)))
+            }
+            "getTypeOfPropertyOfContextualType" => Ok(self.type_ref(
+                checker
+                    .get_type_of_property_of_contextual_type_exported(t, string(request, "name")?),
+            )),
+            "getSymbolsOfParameterPropertyDeclaration" => {
+                let (parameter, property) = checker.get_symbols_of_parameter_property_declaration(
+                    location,
+                    string(request, "name")?,
+                );
+                Ok(json!([
+                    self.symbol_ref(parameter),
+                    self.symbol_ref(property)
+                ]))
+            }
+            "getMemberOverrideModifierStatus" => {
+                let member = node(request, "member")?;
+                Ok(json!(
+                    checker
+                        .get_member_override_modifier_status_exported(location, member, symbol)
+                        .0
+                ))
+            }
+            "resolveExternalModuleName" => Ok(self
+                .symbol_ref(checker.resolve_external_module_name_exported(location, TypeId::NIL))),
+            "getConstantValue" => Ok(match checker.get_constant_value(location) {
+                Some(LiteralValue::String(value)) => crate::classic_strings::string_value(&value),
+                Some(LiteralValue::Number(value)) => json!(value.0),
+                _ => Value::Null,
+            }),
+            "getStringLiteralType" => {
+                Ok(self.type_ref(checker.get_string_literal_type(string(request, "value")?)))
+            }
+            "getNumberLiteralType" => {
+                let value = request["value"].as_f64().ok_or("value must be a number")?;
+                Ok(self.type_ref(checker.get_number_literal_type(ts_goport::jsnum::Number(value))))
+            }
+            "getTrueType" | "getFalseType" => {
+                let fresh = request["fresh"].as_bool().unwrap_or(false);
+                Ok(self.type_ref(match (method, fresh) {
+                    ("getTrueType", true) => checker.true_type,
+                    ("getTrueType", false) => checker.regular_true_type,
+                    (_, true) => checker.false_type,
+                    _ => checker.regular_false_type,
+                }))
+            }
             "isImplementationOfOverload" => Ok(json!(classic_is_implementation_of_overload(
                 &mut checker,
                 location
@@ -262,6 +386,9 @@ impl ClassicChecker {
             "getNonOptionalType" => Ok(self.type_ref(checker.get_non_optional_type(t))),
             "isNullableType" => Ok(json!(checker.is_nullable_type(t))),
             "getWidenedType" => Ok(self.type_ref(checker.get_widened_type(t))),
+            "getWidenedLiteralType" => {
+                Ok(self.type_ref(checker.get_widened_literal_type_exported(t)))
+            }
             "getBaseTypeOfLiteralType" => {
                 Ok(self.type_ref(checker.get_base_type_of_literal_type_exported(t)))
             }
@@ -412,6 +539,23 @@ impl ClassicChecker {
             results.push(json!({"$synthetic": {"$payload": [offset, length]}, "symbols": symbols}));
         }
         Ok(Value::Array(results))
+    }
+
+    /// Classic `TypePredicate`, or none for the checker's no-predicate sentinel.
+    fn type_predicate(&self, checker: &Checker, predicate: TypePredicateId) -> Value {
+        if predicate.is_nil() || predicate == checker.no_type_predicate {
+            return Value::Null;
+        }
+        let data = checker.pred(predicate);
+        let mut result = json!({"$typePredicate": predicate.0, "kind": data.kind.0, "type": self.type_ref(data.t)});
+        if matches!(
+            data.kind,
+            TypePredicateKind::IDENTIFIER | TypePredicateKind::ASSERTS_IDENTIFIER
+        ) {
+            result["parameterName"] = crate::classic_strings::string_value(&data.parameter_name);
+            result["parameterIndex"] = json!(data.parameter_index);
+        }
+        result
     }
 
     /// Classic `IndexInfo`; `id` keeps one object per index info of the checker.

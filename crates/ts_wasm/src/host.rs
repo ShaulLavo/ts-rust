@@ -437,7 +437,19 @@ pub mod test_host {
                 Some(Vec::new())
             }
             Op::Chtimes => Some(Vec::new()),
+            // Native tests have no cancellation callback, so polling succeeds.
+            Op::PollCancellation => Some(Vec::new()),
             Op::SourceMetadata | Op::GetSourceFile => None,
         }
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::{Op, call};
+
+    #[test]
+    fn poll_cancellation_without_callback_succeeds() {
+        assert_eq!(call(Op::PollCancellation, &[]), Ok(Vec::new()));
     }
 }

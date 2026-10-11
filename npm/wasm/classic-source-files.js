@@ -30,15 +30,15 @@ function sourceLease(instance, source) {
 /** One source object per Rust file version and classic parse target, shared by every user of the instance. */
 export function materializeSourceFile(instance, response) {
     const lease = sourceLease(instance, response.source);
-    const target = response.languageVersion;
     let file = lease.file?.deref();
     if (!file) {
-        file = decodeSourceFile(response.data, { languageVersion: target, version: response.version }, lease);
-        file.parseDiagnostics = (response.parseDiagnostics ?? []).map(diagnostic => withFile(diagnostic, file));
+        const source = response.data === undefined ? instance.source(response.source) : response;
+        file = decodeSourceFile(source.data, { languageVersion: source.languageVersion, version: source.version }, lease);
+        file.parseDiagnostics = (source.parseDiagnostics ?? []).map(diagnostic => withFile(diagnostic, file));
         // TypeScript 6.0.3 ignores `no-default-lib` references; its parser sets this false.
         file.hasNoDefaultLib = false;
         addSourceFileMembers(file, instance, response.source);
-        file.pragmas = pragmaMap(response.pragmas ?? []);
+        file.pragmas = pragmaMap(source.pragmas ?? []);
         file.checkJsDirective = checkJsDirective(file.pragmas);
         lease.file = new WeakRef(file);
     }

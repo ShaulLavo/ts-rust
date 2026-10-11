@@ -184,6 +184,14 @@ impl Sources {
         ts_goport::ast::release_file_version_pins_later();
     }
 
+    pub fn descriptor(&self, id: u32) -> Result<Value, String> {
+        let source = self
+            .files
+            .get(&id)
+            .ok_or("source file lease has been released")?;
+        Ok(json!({ "source": id, "fileName": source.file.file_name() }))
+    }
+
     pub fn response(&self, id: u32) -> Result<Value, String> {
         let source = self
             .files

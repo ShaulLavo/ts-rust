@@ -360,8 +360,9 @@ inventory guard remains required evidence for later corpus comparisons; it grant
 waiver or formal compiler acceptance.
 
 Six sequential fresh-process triplets use Node 22.23.3, the unchanged 2,000-declaration,
-30-edit fixture and alternating arm order. No build, roster, corpus or profile overlaps these
-runs. Cells show across-process median / nearest-rank p95 of phase medians in milliseconds;
+30-edit fixture and alternating arm order. No ts-rust build, roster, corpus or profile overlaps
+these runs. Host quietness was not established; latency is observational shared-host evidence.
+Cells show across-process median / nearest-rank p95 of phase medians in milliseconds;
 module load remains separate and edit observations are not pooled.
 
 | Phase | Frozen u8 baseline | Typed candidate | TypeScript 6.0.3 |
@@ -399,6 +400,98 @@ Read-only failure triage identifies 13 file-rename failures (11 after moving), m
 resolver lookup metadata plus Classic/Node10 resolution gaps; twelve array-hole breakpoint
 failures; and four direct missing-checker-member failures. These are investigation targets,
 not claimed recoveries or new exclusions.
+
+### Non-encoding source descriptors (u10, 2026-10-11)
+
+The verified u9 unit was published fast-forward to the fork as
+`1b65f8c1cabea895ad3250aba207bfb616e2efc7`; the remote tip was checked.
+The next runtime unit changes only `classic_sources.rs`, `classic_graph.rs` and
+`classic-source-files.js` in production. Program source requests retain the same lease and
+return its ID, filename and per-program library flags without encoding the tree. Materialization
+first checks the instance/source lease cache; a live file returns immediately. A genuine miss
+uses a supplied full response or fetches the existing Rust `source` operation once. Parsing still
+returns full data. No version negotiation or old-request compatibility path is introduced.
+
+Scratch contracts pass for supplied full responses, zero-fetch descriptor hits, one-fetch misses,
+parse target/version, diagnostic-file identity, pragmas, shared sources with per-program library
+flags, and bundled-library first use with no host version. The unchanged baseline demonstrably
+fails the descriptor-miss contract. Independent source review matches the frozen three-file patch
+and passes all eight registry/program focused tests; retention and finalizer guards are unchanged.
+
+Fresh Rust 1.98.1 size-profile WASM is 7,465,287 bytes, SHA-256
+`f218d5ac6c0971758ec9198d568f7bbc53f2543c05520127650c422094329a7a`.
+Runtime passes 69/69 with no skips; source and packed browser matrices each pass 4/4, packed Node
+passes and strict declarations have 65 members with zero diagnostics. The complete 7,853-case
+roster retains all 7,482 passing occurrences, with zero recovered, lost, absent or unrun cases;
+371 failures and 75 exclusions remain unchanged. All 19,915 original emit rows remain identical,
+with the strict guard independently validating the full 19,922-input inventory and unchanged
+seven non-UTF-8 exclusions. Scoped native `ts_wasm` tests pass 2/2 on Rust 1.93.0. The first
+formatter attempt failed because that toolchain lacks rustfmt; the installed 1.97.1 formatter
+then passes both files. No shared `ts_goport` source changed. Formal R188 remains **unrun** and
+the historical fourteen-binary 181,927 result is not fresh evidence for u10.
+
+Count-only probes use the identical 59,844-byte fixture. Open response bytes fall
+1,002,303 → 501,420; thirty edits fall 30,064,018 → 15,037,187. Open remains 15 bridge calls,
+each edit remains ten calls, and both arms perform zero extra full-source fetches in these phases.
+Completion response bytes remain 125,902 across thirty calls to the service (900 bridge calls).
+Both arms retain `fileExists=93`, `readFile=0`, 31 snapshots and 184 version calls. Instrumented
+probe timings are excluded.
+
+Six fresh processes per arm, alternating triplet order and the unchanged original workload,
+measure the following median / p95 of process phase medians in milliseconds. No ts-rust build,
+full roster, corpus or diagnostic profile overlaps these timing processes. A subsequent process
+inspection found unrelated owner build/test jobs with elapsed times overlapping the run; none
+was stopped or altered. These are shared-host latency observations, not isolated speedup proof.
+Edit observations are not pooled; module loading is reported separately.
+
+| Phase | Frozen u9 baseline | Descriptor candidate | TypeScript 6.0.3 |
+| --- | ---: | ---: | ---: |
+| Open | 72.789 / 100.725 | 87.362 / 112.692 | 75.641 / 108.363 |
+| Edit / program update | 27.023 / 42.221 | 21.208 / 38.891 | 7.491 / 12.812 |
+| Completions | 12.653 / 18.820 | 11.791 / 20.135 | 0.679 / 1.360 |
+| Quick info | 1.751 / 2.597 | 1.530 / 2.456 | 0.677 / 1.223 |
+| Diagnostics | 7.328 / 14.610 | 6.982 / 15.368 | 4.497 / 10.421 |
+| 20,000 line/position round trips | 14.488 / 21.734 | 16.815 / 22.132 | 4.971 / 7.133 |
+
+Module-load median / p95 is 165.882 / 772.001 ms baseline, 152.077 / 477.143 ms candidate,
+172.375 / 295.082 ms reference. Observed edit median is 21.5% lower, but cold open median is
+20.0% higher and repeated line-map median is 16.1% higher. Shared-host contention and variable
+results preclude a causal latency improvement or broad parity claim. The deterministic payload
+reduction is approximately 50%.
+Evidence: `/work/tmp/tsrust-ls-probes/u10-descriptors/final`, with count-only results in the
+sibling `count-only` directory. Independent regression audit returned LOCAL PASS for the exact
+frozen source/WASM: all 7,853 occurrence-qualified identities were compared, all 7,482 passes
+retained, strict corpus completeness independently checked, and all eighteen timing outputs
+validated. This approves local publication only; original-JavaScript boundaries and formal
+compiler acceptance remain open. Shared-host timings establish no isolated speedup.
+All seven original-JavaScript boundary routes still **STOP**, with binder-factory initialization
+observed and transitive closure unproved. Dependency checks still report no unresolved imports,
+missing packed files or browser Node imports.
+
+#### Approved continuation after u10
+
+1. Finish the end-to-end edit-cost unit. The named diagnostic profile in
+   `u10-descriptors/profile-debug` uses a different name-retaining WASM and overlaps correctness
+   gates: its timings are excluded. Of 3,198 edit samples, 1,589 include Rust `encode_tree`,
+   994 include parse-cache acquisition and 991 include parsing. These counts overlap; encoding
+   is the largest demonstrated remaining edit subtree. Investigate its allocations and child/data
+   traversal before changing the shared encoder. Any `ts_goport` change needs fresh independent
+   review, the fourteen-binary native comparison with zero losses, and original corpus checks.
+2. Profile and repair completion cost. The same diagnostic run has 1,670 completion samples;
+   505 include `NodeIndexTable::get_index`, 481 its first-use sort, and 362 `get_node_id`.
+   Exclusive leaves include 303 JS `wrap` samples and 300 Rust `get_node_id` samples. Inspect
+   wrapper materialization and the per-version node-handle index separately; measure candidates
+   with six fresh processes and the full retained roster. The source/data representation,
+   rather than callback count, is the demonstrated remaining cost.
+3. Close all seven Rust-ownership boundaries: dedicated syntax-only JSON and detached entity/
+   JSDoc parsing; resolver lookup metadata and arbitrary resolution requests; structured printer
+   writers and synthesized-tree encoding; transform context ABI. Keep dependency checks green.
+4. Recover the 371 failures, rename first. Of 13 file-rename failures, eleven occur after moving
+   and two before moving. Stored resolver results lack ordered failed/affecting locations;
+   Classic/Node10 resolution is also missing for the two pre-move cases. Preserve all sixteen
+   passing file-rename controls. Twelve destructuring breakpoints expose array-binding holes as
+   `BindingElement` where classic expects `OmittedExpression`. Four direct failures require
+   `getAnyAsyncIterableType`, `getNullableType` and `writeTypePredicate`. No recovery is yet claimed.
 
 ## Native regression repair after r35
 

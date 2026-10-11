@@ -247,7 +247,7 @@ impl Graphs {
             .map_or(&[][..], |metadata| metadata.version.as_slice());
         let mut result = crate::classic_sources::with_sources(|sources| {
             let id = sources.retain(&file, owner.parse_target.get().unwrap_or(1), version);
-            sources.response(id)
+            sources.descriptor(id)
         })?;
         result["defaultLibrary"] = json!(program.is_source_file_default_library(file.path()));
         result["externalLibrary"] = json!(program.is_source_file_from_external_library(&file));

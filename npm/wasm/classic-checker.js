@@ -1,7 +1,7 @@
 import { decodeSyntheticNode, nodeHandle, nodeLease } from "./classic-ast.js";
 import { classicNamespace } from "./classic-module.js";
 import { signatureDocumentationMembers, symbolDocumentationMembers } from "./classic-symbol-docs.js";
-import { EmitHint, NodeBuilderFlags, NodeFlags, SignatureKind, SymbolFormatFlags, SyntaxKind, TypeFormatFlags, TypeFlags, ObjectFlags, SymbolFlags, nativeSyntaxKind, nativeTypeFlags, nativeObjectFlags, nativeSymbolFlags } from "./classic-enums.js";
+import { EmitHint, NodeBuilderFlags, NodeFlags, SignatureKind, SymbolFormatFlags, SyntaxKind, TypeFormatFlags, TypeFlags, ObjectFlags, SymbolFlags, nativeSyntaxKind, nativeTypeFlags, nativeObjectFlags, nativeSymbolFlags, SignatureFlags, nativeSignatureFlags } from "./classic-enums.js";
 
 function translateBits(flags, source, destination) {
     let result = 0;
@@ -79,7 +79,7 @@ export function createTypeChecker(lease, resolveNode) {
         if (value.$node) return resolveNode(value.$node);
         if (value.$indexInfo) return indexInfo(value);
         if (value.$typePredicate) return typePredicate(value);
-        if (value.$synthetic) return decodeSyntheticNode(value.$synthetic, new Map(value.symbols.map(([index, symbol]) => [index, decode(symbol)])));
+        if (value.$synthetic) return decodeSyntheticNode(value.$synthetic, new Map(value.symbols.map(([index, symbol]) => [index, decode(symbol)])), new Map(value.emitFlags), new Set(value.singleQuotes));
         return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, decode(item)]));
     }
 
@@ -158,6 +158,10 @@ export function createTypeChecker(lease, resolveNode) {
             get typeArguments() {
                 return (object.flags & TypeFlags.Object) !== 0 && (object.objectFlags & ObjectFlags.Reference) !== 0 ? checker.getTypeArguments(object) : undefined;
             },
+            // Classic's resolved `TypeParameter.constraint`, which code fixes read directly.
+            get constraint() {
+                return (object.flags & TypeFlags.TypeParameter) !== 0 ? checker.getConstraintOfTypeParameter(object) : undefined;
+            },
         }), origin, true);
     }
 
@@ -193,7 +197,11 @@ export function createTypeChecker(lease, resolveNode) {
     }
 
     function signature(id, origin) {
-        return intern(signatures, id, "signature", "getSignatureData", data => data, object => ({
+        return intern(signatures, id, "signature", "getSignatureData", data => {
+            // The port's `Construct` bit has no classic counterpart; classic `Abstract` shares its value.
+            data.flags = translateBits(data.flags, nativeSignatureFlags, SignatureFlags);
+            return data;
+        }, object => ({
             getDeclaration: () => object.declaration,
             getTypeParameters: () => object.typeParameters,
             getParameters: () => object.parameters,
@@ -261,6 +269,15 @@ export function createTypeChecker(lease, resolveNode) {
             return node ? query(method, { location: location(node) }) : missing();
         };
     }
+    // Classic answers a `@param` tag's tag name with the tag's parameter, as it answers the name
+    // (`getParameterSymbolFromJSDoc`); Go answers only the name.
+    const symbolAtLocation = checker.getSymbolAtLocation;
+    checker.getSymbolAtLocation = nodeIn => {
+        const node = parseTree(nodeIn);
+        const tag = node?.parent;
+        if (tag?.kind !== SyntaxKind.JSDocParameterTag || node !== tag.tagName) return symbolAtLocation(nodeIn);
+        return tag.name.kind === SyntaxKind.Identifier ? symbolAtLocation(tag.name) : undefined;
+    };
     for (const method of ["getDeclaredTypeOfSymbol", "getTypeOfSymbol", "getAliasedSymbol", "getImmediateAliasedSymbol", "getMergedSymbol", "getRootSymbols", "getExportsOfModule", "getFullyQualifiedName"]) {
         checker[method] = object => query(method, { symbol: handle(object, "symbol"), origin: objectHandles.get(object)?.origin });
     }
@@ -438,7 +455,7 @@ export function createTypeChecker(lease, resolveNode) {
     checker.symbolToParameterDeclaration = (symbol, enclosing, flags, internalFlags) => build("symbolToParameterDeclaration", symbolParams(symbol), enclosing, flags, internalFlags)[0];
     checker.symbolToTypeParameterDeclarations = (symbol, enclosing, flags, internalFlags) => {
         const nodes = build("symbolToTypeParameterDeclarations", symbolParams(symbol), enclosing, flags, internalFlags);
-        return nodes.length ? classicNamespace().factory.createNodeArray(nodes) : undefined;
+        return nodes && classicNamespace().factory.createNodeArray(nodes);
     };
     checker.signatureToSignatureDeclaration = (signature, kind, enclosing, flags, internalFlags) => build("signatureToSignatureDeclaration", {
         signature: handle(signature, "signature"), kind: nativeSyntaxKind[SyntaxKind[kind]], origin: objectHandles.get(signature)?.origin,
@@ -511,6 +528,7 @@ export function createTypeChecker(lease, resolveNode) {
         return query("typeToString", { type: handle(type, "type"), location: enclosing && location(enclosing), origin: objectHandles.get(type)?.origin });
     };
     checker.symbolToString = symbol => query("symbolToString", { symbol: handle(symbol, "symbol") });
-    checker.signatureToString = signature => query("signatureToString", { signature: handle(signature, "signature"), origin: objectHandles.get(signature)?.origin });
+    checker.signatureToString = (signature, enclosing, flags, kind) =>
+        classicNamespace().usingSingleLineStringWriter(writer => void writeSignature(signature, parseTree(enclosing), flags, kind, writer));
     return checker;
 }

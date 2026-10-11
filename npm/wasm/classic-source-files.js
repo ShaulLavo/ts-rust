@@ -39,6 +39,7 @@ export function materializeSourceFile(instance, response) {
         file.hasNoDefaultLib = false;
         addSourceFileMembers(file, instance, response.source);
         file.pragmas = pragmaMap(response.pragmas ?? []);
+        file.checkJsDirective = checkJsDirective(file.pragmas);
         lease.file = new WeakRef(file);
     }
     return file;
@@ -63,6 +64,17 @@ function pragmaMap(pragmas) {
     return result;
 }
 
+/** Classic `processPragmasIntoFields`: the last `ts-check` or `ts-nocheck` comment decides. */
+function checkJsDirective(pragmas) {
+    let directive;
+    for (const key of ["ts-check", "ts-nocheck"]) {
+        for (const entry of [].concat(pragmas.get(key) ?? [])) {
+            if (!directive || entry.range.pos > directive.pos) directive = { enabled: key === "ts-check", end: entry.range.end, pos: entry.range.pos };
+        }
+    }
+    return directive;
+}
+
 /** SourceFileObject's `identifiers` (read once from Rust) and `getNamedDeclarations`. */
 function addSourceFileMembers(file, instance, source) {
     Object.defineProperty(file, "identifiers", {
@@ -74,6 +86,17 @@ function addSourceFileMembers(file, instance, source) {
         },
     });
     file.getNamedDeclarations = () => getNamedDeclarations(file, namedDeclarations);
+    // Classic's binder sets `commonJsModuleIndicator`; read it from the Rust binder's file info.
+    Object.defineProperty(file, "commonJsModuleIndicator", {
+        configurable: true, enumerable: true,
+        get() {
+            const handle = instance.call({ action: "sourceCommonJsModuleIndicator", source });
+            return handle ? resolveNodeHandle(file, handle) : undefined;
+        },
+        set(value) {
+            Object.defineProperty(file, "commonJsModuleIndicator", { configurable: true, enumerable: true, writable: true, value });
+        },
+    });
 }
 
 /** A classic `DiagnosticWithLocation` of `file`. */

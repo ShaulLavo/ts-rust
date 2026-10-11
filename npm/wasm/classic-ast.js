@@ -1,6 +1,6 @@
 import { decodeNode, RemoteNode, RemoteNodeList } from "./native-ast.js";
-import { SyntaxKind, NodeFlags, TokenFlags, ModifierFlags,
-    nativeSyntaxKind, nativeNodeFlags, nativeTokenFlags, nativeModifierFlags } from "./classic-enums.js";
+import { SyntaxKind, NodeFlags, TokenFlags, ModifierFlags, EmitFlags,
+    nativeSyntaxKind, nativeNodeFlags, nativeTokenFlags, nativeModifierFlags, nativeEmitFlags } from "./classic-enums.js";
 import { nodeFields } from "./classic-node-fields.js";
 import { classicNamespaceOrUndefined } from "./classic-module.js";
 
@@ -74,13 +74,13 @@ const kindProperties = {
     Identifier: ["escapedText", "text"], PrivateIdentifier: ["escapedText", "text"],
     JSDocText: ["text"], JSDocLink: ["text"], JSDocLinkPlain: ["text"], JSDocLinkCode: ["text"],
     JSDocParameterTag: ["isNameFirst", "isBracketed"], JSDocPropertyTag: ["isNameFirst", "isBracketed"],
-    JSDocTypeLiteral: ["isArrayType"],
+    JSDocTypeLiteral: ["isArrayType"], JSDocTypedefTag: ["fullName"], JSDocCallbackTag: ["fullName"],
     NumericLiteral: ["text", "numericLiteralFlags"], BigIntLiteral: ["text"], StringLiteral: ["text", "singleQuote"],
     RegularExpressionLiteral: ["text"], NoSubstitutionTemplateLiteral: ["text", "rawText", "templateFlags"],
     TemplateHead: ["text", "rawText", "templateFlags"], TemplateMiddle: ["text", "rawText", "templateFlags"], TemplateTail: ["text", "rawText", "templateFlags"],
     JsxText: ["text", "containsOnlyTriviaWhiteSpaces"], PrefixUnaryExpression: ["operator"], PostfixUnaryExpression: ["operator"],
     TypeOperator: ["operator"], HeritageClause: ["token"], MetaProperty: ["keywordToken"],
-    ImportClause: ["isTypeOnly", "phaseModifier"], ImportSpecifier: ["isTypeOnly"], ExportSpecifier: ["isTypeOnly"], ExportDeclaration: ["isTypeOnly"],
+    ImportType: ["isTypeOf"], SyntaxList: ["_children"], ImportClause: ["isTypeOnly", "phaseModifier"], ImportSpecifier: ["isTypeOnly"], ExportSpecifier: ["isTypeOnly"], ExportDeclaration: ["isTypeOnly"],
     ImportEqualsDeclaration: ["isTypeOnly"], ImportAttributes: ["token", "multiLine"], ExportAssignment: ["isExportEquals"],
     SourceFile: ["text", "fileName", "path", "languageVersion", "languageVariant", "scriptKind", "isDeclarationFile", "referencedFiles",
         "typeReferenceDirectives", "libReferenceDirectives", "imports", "moduleAugmentations", "ambientModuleNames", "externalModuleIndicator", "parseDiagnostics", "bindDiagnostics", "version"],
@@ -88,14 +88,31 @@ const kindProperties = {
 const extraProperties = new Map();
 for (const [kind, fields] of Object.entries(kindProperties)) extraProperties.set(nativeSyntaxKind[kind], fields);
 
+// Classic names of native child fields, by native kind: classic name to native name.
+const renamedFields = new Map(Object.entries({
+    TypeParameter: { default: "defaultType" },
+    JSDocSeeTag: { name: "nameExpression" },
+    JSDocImplementsTag: { class: "className" },
+    JSDocAugmentsTag: { class: "className" },
+    JSDocTypeLiteral: { jsDocPropertyTags: "jsdocPropertyTags" },
+}).map(([kind, names]) => [nativeSyntaxKind[kind], names]));
+const nativeFieldNames = new Map(Array.from(renamedFields, ([kind, names]) => [kind, new Map(Object.entries(names).map(([classic, native]) => [native, classic]))]));
+
 function publicFields(raw) {
-    const children = (childFields.get(raw.kind) ?? []).flatMap(field => field === "postfixToken" ? ["questionToken", "exclamationToken"] : field ? [field] : []);
+    const renamed = nativeFieldNames.get(raw.kind);
+    const children = (childFields.get(raw.kind) ?? []).flatMap(field => field === "postfixToken" ? ["questionToken", "exclamationToken"]
+        : renamed?.has(field) ? [renamed.get(field)] : field ? [field] : []);
     return Array.from(new Set(["pos", "end", "kind", "id", "flags", "modifierFlagsCache", "transformFlags", "parent", "original", "emitNode"].concat(children, extraProperties.get(raw.kind) ?? [], ["jsDoc"])));
 }
 
 function jsDocProperties(raw) {
     if (raw.kind === nativeSyntaxKind.JSDocParameterTag || raw.kind === nativeSyntaxKind.JSDocPropertyTag) {
         return ["tagName"].concat(raw.isNameFirst ? ["name", "typeExpression"] : ["typeExpression", "name"], ["comment"]);
+    }
+    // Classic visits a typedef's name before a `JSDocTypeLiteral`, and a callback's before its signature.
+    if (raw.kind === nativeSyntaxKind.JSDocTypedefTag && raw.typeExpression?.kind !== nativeSyntaxKind.JSDocTypeExpression
+        || raw.kind === nativeSyntaxKind.JSDocCallbackTag) {
+        return ["tagName", "name", "typeExpression", "comment"];
     }
     return childFields.get(raw.kind) ?? [];
 }
@@ -123,6 +140,7 @@ function flagTranslation(native, classic) {
 const nodeFlagBits = flagTranslation(nativeNodeFlags, NodeFlags).filter(([bit]) => bit !== nativeNodeFlags.OptionalChain && bit !== nativeNodeFlags.ThisNodeOrAnySubNodesHasError);
 const tokenFlagBits = flagTranslation(nativeTokenFlags, TokenFlags);
 const modifierFlagBits = flagTranslation(nativeModifierFlags, ModifierFlags);
+const emitFlagBits = flagTranslation(nativeEmitFlags, EmitFlags);
 
 function translateFlags(value, bits) {
     let result = 0;
@@ -171,8 +189,8 @@ export function nodeHandle(node) {
 }
 
 /** Classic synthesized nodes from the node builder's binary output. */
-export function decodeSyntheticNode(bytes, symbols) {
-    return decodeSourceFile(bytes, {}, undefined, { symbols });
+export function decodeSyntheticNode(bytes, symbols, emitFlags = new Map(), singleQuotes = new Set()) {
+    return decodeSourceFile(bytes, {}, undefined, { symbols, emitFlags, singleQuotes });
 }
 
 export function resolveNodeHandle(sourceFile, handle) {
@@ -215,6 +233,8 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
     const nodes = new WeakMap();
     const arrays = new WeakMap();
     const children = new WeakMap();
+    // Builder output reuses the reparsed nodes JSDoc types become: there they are real children.
+    const isChild = synthetic ? raw => (raw.flags & nativeNodeFlags.Reparsed) !== 0 || isClassicChild(raw) : isClassicChild;
 
     function wrap(value) {
         if (Array.isArray(value)) return wrapArray(value);
@@ -228,6 +248,12 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         const allowed = new Set(fields.concat(Array.from(nodeMethods), value === root && !synthetic ? Array.from(fileMethods) : []));
         // A synthesized identifier carries the symbol the node builder named it for.
         if (synthetic?.symbols.has(value.index)) overrides.symbol = synthetic.symbols.get(value.index);
+        // The builder's emit flags, as classic's builder sets them with `setEmitFlags`.
+        if (synthetic?.emitFlags.has(value.index)) {
+            const native = synthetic.emitFlags.get(value.index);
+            overrides.emitNode = { flags: translateFlags(native, emitFlagBits) };
+            if (native & nativeEmitFlags.StartOnNewLine) overrides.emitNode.startsOnNewLine = true;
+        }
         const keys = () => Reflect.isExtensible(overrides) ? Array.from(new Set(fields.filter(field => !deleted.has(field)).concat(Reflect.ownKeys(overrides)))) : Reflect.ownKeys(overrides);
         const get = property => {
             if (Object.hasOwn(overrides, property)) return Reflect.get(overrides, property, node);
@@ -263,13 +289,14 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
         });
         nodes.set(value, node);
         nativeNodes.set(node, { node: value, root, wrap, lease, synthetic: synthetic !== undefined });
+        if (synthetic) parenthesizeChildren(node, overrides);
         return node;
     }
 
     function wrapArray(value) {
         let result = arrays.get(value);
         if (result) return result;
-        result = Array.from(value).filter(isClassicChild).map(wrap);
+        result = Array.from(value).filter(isChild).map(wrap);
         arrays.set(value, result);
         for (const property of ["pos", "end", "hasTrailingComma", "transformFlags"]) {
             if (value[property] !== undefined) result[property] = value[property];
@@ -280,15 +307,22 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
 
     function read(raw, overrides, property) {
         if (Object.hasOwn(overrides, property)) return overrides[property];
-        if (property === "kind") return translateKind(raw.kind);
+        if (property === "kind") return isUnknownJSDocType(raw) ? SyntaxKind.JSDocUnknownType : translateKind(raw.kind);
+        if (property === "type" && isUnknownJSDocType(raw)) return undefined;
         // Builder output is synthesized, as classic factory nodes are: no position, no parent.
         if (synthetic && (property === "pos" || property === "end")) return -1;
         if (synthetic && property === "parent") return undefined;
+        // A classic JSDoc comment starts at its `/**`; the native node starts at the trivia before it.
+        if (property === "pos" && raw.kind === nativeSyntaxKind.JSDoc && classicNamespaceOrUndefined()) {
+            const range = classicNamespaceOrUndefined().getLeadingCommentRanges(root.text, raw.pos)?.find(comment => comment.end === raw.end);
+            return range ? range.pos : raw.pos;
+        }
         if (property === "flags") return translateNodeFlags(raw) | (synthetic ? NodeFlags.Synthesized : 0);
         if (property === "tokenFlags") return translateFlags(raw.tokenFlags ?? 0, tokenFlagBits);
         if (property === "templateFlags") return translateFlags(templateFlags(raw), tokenFlagBits) & TokenFlags.TemplateLiteralLikeFlags;
         if (property === "modifierFlags") return translateFlags(raw.modifierFlags ?? 0, modifierFlagBits);
         if (property === "id") return 0;
+        if (property === "transformFlags") return !synthetic && containsJsx(raw) ? transformFlagsContainsJsx : 0;
         if (property === "escapedText") return escapedText(raw);
         if (property === "numericLiteralFlags") return translateFlags(raw.tokenFlags, tokenFlagBits);
         if (property === "rawText" && raw.kind === nativeSyntaxKind.NoSubstitutionTemplateLiteral) {
@@ -296,8 +330,15 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
             return raw.sourceFile.text.slice(raw.getStart() + 1, raw.end - delimiter);
         }
         if (property === "questionToken" || property === "exclamationToken") return postfixToken(raw, property);
+        if (property === "jsDocPropertyTags" && raw.kind === nativeSyntaxKind.JSDocTypeLiteral) return propertyTags(raw);
+        const native = renamedFields.get(raw.kind)?.[property];
+        if (native) return read(raw, overrides, native);
+        // Classic sets `singleQuote` only on factory literals; the builder says which of its are.
+        if (property === "singleQuote") return synthetic?.singleQuotes.has(raw.index) ? true : undefined;
         if (["operator", "keywordToken", "token", "phaseModifier"].includes(property)) return translateKind(raw[property]);
-        if (property === "forEachChild") return (visit, visitArray) => visitChildren(raw, visit, visitArray);
+        if (property === "forEachChild") return synthetic
+            ? (visit, visitArray) => classicNamespaceOrUndefined().forEachChild(wrap(raw), visit, visitArray)
+            : (visit, visitArray) => visitChildren(raw, visit, visitArray);
         if (property === "comment" && Array.isArray(raw.comment)) return comment(raw.comment);
         if (property === "getFirstToken" || property === "getLastToken") return source => edgeToken(wrap(raw), property === "getFirstToken", source);
         if (raw === root && Object.hasOwn(metadata, property)) return metadata[property];
@@ -310,13 +351,22 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
             if (!end) end = starts[line + 1] - 1;
             return root.text[end] === "\n" && root.text[end - 1] === "\r" ? end - 1 : end;
         };
+        // Classic's typedef and callback tags name their full (possibly namespaced) name `fullName`
+        // and its innermost identifier `name`.
+        if ((raw.kind === nativeSyntaxKind.JSDocTypedefTag || raw.kind === nativeSyntaxKind.JSDocCallbackTag) && (property === "fullName" || property === "name")) {
+            let name = raw.name;
+            if (property === "name") while (name?.kind === nativeSyntaxKind.ModuleDeclaration) name = name.body ?? name.name;
+            return wrap(name);
+        }
+        // Classic's `SyntaxList` keeps its children in `_children`; `getTokenPosOfNode` reads it.
+        if (property === "_children" && raw.kind === nativeSyntaxKind.SyntaxList) return classicChildren(raw, wrap(root));
         if (property === "getChildren") return source => classicChildren(raw, source);
         if (property === "getChildCount") return source => classicChildren(raw, source).length;
         if (property === "getChildAt") return (index, source) => classicChildren(raw, source)[index];
         const value = raw[property];
         if (typeof value === "function") return (...args) => wrap(value.apply(raw, args.map(unwrapNode)));
-        if (typeof value?.kind === "number" && !isClassicChild(value)) return undefined;
-        if (property === "modifiers" && value?.length && !Array.from(value).some(isClassicChild)) return undefined;
+        if (typeof value?.kind === "number" && !isChild(value)) return undefined;
+        if (property === "modifiers" && value?.length && !Array.from(value).some(isChild)) return undefined;
         return wrap(value);
     }
 
@@ -329,28 +379,49 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
             children.set(raw, result);
             return result;
         }
-        result = raw.getChildren(unwrapNode(source)).flatMap(child => child.kind === nativeSyntaxKind.LessThanSlashToken
+        result = raw.getChildren(unwrapNode(source)).filter(child => !isUnknownJSDocType(raw) || child !== raw.type).flatMap(child => child.kind === nativeSyntaxKind.LessThanSlashToken
             ? [syntheticToken(child, nativeSyntaxKind.LessThanToken, child.pos, child.end - 1), syntheticToken(child, nativeSyntaxKind.SlashToken, child.end - 1, child.end)]
-            : isClassicChild(child) ? [wrap(child)] : []);
+            : isChild(child) ? [wrap(child)] : []);
         children.set(raw, result);
         return result;
     }
 
     function comment(parts) {
+        // Classic leaves `comment` undefined when the comment has no text.
+        if (parts.length === 0) return undefined;
         if (Array.from(parts).every(part => part.kind === nativeSyntaxKind.JSDocText)) return Array.from(parts, part => part.text).join("");
         return wrapArray(parts);
     }
 
     function visitChildren(raw, visit, visitArray) {
+        if (isUnknownJSDocType(raw)) return undefined;
         if (isCommentContainer(raw.kind)) return visitFields(jsDocProperties(raw), raw, visit, visitArray);
-        return raw.forEachChild(child => isClassicChild(child) ? visit(wrap(child)) : undefined,
-            visitArray && (children => Array.from(children).some(isClassicChild) || children.length === 0 ? visitArray(wrapArray(children)) : undefined));
+        return raw.forEachChild(child => isChild(child) ? visit(wrap(child)) : undefined,
+            visitArray && (children => Array.from(children).some(isChild) || children.length === 0 ? visitArray(wrapArray(children)) : undefined));
+    }
+
+    // Go's `JSDocPropertyTags` is a slice the encoder writes as direct children, so the native
+    // field answers only the first; classic's is a plain array of every tag.
+    const propertyTagLists = new WeakMap();
+    function propertyTags(raw) {
+        let result = propertyTagLists.get(raw);
+        if (result) return result;
+        result = Array.from(raw.getChildren()).filter(child => child.kind === nativeSyntaxKind.JSDocParameterTag || child.kind === nativeSyntaxKind.JSDocPropertyTag).map(wrap);
+        if (result.length === 0) result = undefined;
+        propertyTagLists.set(raw, result);
+        return result;
     }
 
     function visitFields(properties, raw, visit, visitArray) {
         for (const property of properties) {
+            if (property === "jsdocPropertyTags") {
+                const tags = propertyTags(raw);
+                const result = tags && visitNodes(tags, visit, undefined);
+                if (result) return result;
+                continue;
+            }
             const value = raw[property];
-            if (!value || (property === "comment" && typeof comment(value) === "string")) continue;
+            if (!value || (property === "comment" && !Array.isArray(comment(value)))) continue;
             const result = Array.isArray(value) ? visitNodes(wrapArray(value), visit, visitArray) : visit(wrap(value));
             if (result) return result;
         }
@@ -379,6 +450,68 @@ export function decodeSourceFile(bytes, metadata = {}, lease, synthetic) {
     }
 
     return wrap(root);
+}
+
+// Classic's factory parenthesizes a node's children as it creates the node, and its printer
+// relies on that; the port's factory leaves it to the port's printer. Builder output therefore
+// gets the parenthesization the classic constructor of each node gives.
+const parenthesizedChildren = {
+    ArrayType: [["elementType", "parenthesizeNonArrayTypeOfPostfixType"]],
+    IndexedAccessType: [["objectType", "parenthesizeNonArrayTypeOfPostfixType"]],
+    OptionalType: [["type", "parenthesizeTypeOfOptionalType"]],
+    UnionType: [["types", "parenthesizeConstituentTypesOfUnionType"]],
+    IntersectionType: [["types", "parenthesizeConstituentTypesOfIntersectionType"]],
+    ConditionalType: [["checkType", "parenthesizeCheckTypeOfConditionalType"], ["extendsType", "parenthesizeExtendsTypeOfConditionalType"]],
+    TupleType: [["elements", "parenthesizeElementTypesOfTupleType"]],
+    TypeReference: [["typeArguments", "parenthesizeTypeArguments"]],
+    TypeQuery: [["typeArguments", "parenthesizeTypeArguments"]],
+    ImportType: [["typeArguments", "parenthesizeTypeArguments"]],
+    ExpressionWithTypeArguments: [["expression", "parenthesizeLeftSideOfAccess"], ["typeArguments", "parenthesizeTypeArguments"]],
+    PropertyAccessExpression: [["expression", "parenthesizeLeftSideOfAccess"]],
+    ElementAccessExpression: [["expression", "parenthesizeLeftSideOfAccess"]],
+    ComputedPropertyName: [["expression", "parenthesizeExpressionOfComputedPropertyName"]],
+};
+
+const parenthesizedChildrenByKind = new Map(Object.entries(parenthesizedChildren).map(([name, children]) => [SyntaxKind[name], children]));
+
+function parenthesizeChildren(node, overrides) {
+    const ts = classicNamespaceOrUndefined();
+    if (!ts) return;
+    const rules = ts.factory.parenthesizer;
+    const kind = node.kind;
+    const children = kind === SyntaxKind.TypeOperator
+        ? [["type", node.operator === SyntaxKind.ReadonlyKeyword ? "parenthesizeOperandOfReadonlyTypeOperator" : "parenthesizeOperandOfTypeOperator"]]
+        : parenthesizedChildrenByKind.get(kind);
+    if (!children) return;
+    for (const [property, rule] of children) {
+        const child = node[property];
+        if (child === undefined) continue;
+        const result = rules[rule](child);
+        if (result !== child) overrides[property] = result;
+    }
+}
+
+// Classic `TransformFlags.ContainsJsx`, the one transform flag services read (moving JSX
+// statements, JSX completions and fixes). Other flags drive classic's emit, which never runs.
+const transformFlagsContainsJsx = 2;
+const jsxSubtrees = new WeakMap();
+function containsJsx(raw) {
+    let result = jsxSubtrees.get(raw);
+    if (result !== undefined) return result;
+    result = raw.kind === nativeSyntaxKind.JsxText || raw.kind === nativeSyntaxKind.JsxTextAllWhiteSpaces
+        || (raw.kind >= nativeSyntaxKind.JsxElement && raw.kind <= nativeSyntaxKind.JsxNamespacedName)
+        || !!raw.forEachChild(child => containsJsx(child) || undefined);
+    jsxSubtrees.set(raw, result);
+    return result;
+}
+
+// Go parses a lone `?` JSDoc type as a nullable type over a missing reference; classic parses
+// it as `JSDocUnknownType`.
+function isUnknownJSDocType(raw) {
+    if (raw.kind !== nativeSyntaxKind.JSDocNullableType) return false;
+    const type = raw.type;
+    return type?.kind === nativeSyntaxKind.TypeReference && type.pos === type.end && type.end === raw.end
+        && type.typeName?.kind === nativeSyntaxKind.Identifier && type.typeName.text === "";
 }
 
 function templateFlags(raw) {

@@ -10,11 +10,12 @@ use ts_goport::binder::go_symbol_name;
 use ts_goport::checker::{Checker, InternalNodeBuilderFlags, LiteralValue, NodeBuilderFlags};
 use ts_goport::core::{IndexInfoId, Node, SignatureId, SymbolId, TypeId, TypePredicateId};
 use ts_goport::flags::{
-    CheckFlags, ContextFlags, SignatureKind, SymbolFlags, TypeFlags, TypePredicateKind,
+    CheckFlags, ContextFlags, SignatureKind, SymbolFlags, TokenFlags, TypeFlags, TypePredicateKind,
     UnionReduction,
 };
 use ts_goport::frontend::compiler::NewProgram;
 use ts_goport::gostd::Context;
+use ts_goport::printer::EmitFlags;
 use ts_goport::program::ls_program;
 
 pub struct ClassicChecker {
@@ -599,10 +600,26 @@ impl ClassicChecker {
                     &builder, symbol, enclosing, flags, internal, None,
                 )]
             }
-            "symbolToTypeParameterDeclarations" => checker
-                .node_builder_symbol_to_type_parameter_declarations(
-                    &builder, symbol, enclosing, flags, internal, None,
-                ),
+            // Classic's rule (`typeParametersToTypeParameterDeclarations`): a class, interface or
+            // type alias target gives its local type parameters, any other symbol none. Go also
+            // takes functions and tests `Alias` where classic tests `TypeAlias`.
+            "symbolToTypeParameterDeclarations" => {
+                let target = checker.get_target_symbol(symbol);
+                if !checker.sym(target).flags.intersects(
+                    SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS,
+                ) {
+                    return Ok(Value::Null);
+                }
+                checker
+                    .get_local_type_parameters_of_class_or_interface_or_type_alias(symbol)
+                    .into_iter()
+                    .map(|parameter| {
+                        checker.node_builder_type_parameter_to_declaration(
+                            &builder, parameter, enclosing, flags, internal, None,
+                        )
+                    })
+                    .collect()
+            }
             "signatureToSignatureDeclaration" => {
                 let kind = u16::try_from(number(request, "kind")?)
                     .ok()
@@ -623,6 +640,7 @@ impl ClassicChecker {
             operation => return Err(format!("unknown node builder operation: {operation}")),
         };
         let identifiers = builder.borrow().impl_.borrow().id_to_symbol.clone();
+        let emit_context = builder.borrow().impl_.borrow().e.clone();
         let mut results = Vec::with_capacity(nodes.len());
         for node in nodes {
             if node.is_nil() {
@@ -641,7 +659,36 @@ impl ClassicChecker {
                     Some(json!([index, self.symbol_ref(*symbol)]))
                 })
                 .collect::<Vec<_>>();
-            results.push(json!({"$synthetic": {"$payload": [offset, length]}, "symbols": symbols}));
+            // Classic's builder marks nodes (single-line type literals and tuples, unescaped
+            // literals) with emit flags; the port records the same flags in its emit context.
+            let emit_flags = table
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    let flags = emit_context.emit_flags(*node);
+                    (flags != EmitFlags::NONE).then(|| json!([index, flags.bits()]))
+                })
+                .collect::<Vec<_>>();
+            // Classic `singleQuote`: a literal the builder makes takes the quote it chose; a source
+            // literal it reuses keeps classic's parsed `undefined` unless the builder's flags ask
+            // for single quotes. The port's reused literals keep the parser's quote flag.
+            let single_quotes = table
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.is_some() && node.kind() == SyntaxKind::StringLiteral)
+                .filter(|(_, node)| {
+                    if node.pos() >= 0 || emit_context.original(**node).is_some() {
+                        flags
+                            .intersects(NodeBuilderFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE)
+                    } else {
+                        node.token_flags().intersects(TokenFlags::SINGLE_QUOTE)
+                    }
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            results.push(json!({"$synthetic": {"$payload": [offset, length]}, "symbols": symbols, "emitFlags": emit_flags, "singleQuotes": single_quotes}));
         }
         Ok(Value::Array(results))
     }

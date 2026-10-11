@@ -242,6 +242,22 @@ impl Sources {
         ))
     }
 
+    /// Classic `SourceFile.commonJsModuleIndicator`, which the binder sets: the node's index in
+    /// the file's encoding, or null before binding or for a file without one.
+    pub fn common_js_module_indicator(&self, id: u32) -> Result<Value, String> {
+        let source = self
+            .files
+            .get(&id)
+            .ok_or("source file lease has been released")?;
+        let root = source.file.root;
+        let indicator = ts_goport::ast::source_file_info(root).common_js_module_indicator;
+        if indicator.is_nil() {
+            return Ok(Value::Null);
+        }
+        let index = encoder::get_node_index_table(root).get_index(indicator);
+        Ok(json!({"index": index, "nativeKind": indicator.kind() as u32}))
+    }
+
     pub fn resolve(&self, location: &Value) -> Result<Node, String> {
         if location.is_null() {
             return Ok(Node::NIL);

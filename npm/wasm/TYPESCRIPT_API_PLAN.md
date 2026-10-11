@@ -149,6 +149,58 @@ Every classic service and registry of a compiled module lives in one shared WASM
 (`classic-instance.js`). A shared registry therefore shares Rust parses, so `SourceFile` and node
 identity hold across services.
 
+## Builder output, signatures and JSDoc nodes (unit 4, fifth batch)
+
+Injected run: **7,023 of 7,853** (fourslash 5,530, services 1,493), none lost against `r16` or
+`r17` (`r17`, `r18` in `/work/tmp/tsrust-ls-probes/u3/`, compare with `ldiff.sh`).
+
+- Builder nodes carry the port builder's emit flags (`SingleLine` type literals and tuples,
+  `NoAsciiEscaping`), translated by name, and classic `singleQuote`: a literal the builder makes
+  takes its chosen quote; a reused source literal is single-quoted only under
+  `UseSingleQuotesForStringLiteralType`, as classic's clone is.
+- Builder nodes get the parenthesization classic's factory constructors apply (array and
+  indexed-access element types, union and intersection members, optional, tuple, conditional,
+  type operator, type arguments, access expressions, computed names); their `forEachChild` is
+  classic's, so it sees the same children. Reparsed nodes the builder reuses (JSDoc types in
+  JS) are kept as children.
+- `symbolToTypeParameterDeclarations` follows classic: class, interface and type alias targets
+  give their local type parameters (an empty array when none), other symbols undefined. Go
+  tests `Alias` where classic tests `TypeAlias` and also takes functions.
+- Field names: `TypeParameterDeclaration.default`, `ImportTypeNode.isTypeOf`,
+  `JSDocSeeTag.name`, `class` of `@augments`/`@implements`, `JSDocTypeLiteral.jsDocPropertyTags`
+  (every tag; the native field answers only the first), typedef and callback `fullName` and
+  `name`, `SyntaxList._children`. A JSDoc comment starts at its `/**`; an empty comment is
+  undefined; typedef children follow classic's visiting order; a lone `{?}` (Go: nullable over
+  a missing reference) is `JSDocUnknownType`.
+- Signatures have classic `flags` (the port's `Construct` bit read as classic `Abstract`);
+  `signatureToString` takes its flags and kind; type parameters answer classic's `constraint`.
+- Source files: `checkJsDirective` from the pragmas, `commonJsModuleIndicator` from the Rust
+  binder, and node `transformFlags` with classic's `ContainsJsx` (the only bit services read).
+- A `@param` tag name answers the parameter symbol, as classic's checker does.
+
+Deviations: `transformFlags` holds only `ContainsJsx`; a type parameter's `constraint` is the
+resolved constraint at any time (classic's field is unset before resolution and holds
+`noConstraintType` for an unconstrained parameter).
+
+Classified, not changed (the port follows TypeScript-Go at its pin): no `@enum` tag, no
+closure-style `function(...)` JSDoc types or JS constructor functions; an untyped `@typedef` is
+not an alias; a hyphenated `@property` name reparses to a string-literal name, so hovering it
+finds no symbol; Go's builder builds predicate and qualified-chain types fresh where classic
+reuses the source node (`this is (A & B)` prints without parentheses); which duplicate
+object-literal member a name resolves to.
+
+Remaining in the two groups (`s1i`): 8 range-text and 29 quick-info cases, of which the index
+signature display needs `getIndexInfosAtLocation` (item 8), truncation needs the builder's
+maximum length, and the rest are the classified port semantics above plus copied comments on
+builder output (`codeFixClassImplementInterfaceComments`), mapped-type key remapping and
+JSDoc closure types.
+
+Next by failing count (`r18`): `getSymbolOfExpando` (47), unbacked nodes (42), `program.emit`
+(36), types of another checker (36), `createSymbol` (31), quick info text (29), builder-node
+`getChildren` (21), `getIndexInfosAtLocation` (20), `createSignature` (19),
+`getExactOptionalProperties` (15), range text (12), `isLibType` (12),
+`getClassifiableNames` (12), `getSymbolWalker` (11).
+
 ## Options, pragmas and parameter info (unit 4, fourth batch)
 
 Injected run: **6,793 of 7,853** (fourslash 5,305, services 1,488), none lost against the

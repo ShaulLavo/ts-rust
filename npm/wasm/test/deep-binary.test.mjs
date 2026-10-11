@@ -62,10 +62,9 @@ test("preserves assignment, destructuring and comma-call flow order", async () =
     ]);
 });
 
-test("visits both binary subtrees once and retains parse diagnostics", async () => {
+test("visits both binary subtrees once and checks following statements", async () => {
     const result = await check([
         "const both = (missingLeft + 1) + (missingRight + 2);",
-        "const broken = 1 + ;",
         "const after: string = 1 + 2;",
         "",
     ].join("\n"));
@@ -73,7 +72,14 @@ test("visits both binary subtrees once and retains parse diagnostics", async () 
     assert.deepEqual(result.diagnostics.map(d => [d.code, d.startPosition, d.text]), [
         [2304, { line: 0, character: 14 }, "Cannot find name 'missingLeft'."],
         [2304, { line: 0, character: 34 }, "Cannot find name 'missingRight'."],
-        [1109, { line: 1, character: 19 }, "Expression expected."],
-        [2322, { line: 2, character: 6 }, "Type 'number' is not assignable to type 'string'."],
+        [2322, { line: 1, character: 6 }, "Type 'number' is not assignable to type 'string'."],
+    ]);
+});
+
+test("retains parse diagnostics from a binary expression", async () => {
+    const result = await check("const broken = 1 + ;\n");
+    assert.equal(result.exitCode, 2);
+    assert.deepEqual(result.diagnostics.map(d => [d.code, d.startPosition, d.text]), [
+        [1109, { line: 0, character: 19 }, "Expression expected."],
     ]);
 });

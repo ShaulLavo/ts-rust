@@ -356,7 +356,12 @@ impl EmitResolver {
         }
         self.with_checker(|c| {
             if file.is_some() {
-                file.for_each_child(|n: Node| mark_linked_references_recursively_visit(c, n));
+                mark_linked_references_recursively_worker(
+                    c,
+                    file,
+                    #[cfg(test)]
+                    None,
+                );
             }
         });
     }
@@ -1171,23 +1176,46 @@ impl EmitResolver {
     }
 }
 
-// Go: checker/emitresolver.go:804 MarkLinkedReferencesRecursively.func1 (visit)
-// PORT: the Go closure is recursive (it passes itself to `ForEachChild`), so it is a named fn.
-fn mark_linked_references_recursively_visit(c: &mut Checker, n: Node) -> bool {
-    if is_import_equals_declaration(n) && !n.modifier_flags().intersects(ModifierFlags::EXPORT) {
-        return false; // These are deferred and marked in a chain when referenced
+// Go: checker/emitresolver.go:808 MarkLinkedReferencesRecursively
+fn mark_linked_references_recursively_worker(
+    c: &mut Checker,
+    file: Node,
+    #[cfg(test)] mut marked: Option<&mut Vec<Node>>,
+) {
+    let mut pending = Vec::new();
+    file.for_each_child(|child| {
+        pending.push(child);
+        false
+    });
+    pending.reverse();
+    while let Some(node) = pending.pop() {
+        if is_import_equals_declaration(node)
+            && !node.modifier_flags().intersects(ModifierFlags::EXPORT)
+        {
+            continue;
+        }
+        if is_import_declaration(node) {
+            continue;
+        }
+        #[cfg(test)]
+        if let Some(marked) = marked.as_deref_mut() {
+            marked.push(node);
+        }
+        c.mark_linked_references(
+            node,
+            ReferenceHint::UNSPECIFIED,
+            SymbolId::NIL, /*propSymbol*/
+            TypeId::NIL,   /*parentType*/
+        );
+        // Marking updates checker links, leaving source child slots unchanged.
+        // Only owned handles leave the child-read scope, in Go preorder.
+        let start = pending.len();
+        node.for_each_child(|child| {
+            pending.push(child);
+            false
+        });
+        pending[start..].reverse();
     }
-    if is_import_declaration(n) {
-        return false; // likewise, these are ultimately what get marked by calls on other nodes - we want to skip them
-    }
-    c.mark_linked_references(
-        n,
-        ReferenceHint::UNSPECIFIED,
-        SymbolId::NIL, /*propSymbol*/
-        TypeId::NIL,   /*parentType*/
-    );
-    n.for_each_child(|child: Node| mark_linked_references_recursively_visit(c, child));
-    false
 }
 
 // PORT: Go passes `*printer.EmitContext` to `NewNodeBuilder`, which keeps it. The Rust node
@@ -1228,5 +1256,335 @@ impl Checker {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod linked_reference_tests {
+    use super::*;
+    use crate::checker::emit_resolver_p1::get_emit_resolver_of_shared_checker;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    struct FixtureDirectory(PathBuf);
+
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct FixtureProgram(&'static GoProgram);
+
+    impl Drop for FixtureProgram {
+        fn drop(&mut self) {
+            crate::program::release_program(self.0);
+        }
+    }
+
+    fn with_fixture(
+        source: &str,
+        run: impl FnOnce(&Rc<RefCell<Checker>>, &Rc<EmitResolver>, Node),
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "goport-linked-references-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let directory = FixtureDirectory(path);
+        std::fs::write(directory.0.join("input.ts"), source).unwrap();
+        std::fs::write(
+            directory.0.join("dependency.ts"),
+            "export const runtime = 1; export interface Shape { size: number; }",
+        )
+        .unwrap();
+        let config = directory.0.join("tsconfig.json");
+        std::fs::write(
+            &config,
+            r#"{"compilerOptions":{"noLib":true,"target":"es2020","module":"commonjs"},"files":["input.ts","dependency.ts"]}"#,
+        )
+        .unwrap();
+        let program = FixtureProgram(
+            crate::program::try_load_version(config.to_str().unwrap(), |_| {}).unwrap(),
+        );
+        let _scope = crate::core::enter_program(Some(program.0));
+        let checker = Rc::new(RefCell::new(
+            crate::program::ls_program::new_checker_for_version(program.0),
+        ));
+        let resolver = get_emit_resolver_of_shared_checker(&checker);
+        let file = program
+            .0
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/input.ts"))
+            .unwrap()
+            .root;
+        run(&checker, &resolver, file);
+    }
+
+    fn children(node: Node) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        node.for_each_child(|child| {
+            nodes.push(child);
+            false
+        });
+        nodes
+    }
+
+    fn shape(file: Node) -> Vec<(Node, Vec<Node>)> {
+        let mut nodes = Vec::new();
+        let mut pending = vec![file];
+        while let Some(node) = pending.pop() {
+            let child_nodes = children(node);
+            pending.extend(child_nodes.iter().copied());
+            nodes.push((node, child_nodes));
+        }
+        nodes
+    }
+
+    // The shallow oracle keeps Go's callback recursion, independent of the worker stack.
+    fn go_preorder(file: Node) -> Vec<Node> {
+        fn visit(node: Node, nodes: &mut Vec<Node>) {
+            if is_import_declaration(node)
+                || (is_import_equals_declaration(node)
+                    && !node.modifier_flags().intersects(ModifierFlags::EXPORT))
+            {
+                return;
+            }
+            nodes.push(node);
+            node.for_each_child(|child| {
+                visit(child, nodes);
+                false
+            });
+        }
+        let mut nodes = Vec::new();
+        file.for_each_child(|child| {
+            visit(child, &mut nodes);
+            false
+        });
+        nodes
+    }
+
+    fn trace(resolver: &EmitResolver, file: Node) -> Vec<Node> {
+        resolver.with_checker(|checker| {
+            let mut nodes = Vec::new();
+            mark_linked_references_recursively_worker(checker, file, Some(&mut nodes));
+            nodes
+        })
+    }
+
+    fn alias_nodes(file: Node) -> Vec<Node> {
+        shape(file)
+            .into_iter()
+            .map(|(node, _)| node)
+            .filter(|&node| is_import_specifier(node) || is_import_equals_declaration(node))
+            .collect()
+    }
+
+    fn alias_referenced(resolver: &EmitResolver, node: Node) -> bool {
+        resolver.with_checker(|checker| {
+            let symbol = checker.get_symbol_of_declaration(node);
+            assert!(symbol.is_some(), "unbound alias {:?}", node.name().text());
+            checker.alias_symbol_links.get(symbol).referenced
+        })
+    }
+
+    const ALIASES: &str = r#"
+        import { runtime as used, runtime as unused, type Shape } from "./dependency";
+        namespace values { export const runtime = 1; }
+        import idle = values;
+        import middle = values;
+        import linked = middle;
+        export import exposed = values;
+        const answer = used + linked.runtime;
+        const arithmetic = (1 + 2) * (3 + 4);
+        let annotation: Shape;
+    "#;
+
+    #[test]
+    fn mark_linked_references_preserves_go_preorder_import_skips_and_source_shape() {
+        with_fixture(ALIASES, |_, resolver, file| {
+            let before = shape(file);
+            assert!(
+                before
+                    .iter()
+                    .all(|(node, _)| static_ast_node(*node).is_some())
+            );
+            let expected = go_preorder(file);
+            let aliases = alias_nodes(file);
+            assert_eq!(aliases.len(), 7);
+            assert!(
+                aliases
+                    .iter()
+                    .all(|&node| !alias_referenced(resolver, node))
+            );
+            let cold = trace(resolver, file);
+            assert_eq!(cold, expected);
+            assert!(!cold.contains(&file));
+            assert_eq!(shape(file), before);
+            for &(node, ref child_nodes) in &before {
+                if is_import_declaration(node)
+                    || (is_import_equals_declaration(node)
+                        && !node.modifier_flags().intersects(ModifierFlags::EXPORT))
+                {
+                    assert!(!cold.contains(&node));
+                    assert!(child_nodes.iter().all(|child| !cold.contains(child)));
+                }
+                if node.kind() == SyntaxKind::BinaryExpression {
+                    assert_eq!(
+                        *child_nodes,
+                        vec![node.left(), node.operator_token(), node.right()]
+                    );
+                    let start = cold.iter().position(|&visited| visited == node).unwrap();
+                    assert_eq!(cold[start + 1], node.left());
+                    let operator = cold
+                        .iter()
+                        .position(|&visited| visited == node.operator_token())
+                        .unwrap();
+                    let right = cold
+                        .iter()
+                        .position(|&visited| visited == node.right())
+                        .unwrap();
+                    assert!(start < operator && operator < right);
+                }
+            }
+            let cold_aliases: Vec<_> = aliases
+                .iter()
+                .map(|&node| (node.name().text(), alias_referenced(resolver, node)))
+                .collect();
+            for &(name, referenced) in &cold_aliases {
+                assert_eq!(
+                    referenced,
+                    matches!(name, "used" | "middle" | "linked" | "exposed"),
+                    "{name}"
+                );
+            }
+            let exported = aliases
+                .iter()
+                .copied()
+                .find(|node| node.name().text() == "exposed")
+                .unwrap();
+            assert!(cold.contains(&exported));
+            assert!(children(exported).iter().all(|child| cold.contains(child)));
+            let warm = trace(resolver, file);
+            assert_eq!(warm, cold);
+            assert_eq!(shape(file), before);
+            let warm_aliases: Vec<_> = aliases
+                .iter()
+                .map(|&node| (node.name().text(), alias_referenced(resolver, node)))
+                .collect();
+            assert_eq!(warm_aliases, cold_aliases);
+            resolver.mark_linked_references_recursively(file);
+            assert_eq!(shape(file), before);
+        });
+    }
+
+    #[test]
+    fn mark_linked_references_checker_early_return_does_not_prune_children() {
+        with_fixture(ALIASES, |checker, resolver, file| {
+            let before = shape(file);
+            let aliases = alias_nodes(file);
+            checker
+                .borrow_mut()
+                .can_collect_symbol_alias_accessibility_data = false;
+            assert_eq!(trace(resolver, file), go_preorder(file));
+            assert_eq!(shape(file), before);
+            assert!(
+                aliases
+                    .iter()
+                    .all(|&node| !alias_referenced(resolver, node))
+            );
+            checker
+                .borrow_mut()
+                .can_collect_symbol_alias_accessibility_data = true;
+            resolver.mark_linked_references_recursively(file);
+            let used = aliases
+                .iter()
+                .copied()
+                .find(|node| node.name().text() == "used")
+                .unwrap();
+            assert!(alias_referenced(resolver, used));
+            assert_eq!(shape(file), before);
+        });
+    }
+
+    #[test]
+    fn mark_linked_references_rejects_synthetic_root_before_borrowing_checker() {
+        with_fixture(ALIASES, |checker, resolver, file| {
+            let factory = NodeFactory::new();
+            let synthetic = factory.new_source_file(
+                "/linked-synthetic.ts",
+                "/linked-synthetic.ts",
+                "",
+                factory.new_node_list(&[]),
+                factory.new_token(SyntaxKind::EndOfFile),
+            );
+            add_node_flags(synthetic, NodeFlags::SYNTHESIZED);
+            assert!(!is_parse_tree_node(synthetic));
+            assert!(static_ast_node(synthetic).is_none());
+            let before = shape(file);
+            {
+                let _borrow = checker.borrow_mut();
+                resolver.mark_linked_references_recursively(synthetic);
+            }
+            assert_eq!(shape(file), before);
+            assert!(
+                alias_nodes(file)
+                    .iter()
+                    .all(|&node| !alias_referenced(resolver, node))
+            );
+        });
+    }
+
+    #[test]
+    fn mark_linked_references_deep_scoped_children_use_a_real_checker() {
+        with_fixture("", |_, resolver, _| {
+            let factory = NodeFactory::new();
+            let depth = 10_000;
+            let mut expression = factory.new_numeric_literal("0", TokenFlags::NONE);
+            for _ in 0..depth {
+                expression = factory.new_binary_expression(
+                    ModifierList::NIL,
+                    expression,
+                    Node::NIL,
+                    factory.new_token(SyntaxKind::PlusToken),
+                    factory.new_numeric_literal("1", TokenFlags::NONE),
+                );
+            }
+            let statement = factory.new_expression_statement(expression);
+            let file = factory.new_source_file(
+                "/linked-deep.ts",
+                "/linked-deep.ts",
+                "",
+                factory.new_node_list(&[statement]),
+                factory.new_token(SyntaxKind::EndOfFile),
+            );
+            assert!(is_parse_tree_node(file));
+            let before = shape(file);
+            // The real checker reads parent links even for numeric expressions.
+            for (parent, children) in &before {
+                for &child in children {
+                    crate::ast::set_node_parent(child, *parent);
+                }
+            }
+            assert!(
+                before
+                    .iter()
+                    .all(|(node, _)| static_ast_node(*node).is_none())
+            );
+            let cold = trace(resolver, file);
+            assert_eq!(cold.len(), 3 * depth + 3);
+            assert_eq!(cold[0], statement);
+            assert_eq!(cold[1], expression);
+            assert!(!cold.contains(&file));
+            assert_eq!(shape(file), before);
+            let warm = trace(resolver, file);
+            assert_eq!(warm, cold);
+            assert_eq!(shape(file), before);
+            resolver.mark_linked_references_recursively(file);
+            assert_eq!(shape(file), before);
+        });
     }
 }

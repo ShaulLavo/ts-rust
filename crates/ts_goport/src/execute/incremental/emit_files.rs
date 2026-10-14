@@ -69,7 +69,7 @@ fn path_of(file: Node) -> Path {
 // Go `syscall.Errno` text (`pprof::path_error`, which uses
 // `fswatch::syscall::io_error_text` on every target). The other errors are
 // the Go `io/fs` errors.
-pub(crate) fn fs_error_text(err: &FsError) -> String {
+pub fn fs_error_text(err: &FsError) -> String {
     match err {
         FsError::Path { op, path, err } => crate::pprof::path_error(op, path, err).error(),
         FsError::Invalid => "invalid argument".to_string(),
@@ -352,7 +352,9 @@ impl<'a> EmitFilesHandler<'a> {
         order: &[Path],
         write_file: Option<&WriteFile>,
     ) -> bool {
-        let Some(failures) = flush_writes(writes, order, write_file) else {
+        // Go: emitfileshandler.go:124 `h.program.program.SingleThreaded()`.
+        let single_threaded = self.program.program().single_threaded();
+        let Some(failures) = flush_writes(writes, order, write_file, single_threaded) else {
             return false;
         };
         *self.shared.lock().expect("emit files lock") = EmitFilesShared::default();
@@ -855,7 +857,8 @@ const MAX_FLUSH_THREADS: usize = 8;
 /// map, then the JS, then the declaration map, then the declaration; a
 /// failed write does not stop the others. Here the files' outputs go in
 /// that order, the files in `order`, on up to `MAX_FLUSH_THREADS` threads
-/// (1 under `flush_writes_on_this_thread`). Returns what it did not write
+/// (1 under `flush_writes_on_this_thread`). `single_threaded` is the
+/// emitting program's `--singleThreaded`. Returns what it did not write
 /// when a write failed (`FlushFailures`), else `None`.
 ///
 /// After a failed write of a file, Go's d.ts callback has the TS5033 in
@@ -868,6 +871,7 @@ fn flush_writes(
     mut writes: Vec<BufferedWrite>,
     order: &[Path],
     write_file: Option<&WriteFile>,
+    single_threaded: bool,
 ) -> Option<FlushFailures> {
     let order: FxHashMap<&Path, usize> = order
         .iter()
@@ -883,7 +887,7 @@ fn flush_writes(
     };
     crate::gostd::slices::stable_sort_by(&mut writes, |a, b| key(a).cmp(&key(b)));
     if let Some(calls) = CLIENT_WRITES.get()
-        && !crate::program::single_threaded()
+        && !single_threaded
     {
         return flush_client_writes(writes, calls, write_file);
     }
@@ -1203,11 +1207,25 @@ thread_local! {
 /// when Go's goroutine would have written before the panic ends the
 /// process.
 fn defer_os_writes(f: impl FnOnce() -> bool) -> Vec<DeferredOsWrite> {
-    DEFERRED_OS_WRITES.with(|deferred| *deferred.borrow_mut() = Some(Vec::new()));
+    /// Puts back the deferral of the caller when `f` ends, also when it
+    /// panics (as `buffer_early_emit_writes`). After a caught panic, a
+    /// `useOS` write on this thread is made at once, and the writes that
+    /// `f` held are dropped: Go's panic ends the process before them.
+    struct Restore(Option<Vec<DeferredOsWrite>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let outer = self.0.take();
+            DEFERRED_OS_WRITES.with(|deferred| *deferred.borrow_mut() = outer);
+        }
+    }
+    let restore =
+        Restore(DEFERRED_OS_WRITES.with(|deferred| deferred.borrow_mut().replace(Vec::new())));
     f();
-    DEFERRED_OS_WRITES
+    let writes = DEFERRED_OS_WRITES
         .with(|deferred| deferred.borrow_mut().take())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    drop(restore);
+    writes
 }
 
 /// The OS write of a `writeFile` call that the client answered with
@@ -1440,7 +1458,35 @@ pub(crate) fn finish_emit_files(
 
 #[cfg(test)]
 mod tests {
-    use super::{BUFFER_EARLY_EMIT_WRITES, buffer_early_emit_writes};
+    use super::{
+        BUFFER_EARLY_EMIT_WRITES, buffer_early_emit_writes, defer_os_writes, os_write_or_defer,
+    };
+    use crate::frontend::vfs::FsError;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// followups42: a panic inside `defer_os_writes` ends the deferral. A
+    /// caller that catches it (`tsc -b` keeps a task's panic and goes on)
+    /// would else hold every later `useOS` write on this thread for a
+    /// round that never ends.
+    #[test]
+    fn defer_os_writes_ends_on_a_panic() {
+        let result = std::panic::catch_unwind(|| {
+            defer_os_writes(|| {
+                let held = os_write_or_defer(|| Err(FsError::Closed));
+                assert!(held.is_ok(), "the write is held");
+                panic!("the call panics");
+            })
+        });
+        assert!(result.is_err(), "the panic reaches the caller");
+        let made = Rc::new(Cell::new(false));
+        let write = made.clone();
+        let result = os_write_or_defer(move || {
+            write.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok() && made.get(), "the write is made at once");
+    }
 
     /// k2gaps1: a panic inside the buffered start ends the buffering. `tsc -b`
     /// keeps a task's panic and goes on, so a flag left on would make every

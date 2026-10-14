@@ -240,6 +240,21 @@ impl Name {
         intern::stable(id)
     }
 
+    /// The `hash_str` hash of `text`, for `Name::intern_hashed`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn text_hash(text: &str) -> u64 {
+        intern::hash_str(text)
+    }
+
+    /// `Name::from(text)` with `hash`, the `Name::text_hash` of `text`, and
+    /// the interned text, which lives until the process ends.
+    #[inline]
+    #[must_use]
+    pub(crate) fn intern_hashed(text: &str, hash: u64) -> (Name, &'static str) {
+        intern::intern_hashed(text, hash)
+    }
+
     /// The 4-byte id, for a packed node column (`ast::store::NodeKids`).
     /// It is valid only in this process.
     #[inline]
@@ -857,7 +872,19 @@ mod intern {
         if s.is_empty() {
             return Name(0);
         }
-        let hash = hash_str(s);
+        intern_hashed(s, hash_str(s)).0
+    }
+
+    /// `intern` of `s` with its `hash_str` hash `hash`, which the caller
+    /// already has. Also returns the stored text, which lives as long as
+    /// the process.
+    // PERF: parsefast1 item 1. The parse hashes an identifier once for its
+    // per-file name map and passes that hash here (`Name::intern_hashed`).
+    pub(super) fn intern_hashed(s: &str, hash: u64) -> (Name, &'static str) {
+        debug_assert_eq!(hash, hash_str(s), "intern_hashed of {s:?}");
+        if s.is_empty() {
+            return (Name(0), "");
+        }
         let set = (hash as usize) & (CACHE_SETS - 1);
         // After the thread-local destructors ran (`try_with` fails), a
         // name goes to the shared map without the cache.
@@ -865,7 +892,7 @@ mod intern {
             let [first, second] = &cache.get_or_init(new_cache)[set].0;
             let (h, id, stored) = first.get();
             if id != 0 && h == hash && stored == s {
-                return Some(id);
+                return Some((id, stored));
             }
             let entry = second.get();
             let (h, id, stored) = entry;
@@ -873,12 +900,12 @@ mod intern {
                 // Least recently used goes second.
                 second.set(first.get());
                 first.set(entry);
-                return Some(id);
+                return Some((id, stored));
             }
             None
         });
-        if let Ok(Some(id)) = cached {
-            return Name(id);
+        if let Ok(Some((id, stored))) = cached {
+            return (Name(id), stored);
         }
         // PERF: bind B2. A lib name (lib.dom alone brings about 7k names
         // that no file interned before) gets its id from the static table,
@@ -897,7 +924,7 @@ mod intern {
                 first.set((hash, id, stored));
             }
         });
-        Name(id)
+        (Name(id), stored)
     }
 
     /// The id and stored text of `s`, from the shared map.
@@ -1089,6 +1116,13 @@ enum DeclarationList {
 }
 
 impl Declarations {
+    /// Go `[]*ast.Node{node}` (`newSingleDeclaration`): a list of one node.
+    #[inline]
+    #[must_use]
+    pub fn one(node: Node) -> Self {
+        Self(DeclarationList::One(node))
+    }
+
     /// Go `append(declarations, node)`.
     pub fn push(&mut self, node: Node) {
         match &mut self.0 {
@@ -1276,7 +1310,7 @@ const _: () = assert!(std::mem::size_of::<Symbol>() == 56);
 // freed chunks (only in the language service) go out of line.
 // PERF (apisym1c): the parity is in the index, so `get` does not select a
 // part (a second array cost 0.8 to 2.5 percent instructions in a check).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CowChunks<T: 'static> {
     chunks: Vec<Chunk<T>>,
     /// The values from index `chunks.len() * COW_CHUNK_LEN` on. Empty, with
@@ -1287,6 +1321,31 @@ pub struct CowChunks<T: 'static> {
     /// Each sealed chunk is followed by a freed chunk (`new_interleaved`).
     interleaved: bool,
 }
+
+/// A clone copies the owned chunks and the tail, and shares the others
+/// (`CowChunks`). Its chunk list has `CLONE_CHUNK_ROOM` more entries of
+/// room, so the next pushes do not grow it.
+// PERF (edleak3): the binder lineage is a clone after each change that a
+// program shares (`program::Lineage::symbols_mut`). A clone with no room
+// doubled its chunk list at the first new chunk, and the programs then kept
+// those lists with up to half of them unused.
+impl<T: Clone> Clone for CowChunks<T> {
+    fn clone(&self) -> Self {
+        let mut chunks = Vec::with_capacity(self.chunks.len() + CLONE_CHUNK_ROOM);
+        chunks.extend(self.chunks.iter().cloned());
+        Self {
+            chunks,
+            tail: self.tail.clone(),
+            len: self.len,
+            interleaved: self.interleaved,
+        }
+    }
+}
+
+/// The room of a cloned chunk list (`CowChunks::clone`): the chunks of a few
+/// edited file versions (an edit of a query-core file adds about 8 symbol
+/// chunks and 6 table chunks, the odd chunks included).
+const CLONE_CHUNK_ROOM: usize = 64;
 
 const COW_CHUNK_SHIFT: usize = 8;
 const COW_CHUNK_LEN: usize = 1 << COW_CHUNK_SHIFT;
@@ -2628,8 +2687,10 @@ pub struct SymbolArena {
     symbols: CowChunks<Symbol>,
     tables: CowChunks<Table>,
     /// The names that the binder gave private identifier symbols
-    /// (`get_symbol_name_for_private_identifier`), as intern ids. Each holds
-    /// a symbol id, which `prepare_file_arena` moves.
+    /// (`get_symbol_name_for_private_identifier`), as intern ids, for the
+    /// lib bind snapshot (`note_private_name`). Only a file arena keeps
+    /// them: the snapshot is made from file arenas, and a join drops them
+    /// (`prepare_file_arena`).
     private_names: Vec<u32>,
     /// Where `crate::ast::get_symbol_id` keeps the ids of these symbols.
     ids: SymbolIds,
@@ -3037,10 +3098,17 @@ impl SymbolArena {
     }
 
     /// Notes that the binder gave `name` to a private identifier symbol
-    /// (`get_symbol_name_for_private_identifier`), so the name holds a
-    /// symbol id.
+    /// (`get_symbol_name_for_private_identifier`), for the lib bind
+    /// snapshot (`private_names`). A lineage arena or a copy of one
+    /// (`is_interleaved`) keeps no names.
+    // PERF (edleak3): the binder lineage binds each edited file version in
+    // place (`program::Lineage::bind`), and every program and checker copy
+    // cloned the names: on a 10,000-edit query-core session, 0.31 MiB per
+    // copy that no reader used.
     pub fn note_private_name(&mut self, name: &Name) {
-        self.private_names.push(name.0);
+        if !self.is_interleaved() {
+            self.private_names.push(name.0);
+        }
     }
 
     /// The current symbol and table counts, for `share_since`.
@@ -3228,14 +3296,8 @@ impl SymbolArena {
     /// The declaration lists of a static file leak (`make_static`), because
     /// its symbols live until exit. A freeable file version (`freeable`,
     /// lsshells M3d) keeps them owned, so they go with its chunks.
-    // PORT: the binder writes a symbol id into the names of private
-    // identifier symbols (`get_symbol_name_for_private_identifier`), so those
-    // names move with the ids. Source text can spell a name of the same form
-    // (the byte 0xFE + "#1@#p", see `ast::INTERNAL_SYMBOL_NAME_PREFIX`). Go
-    // keeps such a name as written, so only a symbol that a private
-    // identifier declares moves, with its entries in the tables. Go gives
-    // symbol ids in a different order, so a source name that is equal to a
-    // private identifier name in Go is not always equal to it here.
+    // PORT: the names of private identifier symbols hold no symbol id
+    // (`get_symbol_name_for_private_identifier`, edleak1), so no name moves.
     // PERF: the entries are changed in place and moved by chunk. Rebuilding
     // each symbol in an iterator chain was most of the join time.
     #[must_use]
@@ -3243,35 +3305,12 @@ impl SymbolArena {
         let SymbolArena {
             symbols,
             tables,
-            private_names,
+            private_names: _,
             ids: _,
             seen: _,
         } = self;
-        // The file symbols whose names hold a symbol id.
         // apisym1c: ids move with offset 0 too, from the second chunk on.
-        let mut private_symbols = FxHashSet::default();
-        if !private_names.is_empty() {
-            let private_names: FxHashSet<u32> = private_names.into_iter().collect();
-            for i in 1..symbols.len() {
-                let symbol = symbols.get(i);
-                if private_names.contains(&symbol.name.0)
-                    && symbol.declarations.iter().any(|&declaration| {
-                        crate::ast::is_private_identifier(crate::ast::get_name_of_declaration(
-                            declaration,
-                        ))
-                    })
-                {
-                    private_symbols.insert(i as u32);
-                }
-            }
-        }
-        // `into_aligned` visits the symbols in order from index 1.
-        let mut index = 0u32;
         let symbols = symbols.into_aligned(1, offsets.symbols as usize + 1, |symbol| {
-            index += 1;
-            if private_symbols.contains(&index) {
-                symbol.name = offsets.private_name(&symbol.name);
-            }
             symbol.members = offsets.table(symbol.members);
             symbol.exports = offsets.table(symbol.exports);
             symbol.parent = offsets.symbol(symbol.parent);
@@ -3283,19 +3322,8 @@ impl SymbolArena {
             }
         });
         let tables = tables.into_aligned(1, offsets.tables as usize + 1, |table| {
-            let mut renamed = false;
             for entry in &mut table.entries {
-                if private_symbols.contains(&entry.symbol.0) {
-                    let name = offsets.private_name(&Name(entry.name));
-                    if name.0 != entry.name {
-                        renamed = true;
-                        entry.name = name.0;
-                    }
-                }
                 entry.symbol = offsets.symbol(entry.symbol);
-            }
-            if renamed {
-                table.reindex();
             }
         });
         PreparedFileArena {
@@ -3344,9 +3372,21 @@ impl SymbolArena {
         self.symbols.get_mut(symbol.index())
     }
 
-    /// Go `table[name]`. A nil table reads as empty.
+    /// Go `table[name]`. A nil table reads as empty. `name` is a `&str`
+    /// or a `&Name` (`TableKey`): a `Name` finds its entry by id
+    /// (`get_name`), so a caller that holds one passes it.
+    #[inline]
     #[must_use]
-    pub fn get(&self, table: SymbolTable, name: &str) -> SymbolId {
+    pub fn get<'a>(&self, table: SymbolTable, name: impl Into<TableKey<'a>>) -> SymbolId {
+        match name.into() {
+            TableKey::Text(text) => self.get_text(table, text),
+            TableKey::Name(name) => self.get_name(table, name),
+        }
+    }
+
+    /// Go `table[name]` by text: hashes `name` and compares texts.
+    #[must_use]
+    fn get_text(&self, table: SymbolTable, name: &str) -> SymbolId {
         if table.is_nil() {
             return SymbolId::NIL;
         }
@@ -3373,16 +3413,6 @@ impl SymbolArena {
         table
             .find_id(name.table_hash(), name.0)
             .map_or(SymbolId::NIL, |position| table.entries[position].symbol)
-    }
-
-    /// Go `table[name]` by `get` or `get_name`, whichever `key` holds.
-    #[inline]
-    #[must_use]
-    pub fn get_key(&self, table: SymbolTable, key: TableKey<'_>) -> SymbolId {
-        match key {
-            TableKey::Text(text) => self.get(table, text),
-            TableKey::Name(name) => self.get_name(table, name),
-        }
     }
 
     /// Go `table[name] = symbol`. Panics on a nil table, like Go.
@@ -3507,10 +3537,6 @@ pub struct ArenaMark {
     tables: usize,
 }
 
-/// Prefix of private identifier symbol names (`<prefix>#<id>@<description>`):
-/// `ast::INTERNAL_SYMBOL_NAME_PREFIX` + "#".
-const PRIVATE_PREFIX: &str = "\u{FDD0}\u{10F7FE}#";
-
 /// A file arena with its ids moved to program ids
 /// (`SymbolArena::prepare_file_arena`).
 #[derive(Debug)]
@@ -3594,23 +3620,6 @@ impl ArenaOffsets {
             SymbolTable(lineage_index(table.0 + self.tables))
         }
     }
-
-    /// The private identifier name `name` (`<prefix>#<id>@<description>`,
-    /// see `SymbolArena::note_private_name`) with its symbol id moved.
-    #[cold]
-    fn private_name(self, name: &Name) -> Name {
-        let Some(rest) = name.strip_prefix(PRIVATE_PREFIX) else {
-            return name.clone();
-        };
-        let Some(at) = rest.find('@') else {
-            return name.clone();
-        };
-        let Ok(id) = rest[..at].parse::<u32>() else {
-            return name.clone();
-        };
-        let moved = self.symbol(SymbolId(id));
-        Name::from(format!("{PRIVATE_PREFIX}{}{}", moved.0, &rest[at..]))
-    }
 }
 
 /// Go `*ast.FlowNode`. `antecedents` replaces the Go `FlowList` linked list
@@ -3659,7 +3668,9 @@ pub struct NodeBindExtra {
     pub return_flow_node: FlowNodeId,
     /// Go `FlowNodeData().FlowNode` of the node: astmem1 P3, its record
     /// has the extras index in place of the flow node (`ast::BIND_EXTRA`).
-    /// The install sets it (`ast::bind_store_records`); `of` leaves it nil.
+    /// The bind sets it (`binder::NodeBindRecords`, or
+    /// `ast::bind_store_records` for a lib snapshot load); `of` leaves it
+    /// nil.
     pub flow_node: FlowNodeId,
 }
 
@@ -3694,7 +3705,8 @@ impl NodeBindExtra {
 /// file that are not in their records (`NodeBindExtra`). The `bind` word of
 /// a record holds the index + 1 of its entry with `ast::BIND_EXTRA`, or a
 /// flow node (`FileNodeBind::extra`).
-/// `BoundFile::install` makes it (`ast::bind_store_records`).
+/// A live bind makes the entries while it binds (`binder::NodeBindRecords`);
+/// a lib snapshot load makes them at the install (`ast::bind_store_records`).
 #[derive(Debug, Default)]
 pub struct FileNodeBind {
     extras: Box<[NodeBindExtra]>,
@@ -3761,10 +3773,9 @@ impl NodeBindParts {
     /// Compacts the per-node data of a bound file, given in node order.
     /// `None` is a node with no data. At most `max_entries` items are
     /// `Some`.
-    // PERF: bind C. The binder keeps flow nodes in their own per-node array
-    // (`NodeBindBuilder`) and merges them here. A node with no data and no
-    // flow node is `None`, so it costs one test and no 40-byte compare, and
-    // its slot is already `NO_NODE_BIND` from the fill.
+    // PERF: bind C. A node with no data and no flow node is `None`, so it
+    // costs one test and no 40-byte compare, and its slot is already
+    // `NO_NODE_BIND` from the fill.
     #[must_use]
     pub fn new(
         nodes: impl ExactSizeIterator<Item = Option<NodeBindData>>,
@@ -3926,9 +3937,10 @@ pub enum LinkSlot {
     /// A binder lineage index (`SymbolId`). The lineage never reuses an
     /// index, so in a long watch or editor session most indexes belong to
     /// dead file versions, which a new checker never reads. Indexes below
-    /// `LINK_FLAT_IDS` use the arena table, as `Arena` does. The others use
-    /// one page table per block of indexes that the store reads
-    /// (`LinkStore::far_page`), so a store pays only for the blocks it uses.
+    /// the store's flat bound (`link_flat_ids`) use the arena table, as
+    /// `Arena` does. The others use one page table per block of indexes
+    /// that the store reads (`LinkStore::far_page`), so a store pays only
+    /// for the blocks it uses.
     Lineage(usize),
     /// A node or flow node handle: (file, local index + 1). Each file has
     /// its own page table.
@@ -3940,7 +3952,7 @@ pub enum LinkSlot {
 impl LinkSlot {
     /// The index of a key with slots in its table. Its place in its page is
     /// `index % LINK_PAGE_SIZE`, also for a lineage key in a block table, as
-    /// `LINK_FLAT_IDS` and the block size are multiples of the page size.
+    /// the flat bounds and the block size are multiples of the page size.
     #[inline(always)]
     fn index(self) -> usize {
         match self {
@@ -3986,28 +3998,58 @@ impl LinkKey for SymbolId {
     }
 }
 
-/// Lineage indexes below this use the flat arena table: at most 512 KiB of
-/// page pointers per store. A CLI build stays below it, so its reads are the
-/// reads of an `Arena` key. (wgrowth1: a flat table for all indexes grew by
-/// 8 bytes per 64 indexes ever bound, in each symbol link store of each
-/// checker: about 7 MiB per config edit of a 600-file project.)
-const LINK_FLAT_IDS: usize = 1 << 22;
+/// Lineage indexes below this use the flat arena table of a dense store in
+/// a CLI build (`LinkPage::CLI_FLAT_IDS`): at most 2 MiB of page pointers
+/// per store. Go `core.PagedLinkStore` keeps keys below 2^24 in its page
+/// list too (`maxPageCount` pages of 256 keys: a quarter of the page
+/// pointers). A Go key is a dense symbol id; a lineage index is about two
+/// per symbol (the lineage takes the even chunks, a checker's own symbols
+/// the odd ones). So the dense stores of Sentry (5.4 M symbols, index
+/// 10.8 M) are all flat, and VS Code (9.5 M symbols, index 19.0 M) keeps its
+/// keys from here on in blocks (linkflat1: VS Code st made 27.1 M far page
+/// calls with a bound of 2^22, and 4.1 M with this one).
+const LINK_FLAT_IDS: usize = 1 << 24;
 
-/// Lineage indexes from `LINK_FLAT_IDS` on are in blocks of this many, with
+/// The flat bound of a store made in a long session (`link_flat_ids`): at
+/// most 512 KiB of page pointers per store. (wgrowth1: a flat table for all
+/// indexes grew by 8 bytes per 64 indexes ever bound, in each symbol link
+/// store of each checker: about 7 MiB per config edit of a 600-file
+/// project.)
+const LINK_SESSION_FLAT_IDS: usize = 1 << 22;
+
+/// The flat bound of a new store with pages `P`: `LINK_SESSION_FLAT_IDS`
+/// in a language server, API or `tsc --watch` process, where the lineage
+/// grows with each edit (`ast::frees_file_versions_by_default`), else
+/// `P::CLI_FLAT_IDS`.
+// PORT: Go has one bound. A store keeps the bound it was made with, so a
+// store that lives across `ast::set_editor_process` (in a test process)
+// still finds its records.
+fn link_flat_ids<V: Default, P: LinkPage<V>>() -> usize {
+    if crate::ast::frees_file_versions_by_default() {
+        LINK_SESSION_FLAT_IDS
+    } else {
+        P::CLI_FLAT_IDS
+    }
+}
+
+/// Lineage indexes from the flat bound on are in blocks of this many, with
 /// one page table per block.
 const LINK_BLOCK_SHIFT: usize = 16;
 
 const _: () = assert!(
-    LINK_FLAT_IDS % LINK_PAGE_SIZE == 0 && (1 << LINK_BLOCK_SHIFT) % LINK_PAGE_SIZE == 0,
+    LINK_FLAT_IDS % LINK_PAGE_SIZE == 0
+        && LINK_SESSION_FLAT_IDS % LINK_PAGE_SIZE == 0
+        && (1 << LINK_BLOCK_SHIFT) % LINK_PAGE_SIZE == 0,
     "a block page holds the keys of one flat page (`LinkSlot::index`)"
 );
 
 /// The block (an index into `LinkStore::files`) and the index in its block
-/// of lineage index `index`. An index below `LINK_FLAT_IDS` wraps to a block
-/// past every block table, so a lookup of it finds no page.
+/// of lineage index `index`, in a store with flat bound `flat_ids`. An index
+/// below the bound wraps to a block past every block table, so a lookup of
+/// it finds no page.
 #[inline]
-fn far_slot(index: usize) -> (usize, usize) {
-    let far = index.wrapping_sub(LINK_FLAT_IDS);
+fn far_slot(flat_ids: usize, index: usize) -> (usize, usize) {
+    let far = index.wrapping_sub(flat_ids);
     (far >> LINK_BLOCK_SHIFT, far & ((1 << LINK_BLOCK_SHIFT) - 1))
 }
 
@@ -4049,6 +4091,8 @@ const LINK_PAGE_SIZE: usize = 1 << 6;
 /// records that its keys have. `index` is the index of a key of the page in
 /// its table (`LinkSlot`); the page uses `index % LINK_PAGE_SIZE`.
 pub trait LinkPage<V: Default> {
+    /// The flat bound of lineage keys in a CLI build (`link_flat_ids`).
+    const CLI_FLAT_IDS: usize;
     /// A page with no record.
     fn new_page() -> Box<Self>;
     /// The record of key `index`.
@@ -4067,6 +4111,8 @@ pub trait LinkPage<V: Default> {
 pub type DenseLinkPage<V> = [Option<V>; LINK_PAGE_SIZE];
 
 impl<V: Default> LinkPage<V> for DenseLinkPage<V> {
+    const CLI_FLAT_IDS: usize = LINK_FLAT_IDS;
+
     fn new_page() -> Box<Self> {
         const {
             assert!(
@@ -4141,6 +4187,13 @@ impl<V> SparseLinkPage<V> {
 }
 
 impl<V: Default> LinkPage<V> for SparseLinkPage<V> {
+    // PERF: the session bound in a CLI build too. A sparse store has few
+    // records per page, so a flat table to 2^24 costs up to 2 MiB per store
+    // for few records (linkflat1, VS Code st: the sparse stores made 1.35 M
+    // of the 27.1 M far page calls, and flat tables to 2^24 for them cost
+    // 12 MiB of peak RSS, 26 MiB in a default build).
+    const CLI_FLAT_IDS: usize = LINK_SESSION_FLAT_IDS;
+
     fn new_page() -> Box<Self> {
         // A page is made for a new record, so its records are allocated now.
         Box::new(Self {
@@ -4167,10 +4220,14 @@ impl<V: Default> LinkPage<V> for SparseLinkPage<V> {
 
     #[inline(always)]
     fn insert_record(&mut self, index: usize, value: V) -> &mut V {
-        debug_assert_eq!(
-            self.places[index % LINK_PAGE_SIZE],
-            0,
-            "insert_record on a key that has a record"
+        // A real check: a second record of a key would stay in `records`
+        // with no place, and a later `remove_record` could not find the
+        // place of the last record. A `DenseLinkPage` and the map replace
+        // the record, which breaks nothing. The check reads the place that
+        // `push` writes.
+        assert!(
+            self.places[index % LINK_PAGE_SIZE] == 0,
+            "insert_record on a key with a record"
         );
         self.push(index, value)
     }
@@ -4224,12 +4281,15 @@ fn new_link_record<V: Default>(cell: &mut Option<V>) -> &mut V {
 #[derive(Clone, Debug)]
 pub struct LinkStore<K: LinkKey, V: Default, P: LinkPage<V> = DenseLinkPage<V>> {
     /// Page table of arena keys: one flat table for the whole arena (for
-    /// lineage keys, up to `LINK_FLAT_IDS`).
+    /// lineage keys, up to `flat_ids`).
     arena: PageTable<P>,
     /// Page tables of file keys, by file. A store of lineage keys has no
     /// file keys: it keeps the page tables of its blocks here (`far_slot`).
     files: Vec<PageTable<P>>,
     map: FxHashMap<K, V>,
+    /// The flat bound of lineage keys (`link_flat_ids` when the store was
+    /// made).
+    flat_ids: usize,
 }
 
 /// A `LinkStore` of `SparseLinkPage`s, for records that few keys of a page
@@ -4244,6 +4304,7 @@ impl<K: LinkKey, V: Default, P: LinkPage<V>> Default for LinkStore<K, V, P> {
             arena: Vec::new(),
             files: Vec::new(),
             map: FxHashMap::default(),
+            flat_ids: link_flat_ids::<V, P>(),
         }
     }
 }
@@ -4274,7 +4335,7 @@ impl<K: LinkKey, V: Default, P: LinkPage<V>> LinkStore<K, V, P> {
 
     #[inline(always)]
     fn far_lookup(&self, index: usize) -> Option<&P> {
-        let (block, index) = far_slot(index);
+        let (block, index) = far_slot(self.flat_ids, index);
         self.files
             .get(block)?
             .get(index / LINK_PAGE_SIZE)?
@@ -4283,16 +4344,16 @@ impl<K: LinkKey, V: Default, P: LinkPage<V>> LinkStore<K, V, P> {
 
     /// `page_mut` of a lineage key past the flat table.
     // PERF: the page lookup runs twice, as in `page_mut`, and LLVM merges
-    // them. `#[cold]` keeps the callers laid out for flat keys, as a CLI
-    // build has only those; a long session that passes `LINK_FLAT_IDS` pays
-    // the call.
+    // them. `#[cold]` keeps the callers laid out for flat keys, which most
+    // reads of a CLI build are; a larger build or a long session that passes
+    // the flat bound pays the call.
     #[cold]
     #[inline(never)]
     fn far_page_mut(&mut self, key: K, index: usize) -> &mut P {
         if self.far_lookup(index).is_none() {
             return self.add_page(key);
         }
-        let (block, index) = far_slot(index);
+        let (block, index) = far_slot(self.flat_ids, index);
         self.files[block][index / LINK_PAGE_SIZE]
             .as_deref_mut()
             .expect("link page")
@@ -4332,17 +4393,17 @@ impl<K: LinkKey, V: Default, P: LinkPage<V>> LinkStore<K, V, P> {
     fn add_page(&mut self, key: K) -> &mut P {
         let (file, index) = match key.link_slot() {
             LinkSlot::Arena(index) => return Self::table_page(&mut self.arena, index),
-            LinkSlot::Lineage(index) if index < LINK_FLAT_IDS => {
-                // The flat table stops at `LINK_FLAT_IDS`; so does its capacity.
+            LinkSlot::Lineage(index) if index < self.flat_ids => {
+                // The flat table stops at `flat_ids`; so does its capacity.
                 let pages = index / LINK_PAGE_SIZE + 1;
                 if pages > self.arena.capacity() {
                     let capacity =
-                        (2 * self.arena.capacity()).clamp(pages, LINK_FLAT_IDS / LINK_PAGE_SIZE);
+                        (2 * self.arena.capacity()).clamp(pages, self.flat_ids / LINK_PAGE_SIZE);
                     self.arena.reserve_exact(capacity - self.arena.len());
                 }
                 return Self::table_page(&mut self.arena, index);
             }
-            LinkSlot::Lineage(index) => far_slot(index),
+            LinkSlot::Lineage(index) => far_slot(self.flat_ids, index),
             LinkSlot::File(file, index) => (file, index),
             LinkSlot::Map => unreachable!("map keys have no slot"),
         };
@@ -4549,20 +4610,36 @@ mod link_store_tests {
         assert!(!symbols.has(SymbolId(71)) && !symbols.has(SymbolId(64 * 50)));
     }
 
-    // Symbol keys from `LINK_FLAT_IDS` on keep their records in pages by
-    // block: a store with a few far keys has no page table entries for the
-    // indexes between them, and every key still finds its own record. Both
-    // page kinds.
+    // `insert_new` on a key that has a record is a caller bug. A sparse
+    // page checks it in a release build too: the second record would have
+    // no place (`SparseLinkPage::insert_record`).
     #[test]
-    fn link_store_far_symbol_keys_use_blocks() {
-        far_symbol_keys_use_blocks::<DenseLinkPage<u64>>();
-        far_symbol_keys_use_blocks::<SparseLinkPage<u64>>();
+    #[should_panic(expected = "on a key with a record")]
+    fn sparse_link_store_insert_new_on_a_key_with_a_record_panics() {
+        let mut symbols = SparseLinkStore::<SymbolId, u64>::default();
+        symbols.insert_new(SymbolId(1), 1);
+        symbols.insert_new(SymbolId(1), 2);
     }
 
-    fn far_symbol_keys_use_blocks<P: LinkPage<u64>>() {
-        let flat = LINK_FLAT_IDS as u32;
+    // Symbol keys from the flat bound on keep their records in pages by
+    // block: a store with a few far keys has no page table entries for the
+    // indexes between them, and every key still finds its own record. Both
+    // page kinds, at the CLI and the session bound.
+    #[test]
+    fn link_store_far_symbol_keys_use_blocks() {
+        for flat_ids in [LINK_FLAT_IDS, LINK_SESSION_FLAT_IDS] {
+            far_symbol_keys_use_blocks::<DenseLinkPage<u64>>(flat_ids);
+            far_symbol_keys_use_blocks::<SparseLinkPage<u64>>(flat_ids);
+        }
+    }
+
+    fn far_symbol_keys_use_blocks<P: LinkPage<u64>>(flat_ids: usize) {
+        let mut symbols = LinkStore::<SymbolId, u64, P> {
+            flat_ids,
+            ..LinkStore::default()
+        };
+        let flat = flat_ids as u32;
         let block = 1u32 << LINK_BLOCK_SHIFT;
-        let mut symbols = LinkStore::<SymbolId, u64, P>::default();
         let keys = [
             SymbolId(5),
             SymbolId(flat - 1),
@@ -4592,7 +4669,7 @@ mod link_store_tests {
         ] {
             assert!(!symbols.has(SymbolId(absent)), "{absent}");
         }
-        assert_eq!(symbols.arena.len(), LINK_FLAT_IDS / LINK_PAGE_SIZE);
+        assert_eq!(symbols.arena.len(), flat_ids / LINK_PAGE_SIZE);
         let far_entries: usize = symbols.files.iter().map(Vec::len).sum();
         assert!(far_entries < 3 * (1 << LINK_BLOCK_SHIFT) / LINK_PAGE_SIZE);
     }
@@ -4660,9 +4737,10 @@ pub use goport_util::core::*;
 
 /// Runs `f` and returns the text of the Go panic that it raises. Fails the
 /// test when `f` does not panic or raises a plain Rust panic. Tests of the
-/// Go `debug.*` sites (`gostd::debug`) use it.
-#[cfg(test)]
-pub(crate) fn go_panic_text(f: impl FnOnce()) -> String {
+/// Go `debug.*` sites (`gostd::debug`) use it. Not `cfg(test)`: the api
+/// tests in ts_goport use it too, and `cfg(test)` is per crate.
+#[doc(hidden)]
+pub fn go_panic_text(f: impl FnOnce()) -> String {
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("no panic");
     match payload.downcast::<GoPanic>() {
         Ok(p) => p.message,

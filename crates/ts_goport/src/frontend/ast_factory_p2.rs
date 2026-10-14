@@ -6,7 +6,6 @@
 //! `ModifierList`, and Go `nil` is the `NIL` value of each. Nodes go to the
 //! factory target (synthetic arena or the store of the parsed file).
 
-use crate::astdata::NodeData as D;
 use crate::frontend::prelude::*;
 
 /// Go `TokenFlagsNone` in astdata form.
@@ -31,14 +30,10 @@ impl NodeFactory {
         let _ = (opts, text);
         self.new_node(
             SyntaxKind::SourceFile,
-            D::SourceFile(Box::new(crate::astdata::SourceFileData {
+            crate::astdata::SourceFileData {
                 end_of_file_token: self.id(end_of_file_token),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 statements: self.req_list(statements),
-                symbol: None,
-                facts: 0,
-            })),
+            },
         )
     }
 

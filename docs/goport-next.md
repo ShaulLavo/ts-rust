@@ -6,7 +6,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **Now (2026-10-11):** R193 accepted (int60 without effperf1 F3; main 3323eeb9f; notes r193-side, timing-r193). Running after the accept: extrabatR193 and followups42 (workflow after-r193). Next: int61 = R194 on main: effint1 b38ba8de8 (Effect editor features, D1 stays out), effperf3 bc6cd8b72, invokeonce1 75866d18c, jsdocstr1 e9c2aff12, astshrink1 b5611fa68, apicbfu1 1b7532c48, i50 (PR #54); then main's light-path PRs #55 (CI fix) and #53 (#49).
+- **Now (2026-10-12, evening UTC):** R203 (int70) and R204 (int71) accepted; main 4712dcc25. Running: int72 (followups52, flowcost1, identparse1, printfast1 on int71) -> R205; after-r204 (extrabatR204, followups54); edleak2 (round 2: cheap shell kind read); slowproj1 (TypeORM and VS Code default against Go). Next integration int73: followups53 dc5105e58, followups54, edleak2 if it passes. Next perf candidates: the slowproj1 ranking; the relater path under flow narrowing on TypeORM (flowcost1 finding); the intern miss path in core.rs (identparse1 finding). Waits for Theo: Hono record fix (honorec1), gatecounts1. Later: UPSTREAM.json current switch (quiet window), dbook-lan wall A/A, b4-hono #45 flaky_oracle mark, tsrs measurement.
 
 - **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 merged (ef82c3e59, light path). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
 
@@ -35,6 +35,12 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 - **GitHub 2026-10-11 18:51 check:** #43 closed (effect_cases on main since R193). #51 (outside PR, WASM language server): review running (workflow pr51review; its code runs on testboxes only). #39 (clean-builds.py, not protected): main merged in, CI again; land when green. #41, #42 (protected paths: run-cargo-capped.sh, AGENTS.md, candidate.sh, build-goport-tests.sh) and #48 (crate split step 2, needs a batch with its name map): wait for Theo.
 
 - **After R193: extrabatR193 done (equal to R191, 0 port changes); followups42 5df09027d skeptic PASS, into int62 (note after-r193-result-2026-10-11).**
+
+- **portonly1 up to 17d03b190 (items 3, 5, 6, 9; item 10 dropped): into int63. jemtune1 dropped (note perfscan3-lanes-result-2026-10-11).**
+
+- **followups43 98333a1f8: round 2 skeptic PASS, into int63 (note followups43-result-2026-10-11). Running: parsefast1 (perfscan3 items 1 and 7: identifier interning with the scanner hash, binder per-node work; on main R194).**
+
+- **followups44 62f56d2bd: skeptic PASS, into int63 (note followups44-result-2026-10-11). int63: followups43 98333a1f8, followups44 62f56d2bd, portonly1 up to 17d03b190, parsefast1 a9d5cb913 (note parsefast1-result-2026-10-11); followups45 if its skeptic passes in time. Starts after the R195 accept.**
 
 - **int61 (R194) = goport-effint1 b38ba8de8 (all Effect editor features of effect-tsgo 0.51.1; note effint3-result-2026-10-11).** After bump D and int60: merge the accepted head, then a revision. D1 (refactor.rewrite in initialize codeActionKinds) needs Theo.
 

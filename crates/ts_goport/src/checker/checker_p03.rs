@@ -187,13 +187,14 @@ impl Checker {
     }
 
     // Go: checker/checker.go:2220 getSymbol
-    pub fn get_symbol(
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn get_symbol<'a>(
         &mut self,
         symbols: SymbolTable,
-        name: &str,
+        name: impl Into<TableKey<'a>>,
         meaning: SymbolFlags,
     ) -> SymbolId {
-        self.get_symbol_key(symbols, TableKey::Text(name), meaning)
+        self.get_symbol_key(symbols, name.into(), meaning)
     }
 
     /// `get_symbol` by a `TableKey`. `NameResolver` passes an interned
@@ -205,7 +206,7 @@ impl Checker {
         meaning: SymbolFlags,
     ) -> SymbolId {
         if meaning.intersects(SymbolFlags::ALL) {
-            let found = self.symbols.get_key(symbols, name);
+            let found = self.symbols.get(symbols, name);
             let symbol = self.get_merged_symbol(found);
             if symbol.is_some() {
                 if self.sym(symbol).flags.intersects(meaning) {

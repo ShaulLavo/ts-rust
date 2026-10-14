@@ -4,7 +4,7 @@
 //! PORT: Go `opts.Tracing` is the process tracing session
 //! (`crate::tracing::get`).
 
-use super::files_parser::{TakenParse, count_prep, note_prep_taken};
+use super::files_parser::{TakenParse, count_prep, note_names_own, note_prep_taken};
 use crate::contentmapper::{
     ConcurrentTransform, DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError,
     InitializeErrorKind, InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
@@ -33,6 +33,8 @@ pub struct LibResolution {
 pub struct LibFile {
     pub name: String,
     pub path: String,
+    /// ts#64159 (Go N' `LibFile.pathKey`): the path of `path`.
+    pub path_key: Path,
     pub replaced: bool,
 }
 
@@ -217,6 +219,10 @@ pub struct ProcessedFiles {
     // Go `moduleResolutionError` (ts#64299) is a `Program` field since
     // ts#64519 (`NewProgram::module_resolution_error`).
     pub finished_processing: bool,
+    /// The lookups of the load on the plain OS file system, for the thread
+    /// that finishes the symlink cache (`LoadStatCache`).
+    // PORT: not in Go (see `HostStatCache`).
+    pub load_stats: super::files_parser::LoadStatCache,
 }
 
 // Go: fileloader.go:161 jsxRuntimeImportSpecifier
@@ -269,6 +275,7 @@ pub fn process_all_program_files(
             task_data_by_path: FxHashMap::default(),
             max_depth: max_node_module_js_depth,
             single_threaded,
+            load_stats: Cell::new(None),
         }),
         root_tasks: Vec::with_capacity(
             root_files.len() + compiler_options.lib.as_ref().map_or(0, Vec::len),
@@ -345,7 +352,9 @@ pub fn process_all_program_files(
             && compiler_options.trace_resolution != Tristate::True
             && !loader.opts.can_use_project_reference_source()
         {
-            let shared = Arc::new(SharedResolutionCache::default());
+            // PERF (parload2): the cache of the early workers, which
+            // resolved the root files with this config already.
+            let shared = super::files_parser::early_shared_resolution(&loader).unwrap_or_default();
             resolver.caches.shared = Some(SharedResolutionLink {
                 cache: shared.clone(),
                 publish: false,
@@ -505,6 +514,10 @@ thread_local! {
     /// Each worker prep that the loads on this thread looked at: the file
     /// name and whether the loader could use it (`FilePrep::fits`).
     static PREP_FITS: std::cell::RefCell<Vec<(String, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Each file whose taken prep gave the worker's import names
+    /// (`FilePrep::names`), in the loads on this thread.
+    static PREPS_NAMED: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -857,6 +870,18 @@ impl FileLoader {
         )
     }
 
+    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). Debug
+    /// builds check it against the loader's `to_path` of its name.
+    pub fn resolved_path<'r>(&self, resolved: &'r ResolvedModule) -> &'r Path {
+        debug_assert_eq!(
+            resolved.resolved_path,
+            self.to_path(&resolved.resolved_file_name),
+            "resolved path of {}",
+            resolved.resolved_file_name
+        );
+        &resolved.resolved_path
+    }
+
     // Go: fileloader.go:242 (*fileLoader).addRootTask
     pub fn add_root_task(
         &mut self,
@@ -990,6 +1015,7 @@ impl FileLoader {
                 if resolved.is_resolved() {
                     to_parse.push(ResolvedRef {
                         file_name: resolved.resolved_file_name.clone(),
+                        path: resolved.resolved_path.clone(),
                         increase_depth: resolved.is_external_library_import,
                         elide_on_depth: false,
                         include_reason: Some(new_file_include_reason(
@@ -1520,7 +1546,8 @@ impl FileLoader {
         // ts#64159 (fileloader.go:747): the check is on the resolved file,
         // so `/// <reference path="a" />` in a.ts (found as "a" + ".ts")
         // is an error too. N checked only a name with an extension.
-        if containing_path == self.to_path(&resolved_file_name) {
+        let resolved_path = self.to_path(&resolved_file_name);
+        if containing_path == resolved_path {
             return (
                 None,
                 Some(new_explaining_processing_diagnostic(
@@ -1534,6 +1561,7 @@ impl FileLoader {
         (
             Some(ResolvedRef {
                 file_name: resolved_file_name,
+                path: resolved_path,
                 include_reason: Some(include_reason),
                 ..Default::default()
             }),
@@ -1624,6 +1652,7 @@ impl FileLoader {
                 t.add_sub_task(
                     ResolvedRef {
                         file_name: resolved.resolved_file_name.clone(),
+                        path: resolved.resolved_path.clone(),
                         increase_depth: resolved.is_external_library_import,
                         elide_on_depth: false,
                         include_reason: Some(include_reason),
@@ -1718,7 +1747,7 @@ impl FileLoader {
             // PERF (loadpar1): the answers that the parse worker of this
             // file resolved, when it resolved for this loader. Else every
             // name resolves here, as in Go.
-            let prep = prep
+            let mut prep = prep
                 .filter(|_| self.shared_resolution.is_some() && crate::tracing::get().is_none())
                 .and_then(TakenParse::take_prep)
                 .filter(|prep| {
@@ -1746,22 +1775,31 @@ impl FileLoader {
             let mut resolutions_trace: Vec<DiagAndArgs> = Vec::new();
             // PERF: the names, usages and JSDoc flags of the imports and
             // module augmentations of a parse that the loads keep
-            // (`import_names`), and the file's emit format, once per file.
-            let kept = self
-                .keeps_import_names
-                .then(|| import_names(&file))
-                .filter(|kept| kept.len() == module_names.len() - imports_start as usize);
+            // (`import_names`), or that the parse worker read (parload1,
+            // `FilePrep::names`), and the file's emit format, once per file.
+            let kept = if self.keeps_import_names {
+                Some(import_names(&file))
+            } else {
+                prep.as_mut()
+                    .and_then(|prep| prep.names.take())
+                    .map(|names| Rc::new(*names))
+            }
+            .filter(|kept| kept.len() == module_names.len() - imports_start as usize);
+            // The load reads the worker's names (`preps_named`).
+            let named = !self.keeps_import_names && kept.is_some();
             let mut file_emit_mode = None;
 
             for (index, entry) in module_names.iter().copied().enumerate() {
-                let (module_name, usage, adds) =
+                let (module_name, usage, adds, source_phase) =
                     match (&kept, index.checked_sub(imports_start as usize)) {
                         (Some(kept), Some(kept_index)) => kept.get(kept_index),
-                        _ => (entry.text(), import_usage(entry), None),
+                        _ => (entry.text(), import_usage(entry), None, None),
                     };
                 // ts#63915: a source phase import is not resolved
                 // (fileloader.go:875).
-                if module_name.is_empty() || is_source_phase_import(entry.parent()) {
+                if module_name.is_empty()
+                    || source_phase.unwrap_or_else(|| is_source_phase_import(entry.parent()))
+                {
                     continue;
                 }
 
@@ -1772,8 +1810,11 @@ impl FileLoader {
                     Some(&options_for_file),
                     &mut file_emit_mode,
                 );
-                // The worker resolved name `index` with one mode for the
-                // whole file (`guess_import_mode`): most names have it.
+                // The worker resolved name `index` with the mode of the
+                // usage it read (`FilePrep::names`), or with the mode of a
+                // plain import (`guess_import_mode`) for a synthetic import
+                // or without the names. `answer` gives it only when that
+                // mode is `mode`.
                 let taken = prep
                     .as_ref()
                     .and_then(|prep| prep.answer(index, mode))
@@ -1812,6 +1853,8 @@ impl FileLoader {
                 }
 
                 let resolved_file_name = &resolved_module.resolved_file_name;
+                // The JS file test and the subtask both read it.
+                let resolved_path = self.resolved_path(&resolved_module);
                 let is_from_node_modules_search = resolved_module.is_external_library_import;
                 // Don't treat redirected files as JS files.
                 // tsgo#4712: nor files resolved through a content mapper extension.
@@ -1825,7 +1868,7 @@ impl FileLoader {
                         .borrow()
                         .get_redirect_parsed_command_line_for_resolution(&new_has_file_name(
                             resolved_file_name,
-                            &self.to_path(resolved_file_name),
+                            resolved_path,
                         ))
                         .is_none();
                 let is_js_file_from_node_modules = is_from_node_modules_search
@@ -1855,6 +1898,7 @@ impl FileLoader {
                     t.add_sub_task(
                         ResolvedRef {
                             file_name: resolved_file_name.clone(),
+                            path: resolved_path.clone(),
                             increase_depth: resolved_module.is_external_library_import,
                             elide_on_depth: is_js_file_from_node_modules,
                             include_reason: Some(new_file_include_reason(
@@ -1873,9 +1917,15 @@ impl FileLoader {
             }
 
             if prep.is_some() {
+                #[cfg(test)]
+                if named {
+                    PREPS_NAMED.with(|files| files.borrow_mut().push(file_name.to_string()));
+                }
                 note_prep_taken();
+                note_names_own(names_own);
                 count_prep(|c| {
                     c.preps_taken += 1;
+                    c.preps_named += usize::from(named);
                     c.names_taken += names_taken;
                     c.names_own += names_own;
                 });
@@ -1954,6 +2004,7 @@ impl FileLoader {
         }
 
         let mut path = combine_paths(&self.default_library_path, &[name]);
+        let mut path_key = None;
         let mut replaced = false;
         if !self.opts.skip_module_resolution
             && self
@@ -1973,6 +2024,7 @@ impl FileLoader {
             let (resolution, trace) = self.resolve_library(&library_name, &resolve_from);
             if resolution.is_resolved() {
                 path = resolution.resolved_file_name.clone();
+                path_key = Some(self.resolved_path(&resolution).clone());
                 replaced = true;
             }
             self.path_for_lib_file_resolutions
@@ -1993,6 +2045,7 @@ impl FileLoader {
             .or_insert_with(|| {
                 Rc::new(LibFile {
                     name: name.to_string(),
+                    path_key: path_key.unwrap_or_else(|| self.to_path(&path)),
                     path,
                     replaced,
                 })
@@ -2053,7 +2106,7 @@ impl FileLoader {
 /// scope of `file_name` (fileloader.go:397 to :400): for node16 to nodenext
 /// module resolution (not for `.mts`, `.cts`, `.mjs` and `.cjs` files), or
 /// for a path under `/node_modules/`.
-pub(crate) fn package_json_type_applies(
+pub fn package_json_type_applies(
     file_name: &str,
     module_resolution_kind: ModuleResolutionKind,
 ) -> bool {
@@ -2216,7 +2269,7 @@ pub(crate) fn get_mode_for_usage_location(
 /// resolution-mode override, or the kind of usage that
 /// `getEmitSyntaxForUsageLocationWorker` tells apart (`import_usage`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImportUsage {
+pub(crate) enum ImportUsage {
     /// The `resolution-mode` of a type-only import or export, or of an
     /// import type.
     Override(ResolutionMode),
@@ -2296,7 +2349,7 @@ fn emit_usage(parent: Node) -> ImportUsage {
 /// `file_name`. `file_emit_mode` keeps the file's emit format for the other
 /// names of the file (`emit_syntax_for_usage`).
 // Go: fileloader.go:1037 getModeForUsageLocation
-fn mode_for_import_usage(
+pub(crate) fn mode_for_import_usage(
     usage: ImportUsage,
     file_name: &str,
     meta: &SourceFileMetaData,
@@ -2325,19 +2378,22 @@ fn import_adds_file(import: Node) -> bool {
 
 /// The module names of the imports and string module augmentations of a
 /// parse, in the order of `resolveImportsAndModuleAugmentations` after its
-/// synthetic imports, with each name's `ImportUsage` and, for an import,
-/// `import_adds_file`.
+/// synthetic imports, with each name's `ImportUsage`, for an import
+/// `import_adds_file`, and whether it is a source phase import. The
+/// language server keeps them with a parse (`import_names`), and a parse
+/// worker reads them while the nodes are on its thread (`FilePrep`).
 // PORT: not in Go (perf, `import_names`).
-struct ImportNames {
+pub(crate) struct ImportNames {
     /// The names, one after another.
     text: String,
-    /// Per name: its end in `text`, its usage, and whether it adds its file
-    /// (false for a module augmentation, which adds none).
-    names: Vec<(usize, ImportUsage, bool)>,
+    /// Per name: its end in `text`, its usage, whether it adds its file
+    /// (false for a module augmentation, which adds none), and
+    /// `is_source_phase_import` of its parent.
+    names: Vec<(usize, ImportUsage, bool, bool)>,
 }
 
 impl ImportNames {
-    fn of(file: &ParsedSourceFile) -> ImportNames {
+    pub(crate) fn of(file: &ParsedSourceFile) -> ImportNames {
         let augmentations = file
             .module_augmentations
             .iter()
@@ -2358,20 +2414,28 @@ impl ImportNames {
 
     fn push(&mut self, name: Node, adds: bool) {
         self.text.push_str(name.text());
-        self.names.push((self.text.len(), import_usage(name), adds));
+        let source_phase = is_source_phase_import(name.parent());
+        self.names
+            .push((self.text.len(), import_usage(name), adds, source_phase));
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.names.len()
     }
 
-    /// The name, usage and `import_adds_file` of name `index`.
-    fn get(&self, index: usize) -> (&str, ImportUsage, Option<bool>) {
-        let (end, usage, adds) = self.names[index];
+    /// The name, usage, `import_adds_file` and source phase flag of name
+    /// `index`.
+    pub(crate) fn get(&self, index: usize) -> (&str, ImportUsage, Option<bool>, Option<bool>) {
+        let (end, usage, adds, source_phase) = self.names[index];
         let start = index
             .checked_sub(1)
             .map_or(0, |before| self.names[before].0);
-        (&self.text[start..end], usage, Some(adds))
+        (
+            &self.text[start..end],
+            usage,
+            Some(adds),
+            Some(source_phase),
+        )
     }
 }
 
@@ -2481,9 +2545,13 @@ fn emit_syntax_for_usage(
 
 /// Go `getModeForUsageLocation` (with `options`) for a plain `import ..
 /// from` or `export .. from` in `file_name`, the most common form. A parse
-/// worker has no import nodes after the parse, so it resolves each import
-/// with this mode. A wrong guess only resolves another cache key: the
-/// loader resolves each import with its real mode.
+/// worker resolves the synthetic imports with this mode. It resolves the
+/// imports with it too when it has no usages that fit them: a job without
+/// a prep (`GOPORT_LOAD_PREP=0`, a cached file, a bundled lib, or no
+/// metadata), `GOPORT_LOAD_NAMES=0`, or names that are not those of its
+/// references. A wrong guess only resolves another cache key: the loader
+/// resolves each import with its real mode, and takes a worker answer only
+/// when the answer has that mode (`FilePrep::answer`).
 pub(crate) fn guess_import_mode(
     file_name: &str,
     meta: &SourceFileMetaData,
@@ -2586,7 +2654,10 @@ pub(crate) fn get_jsx_implicit_import_base_of_file(
 
 #[cfg(test)]
 mod tests {
-    use super::super::files_parser::{preps_taken, set_load_prep, set_meta_wait};
+    use super::super::files_parser::{
+        early_pools_taken, names_own, preps_taken, set_load_names, set_load_prep, set_meta_wait,
+        set_move_up, set_prep_wait, start_default_lib_prefetch,
+    };
     use super::*;
     use crate::frontend::bundled;
     use crate::frontend::module::cache::set_answer_wait;
@@ -2666,7 +2737,7 @@ mod tests {
     /// loads the program with parse workers (not single threaded), and
     /// returns what the load found (`load_text`).
     fn parallel_load(label: &str, tsconfig: &str, files: &[(&str, &str)]) -> String {
-        load_text(label, tsconfig, files, false)
+        load_text(label, tsconfig, files, false, None)
     }
 
     /// Writes `files` and a tsconfig.json with `tsconfig` to a temp dir,
@@ -2674,12 +2745,15 @@ mod tests {
     /// files in program order, the metadata, module and type reference
     /// resolutions (in map order) and include reasons of each file, the
     /// synthetic imports, the processing diagnostics, the missing files
-    /// and the package.json entries of the resolver.
+    /// and the package.json entries of the resolver. With `early_lib`, an
+    /// early pool with that default lib path starts on the root files after
+    /// the config parse, as in tsc (`start_default_lib_prefetch`).
     fn load_text(
         label: &str,
         tsconfig: &str,
         files: &[(&str, &str)],
         single_threaded: bool,
+        early_lib: Option<&str>,
     ) -> String {
         use std::fmt::Write as _;
         let dir = std::env::temp_dir().join(format!(
@@ -2710,11 +2784,21 @@ mod tests {
             None,
         );
         assert!(errors.is_empty());
+        let config = config.unwrap();
+        if let Some(early_lib) = early_lib {
+            start_default_lib_prefetch(
+                &config,
+                &cwd,
+                fs.use_case_sensitive_file_names(),
+                early_lib,
+                true,
+            );
+        }
         let host = new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, None, None);
         let processed = process_all_program_files_of(
             ProgramOptions {
                 host,
-                config: Rc::new(config.unwrap()),
+                config: Rc::new(config),
                 use_source_of_project_reference: false,
                 single_threaded: if single_threaded {
                     Tristate::True
@@ -2945,6 +3029,251 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         }
     }
 
+    // parload1: the parse workers read each parse's import names, usages
+    // and flags (`FilePrep::names`) and resolve each import with the mode of
+    // its usage. A load that takes them finds what a load that reads the
+    // nodes itself finds, and what a load with no prep finds: mixed modes in
+    // one file (`require`, `import()`, `import type` with `resolution-mode`
+    // both ways, `export .. from`) in node16 CJS and ESM files, JSDoc imports
+    // in TS and JS files, a source phase import, synthetic imports and a
+    // module augmentation. With the names, the loader resolves no import of
+    // a file whose prep it took (only the module augmentation). The load
+    // with names waits for each worker's metadata and prep, so a.ts and
+    // b.ts always take the worker's names.
+    #[test]
+    fn worker_names_give_the_same_load() {
+        let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "allowJs": true,
+             "checkJs": true, "importHelpers": true, "jsx": "react-jsx", "types": [],
+             "noEmit": true }, "include": ["src"] }"#;
+        let files = [
+            ("package.json", r#"{ "name": "app", "type": "commonjs" }"#),
+            ("src/esm/package.json", r#"{ "type": "module" }"#),
+            (
+                "src/esm/a.ts",
+                r#"import { b } from "../b.js";
+import type { T } from "lib" with { "resolution-mode": "require" };
+import type { T as U } from "lib" with { "resolution-mode": "import" };
+export { e } from "lib";
+import source wasm from "./m.wasm";
+export const a = b;
+export type V = T | U;
+export const later = () => import("../c.cjs");
+export const viaRequire: typeof import("lib", { with: { "resolution-mode": "require" } }) = null!;
+"#,
+            ),
+            (
+                "src/b.ts",
+                r#"import x = require("./c.cjs");
+import { e } from "lib";
+export * from "./d.mjs";
+export const b: number = x.c + e;
+export const lazy = () => import("lib");
+export const v = <div />;
+declare module "lib" { export const extra: number; }
+"#,
+            ),
+            (
+                "src/c.cts",
+                "export const c = 1;\nexport const lazy = () => import(\"lib\");\n",
+            ),
+            (
+                "src/d.mts",
+                "import { e } from \"lib\";\nexport const d = e;\n",
+            ),
+            (
+                "src/j.js",
+                r#"/** @import { T } from "lib" */
+const { c } = require("./c.cjs");
+/** @type {T} */
+export const j = c;
+"#,
+            ),
+            (
+                "src/k.ts",
+                "/** @import { T } from \"./c.cjs\" */\nexport const k = 1;\n",
+            ),
+            (
+                "node_modules/lib/package.json",
+                r#"{ "name": "lib", "version": "1.0.0",
+                   "exports": { ".": { "import": "./esm.d.mts", "require": "./cjs.d.cts" } } }"#,
+            ),
+            (
+                "node_modules/lib/esm.d.mts",
+                "export declare const e: number;\nexport type T = string;\n",
+            ),
+            (
+                "node_modules/lib/cjs.d.cts",
+                "export declare const e: number;\nexport type T = number;\n",
+            ),
+            (
+                "node_modules/tslib/package.json",
+                r#"{ "name": "tslib", "version": "2.0.0", "types": "tslib.d.ts" }"#,
+            ),
+            (
+                "node_modules/tslib/tslib.d.ts",
+                "export declare function __assign(t: any): any;\n",
+            ),
+            (
+                "node_modules/react/package.json",
+                r#"{ "name": "react", "version": "18.0.0",
+                   "exports": { "./jsx-runtime": { "types": "./jsx-runtime.d.ts" } } }"#,
+            ),
+            (
+                "node_modules/react/jsx-runtime.d.ts",
+                r#"export declare function jsx(): any;
+export declare namespace JSX { interface IntrinsicElements { [name: string]: any } }
+"#,
+            ),
+        ];
+        // With no parse workers the loader reads every file itself.
+        let workers = super::super::files_parser::parse_workers_enabled();
+        set_load_prep(Some(true));
+        set_load_names(Some(true));
+        set_meta_wait(workers);
+        set_prep_wait(workers);
+        PREPS_NAMED.with(|files| files.borrow_mut().clear());
+        let (taken, own) = (preps_taken(), names_own());
+        let with_names = parallel_load("names_on", tsconfig, &files);
+        let (taken, own) = (preps_taken() - taken, names_own() - own);
+        let named = PREPS_NAMED.with(|files| std::mem::take(&mut *files.borrow_mut()));
+        set_meta_wait(false);
+        set_prep_wait(false);
+        set_load_names(Some(false));
+        let without_names = parallel_load("names_off", tsconfig, &files);
+        set_load_names(None);
+        set_load_prep(Some(false));
+        let without_prep = parallel_load("names_prep_off", tsconfig, &files);
+        set_load_prep(None);
+        assert_eq!(with_names, without_names);
+        assert_eq!(with_names, without_prep);
+        assert!(
+            with_names.contains(r#"module "lib" ModuleKind(1)"#),
+            "{with_names}"
+        );
+        assert!(
+            with_names.contains(r#"module "lib" ModuleKind(99)"#),
+            "{with_names}"
+        );
+        if workers {
+            assert!(taken > 0, "no prep taken:\n{with_names}");
+            for file in ["/src/esm/a.ts", "/src/b.ts"] {
+                assert!(
+                    named.iter().any(|name| name.ends_with(file)),
+                    "{file} took no named prep: {named:?}"
+                );
+            }
+            // Only the module augmentation of b.ts: the workers resolve the
+            // synthetic imports and the imports.
+            assert_eq!(own, 1, "names resolved on the loader:\n{with_names}");
+        }
+    }
+
+    // parload2: an early pool parses the root files and resolves their
+    // names before the loader exists (`start_default_lib_prefetch` with
+    // roots), with the shared resolution cache that the loader then takes
+    // (`early_shared_resolution`): node16 ESM and CJS files, a script file
+    // (its parse reads the module indicator options), a package with
+    // `import` and `require` conditions and an automatic type directive.
+    // The load finds what a load without the early pool finds, and what a
+    // single threaded load finds.
+    #[test]
+    fn early_root_jobs_give_the_same_load() {
+        let tsconfig = r#"{ "compilerOptions": { "module": "node16",
+             "types": ["node-ish"], "noEmit": true }, "include": ["src"] }"#;
+        let files = [
+            ("package.json", r#"{ "name": "app", "type": "module" }"#),
+            (
+                "src/a.ts",
+                "import { b } from \"./b.js\";\nimport { e } from \"lib\";\nexport const a = b + e;\n",
+            ),
+            ("src/b.ts", "export const b = 1;\n"),
+            (
+                "src/c.cts",
+                "import lib = require(\"lib\");\nexport const c = lib.e;\n",
+            ),
+            ("src/g.ts", "declare var g: number;\n"),
+            (
+                "node_modules/lib/package.json",
+                r#"{ "name": "lib", "version": "1.0.0",
+                   "exports": { ".": { "import": "./esm.d.mts", "require": "./cjs.d.cts" } } }"#,
+            ),
+            (
+                "node_modules/lib/esm.d.mts",
+                "export declare const e: number;\n",
+            ),
+            (
+                "node_modules/lib/cjs.d.cts",
+                "export declare const e: number;\n",
+            ),
+            (
+                "node_modules/@types/node-ish/package.json",
+                r#"{ "name": "@types/node-ish", "version": "1.0.0",
+                   "exports": { ".": { "import": "./esm.d.mts", "require": "./index.d.ts" } } }"#,
+            ),
+            (
+                "node_modules/@types/node-ish/index.d.ts",
+                "declare var nodeIsh: number;\n",
+            ),
+            (
+                "node_modules/@types/node-ish/esm.d.mts",
+                "export declare const nodeIsh: number;\n",
+            ),
+        ];
+        let single = load_text("early_st", tsconfig, &files, true, None);
+        assert_eq!(parallel_load("early_off", tsconfig, &files), single);
+        let before = early_pools_taken();
+        set_meta_wait(true);
+        let early = load_text(
+            "early_on",
+            tsconfig,
+            &files,
+            false,
+            Some(&bundled::lib_path()),
+        );
+        set_meta_wait(false);
+        assert_eq!(early, single);
+        for name in [
+            "lib/cjs.d.cts",
+            "lib/esm.d.mts",
+            "@types/node-ish/index.d.ts",
+        ] {
+            assert!(
+                single.contains(&format!("file <dir>/node_modules/{name}")),
+                "{single}"
+            );
+        }
+        if super::super::files_parser::parse_workers_enabled() {
+            assert_eq!(early_pools_taken() - before, 1);
+        }
+        // An early pool with another default lib path (`PrefetchConfig`)
+        // gives the loader no cache: `FilesParser::parse` does not take
+        // that pool, and its workers would write the loader's cache after
+        // the load.
+        let before = early_pools_taken();
+        let other = load_text(
+            "early_other_lib",
+            tsconfig,
+            &files,
+            false,
+            Some("/no/such/lib/dir"),
+        );
+        assert_eq!(other, single);
+        assert_eq!(early_pools_taken() - before, 0);
+        // The move-up of queued jobs (`GOPORT_PREFETCH_MOVE_UP`) changes only
+        // the order of the worker parses: the load with it off, in this
+        // process, finds the same.
+        set_move_up(Some(false));
+        let no_move_up = load_text(
+            "early_no_move_up",
+            tsconfig,
+            &files,
+            false,
+            Some(&bundled::lib_path()),
+        );
+        set_move_up(None);
+        assert_eq!(no_move_up, single);
+    }
+
     /// A program with a project reference (`lib`) that it loads by the
     /// output `.d.ts` files (Go `getParseFileRedirect`, a program that does
     /// not use the sources of its references). The names in `lib/out` and
@@ -3013,7 +3342,13 @@ export const a: T | Dep | number = x + (h as never);
         let load = |label: &str, prep: bool, single_threaded: bool| {
             set_load_prep(Some(prep));
             set_meta_wait(prep && !single_threaded);
-            let text = load_text(label, REFERENCE_TSCONFIG, &REFERENCE_FILES, single_threaded);
+            let text = load_text(
+                label,
+                REFERENCE_TSCONFIG,
+                &REFERENCE_FILES,
+                single_threaded,
+                None,
+            );
             set_load_prep(None);
             set_meta_wait(false);
             text
@@ -3405,7 +3740,7 @@ export const a: T | Dep | number = x + (h as never);
                 .map(|file| processed.source_file_meta_datas[file.path()].implied_node_format);
             let _ = sender.send(a);
         });
-        let loaded = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        let loaded = receiver.recv_timeout(std::time::Duration::from_mins(1));
         *PANIC_IN_JOB.lock().unwrap() = None;
         let loaded =
             loaded.expect("the loader still waits for the job of the worker that panicked");
@@ -3459,7 +3794,7 @@ export const a: T | Dep | number = x + (h as never);
                 });
             let _ = sender.send(dep);
         });
-        let loaded = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        let loaded = receiver.recv_timeout(std::time::Duration::from_mins(1));
         *PANIC_IN_JOB.lock().unwrap() = None;
         let loaded =
             loaded.expect("the loader still waits for the job of the worker that panicked");

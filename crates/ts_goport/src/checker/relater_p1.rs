@@ -1883,10 +1883,12 @@ impl Checker {
      * @param name a property name to search
      * @param isComparingJsxAttributes a boolean flag indicating whether we are searching in JsxAttributesType
      */
+    // PERF (jsxname1): `name` is the property symbol's `Name`, so the member
+    // lookups compare name ids.
     pub fn is_known_property(
         &mut self,
         target_type: TypeId,
-        name: &str,
+        name: &Name,
         is_comparing_jsx_attributes: bool,
     ) -> bool {
         if self.ty(target_type).flags.intersects(TypeFlags::OBJECT) {
@@ -1894,7 +1896,7 @@ impl Checker {
             // is incorrect and inconsistent with element access expressions, where it is an error, so eventually
             // we should remove this exception.
             if self
-                .get_property_of_object_type(target_type, name)
+                .get_property_of_object_type_key(target_type, TableKey::Name(name))
                 .is_some()
                 || self
                     .get_applicable_index_info_for_name(target_type, name)
@@ -2000,9 +2002,9 @@ impl Checker {
         false
     }
 
-    // PORT: perf. The recursion id kept for each entry of the inference
-    // stacks (`invoke_once`) and the relater stacks
-    // (`is_deeply_nested_relater_type`). `None` marks an entry that still needs
+    // PORT: perf. The recursion id kept for each entry of the relater stacks
+    // (`is_deeply_nested_relater_type`; the inference stacks keep
+    // `inference_stack_ids`). `None` marks an entry that still needs
     // `has_matching_recursion_identity`: an instantiated mapped type (its
     // mapped target can make types), an indexed access (its object type can
     // be a mapped type) or an intersection (its parts can be mapped types).
@@ -2021,24 +2023,21 @@ impl Checker {
         Some(self.get_recursion_identity_from_target(t))
     }
 
-    // PORT: perf. `is_deeply_nested_type` for stacks that keep recursion
-    // ids (the inference stacks and, through
-    // `is_deeply_nested_relater_type`, the relater stacks). `ids[i]` is
+    // PORT: perf. `is_deeply_nested_type` for the relater stacks, which keep
+    // recursion ids (`is_deeply_nested_relater_type`). `ids[i]` is
     // `stack_recursion_id(stack[i])`. An entry with an id is compared
     // directly. `probe_id` is `stack_recursion_id(t)` when the caller has it,
     // else `None`. A probe with an id is its own recursion identity target
     // and not an intersection, so the Go code would only compute that same
     // id. The other probes and the `None` entries run the Go code, so
     // `get_recursion_identity_target` runs for the same types in Go order.
-    // `ids` holds `Option<RecursionId>` (relater stacks) or `RecursionKey`
-    // (inference stacks, which convert to the same `Option<RecursionId>`).
     // Go: checker/relater.go:766 isDeeplyNestedType
-    pub fn is_deeply_nested_type_with_ids<I: Copy + Into<Option<RecursionId>>>(
+    pub fn is_deeply_nested_type_with_ids(
         &mut self,
         t: TypeId,
         probe_id: Option<RecursionId>,
         stack: &[TypeId],
-        ids: &[I],
+        ids: &[Option<RecursionId>],
         max_depth: i32,
     ) -> bool {
         debug_assert_eq!(stack.len(), ids.len());
@@ -2068,7 +2067,6 @@ impl Checker {
             let mut count: i32 = 0;
             let mut last_type_id = TypeId(0);
             for (&t, &id) in stack.iter().zip(ids) {
-                let id: Option<RecursionId> = id.into();
                 let matching = match id {
                     Some(id) => id == identity,
                     None => self.has_matching_recursion_identity(t, identity),

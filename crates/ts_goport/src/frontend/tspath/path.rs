@@ -228,18 +228,26 @@ pub fn has_trailing_directory_separator(path: &str) -> bool {
 // Combines paths. If a path is absolute, it replaces any previous path. Relative paths are not simplified.
 // PORT: Go writes into one `strings.Builder` and "sets" the result by moving
 // `start`. Building the current result directly gives the same string.
+// PERF: portonly1 item 9. Go grows one builder to the size of all the parts
+// first (path.go:88-95) and writes each part into it, and `NormalizeSlashes`
+// returns its input when it has no backslash. The port made a String for
+// each part and grew the result as it went (three allocations for one join).
 pub fn combine_paths(first_path: &str, paths: &[&str]) -> String {
     // TODO (drosen): There is potential for a fast path here.
     // In the case where we find the last absolute path and just path.Join from there.
-    let mut result = normalize_slashes(first_path);
+    let first_path = normalize_slashes_cow(first_path);
+    let size = first_path.len() + paths.len() + paths.iter().map(|p| p.len()).sum::<usize>();
+    let mut result = String::with_capacity(size);
+    result.push_str(&first_path);
     for trailing_path in paths {
         if trailing_path.is_empty() {
             continue;
         }
-        let trailing_path = normalize_slashes(trailing_path);
+        let trailing_path = normalize_slashes_cow(trailing_path);
         if result.is_empty() || get_root_length(&trailing_path) != 0 {
             // `trailingPath` is absolute.
-            result = trailing_path;
+            result.clear();
+            result.push_str(&trailing_path);
         } else {
             if !has_trailing_directory_separator(&result) {
                 result.push(DIRECTORY_SEPARATOR as char);
@@ -248,6 +256,39 @@ pub fn combine_paths(first_path: &str, paths: &[&str]) -> String {
         }
     }
     result
+}
+
+// Go: tspath/rooted_path.go:737 (`RootedDirectoryPath.ResolveFile`) and :794
+// (`ResolveDirectory`): the `canAppendPathWithoutNormalization` fast path
+// (rooted_path.go:841) with `appendPathToDirectory` (rooted_path.go:853).
+/// `normalize_path(&combine_paths(directory, &[path]))` when that is just
+/// `directory`, a separator and `path`: `directory` is not empty and is
+/// normal (`is_normalized_path`), and `path` is a relative path with no
+/// backslash, no "." or ".." segment, no empty segment and no trailing
+/// separator. Then the joined path has no segment that `normalize_path`
+/// changes. `None` otherwise: the caller joins and normalizes.
+// PORT: Go's resolver keeps its directories as `RootedDirectoryPath`, which
+// is normal by type; the port tests `directory` here.
+#[must_use]
+pub fn append_relative_to_normal_directory(directory: &str, path: &str) -> Option<String> {
+    let appendable = !path.is_empty()
+        && get_root_length(path) == 0
+        && !path.as_bytes().contains(&b'\\')
+        && !has_relative_path_segment(path)
+        && !has_trailing_directory_separator(path)
+        && !directory.is_empty()
+        && is_normalized_path(directory);
+    if !appendable {
+        return None;
+    }
+    let mut joined = String::with_capacity(directory.len() + 1 + path.len());
+    joined.push_str(directory);
+    if !has_trailing_directory_separator(directory) {
+        joined.push(DIRECTORY_SEPARATOR as char);
+    }
+    joined.push_str(path);
+    debug_assert_eq!(joined, normalize_path(&combine_paths(directory, &[path])));
+    Some(joined)
 }
 
 // Go: tspath/path.go:128 GetPathComponents
@@ -268,6 +309,28 @@ fn path_components(path: &str, root_length: usize) -> Vec<String> {
     result.push(root.to_string());
     result.extend(rest);
     result
+}
+
+/// `combine_paths(directory, &[path])`, with no copy when `path` is rooted:
+/// then the result is `path` with normal slashes.
+fn combine_with_directory<'a>(directory: &str, path: &'a str) -> Cow<'a, str> {
+    let normal = normalize_slashes_cow(path);
+    if get_root_length(&normal) != 0 {
+        return normal;
+    }
+    Cow::Owned(combine_paths(directory, &[path]))
+}
+
+/// `path_components` with parts that borrow `path`: the same parts, no copy
+/// of each.
+fn path_component_refs(path: &str, root_length: usize) -> Vec<&str> {
+    let mut components = vec![&path[..root_length]];
+    components.extend(path[root_length..].split('/'));
+    // The rest always has a part; an empty last one goes, as in `path_components`.
+    if components.last().is_some_and(|last| last.is_empty()) {
+        components.pop();
+    }
+    components
 }
 
 // Go: tspath/path.go:147 IsVolumeCharacter
@@ -472,6 +535,32 @@ fn reduce_path_components(components: Vec<String>) -> Vec<String> {
             continue;
         }
         if component == "." {
+            continue;
+        }
+        if component == ".." {
+            if reduced.len() > 1 {
+                if reduced[reduced.len() - 1] != ".." {
+                    reduced.pop();
+                    continue;
+                }
+            } else if !reduced[0].is_empty() {
+                continue;
+            }
+        }
+        reduced.push(component);
+    }
+    reduced
+}
+
+/// `reduce_path_components` of borrowed parts.
+fn reduce_path_component_refs(components: Vec<&str>) -> Vec<&str> {
+    let mut components = components.into_iter();
+    let Some(first) = components.next() else {
+        return Vec::new();
+    };
+    let mut reduced = vec![first];
+    for component in components {
+        if component.is_empty() || component == "." {
             continue;
         }
         if component == ".." {
@@ -1213,9 +1302,9 @@ fn relative_path_from_normalized_paths(
 
 // Go: tspath/rooted_path.go:106 hasRootedURLSuffix (ts#64159)
 /// A URL root with a query or a fragment after its scheme.
-// PORT: private in Go tspath. The Rust ports of the rooted path
-// constructors that use it are outside tspath (`transpile.rs`,
-// `contentmapper/hostimpl.rs`).
+// PORT: private in Go tspath. `to_rooted_path` and the Rust ports of the
+// rooted path constructors outside tspath (`transpile.rs`,
+// `contentmapper/hostimpl.rs`, `api/session_p2.rs`) use it.
 pub fn has_rooted_url_suffix(path: &str) -> bool {
     if !has_url_root(path) {
         return false;
@@ -1228,6 +1317,42 @@ pub fn has_rooted_url_suffix(path: &str) -> bool {
 // PORT: private in Go tspath (see `has_rooted_url_suffix`).
 pub fn has_url_root(path: &str) -> bool {
     get_encoded_root_length(path) < 0 && path.contains("://")
+}
+
+// Go: tspath/rooted_path.go:29 ToRootedPath (ts#64159)
+// ToRootedPath resolves path against currentDirectory and normalizes it.
+// Go `ToRootedFilePath` (:120) and `ToRootedDirectoryPath` (:154) are this
+// function with a typed result. An empty `path`, or a URL `path` with a
+// query or fragment, is a Go panic; a request handler answers it as
+// `panic: <message>`.
+// PORT: the API and the command line parser use it (the API's other
+// rooted path checks are in `api::session_p2`). Go normalizes with
+// `getNormalizedAbsolutePathFromDirectory` (path.go:409), which gives the
+// text of `get_normalized_absolute_path` for a rooted current directory.
+pub fn to_rooted_path(path: &str, current_directory: &str) -> String {
+    if path.is_empty() {
+        crate::core::go_panic("path must not be empty".to_string());
+    }
+    if has_rooted_url_suffix(path) {
+        crate::core::go_panic("path must not contain a URL query or fragment".to_string());
+    }
+    if get_encoded_root_length(path) == 0
+        && has_url_root(current_directory)
+        && path.contains(['?', '#'])
+    {
+        crate::core::go_panic("relative URL path must not contain a query or fragment".to_string());
+    }
+    let mut normalized = get_normalized_absolute_path(path, current_directory);
+    if get_encoded_root_length(&normalized) == 0 || has_rooted_url_suffix(&normalized) {
+        crate::core::go_panic("path must be rooted".to_string());
+    }
+    // Go: tspath/rooted_path.go:65 ensureRootedPathRootSeparator
+    if get_root_length(&normalized) == normalized.len()
+        && !has_trailing_directory_separator(&normalized)
+    {
+        normalized.push('/');
+    }
+    normalized
 }
 
 // Go: tspath/rooted_path.go:575 CaseSensitivity.trimContainedPath (ts#64159)
@@ -1587,17 +1712,30 @@ pub fn compare_rooted_text(a: &str, b: &str, use_case_sensitive_file_names: bool
 }
 
 // Go: tspath/path.go:1111 ContainsPath
+// PORT: Go at the pin takes only the case setting and combines with "". No
+// Go caller outside tests uses it: the callers take typed rooted paths
+// (`CaseSensitivity.ContainsPath`, rooted_path.go:553, ts#64159). The port's
+// callers pass strings, so `options.current_directory` stays: it roots a
+// relative path, as a Go caller roots it when it makes the typed path. With
+// an empty current directory or two rooted paths, the answer is that of
+// path.go:1111.
 pub fn contains_path(parent: &str, child: &str, options: &ComparePathsOptions) -> bool {
-    let parent = combine_paths(&options.current_directory, &[parent]);
-    let child = combine_paths(&options.current_directory, &[child]);
+    let parent = combine_with_directory(&options.current_directory, parent);
+    let child = combine_with_directory(&options.current_directory, child);
     if parent.is_empty() || child.is_empty() {
         return false;
     }
     if parent == child {
         return true;
     }
-    let parent_components = reduce_path_components(get_path_components(&parent, ""));
-    let child_components = reduce_path_components(get_path_components(&child, ""));
+    // PERF: the parts borrow the two paths (Go's parts are substrings); the
+    // owned `get_path_components` copied each part.
+    let parent = normalize_slashes_cow(&parent);
+    let child = normalize_slashes_cow(&child);
+    let parent_components =
+        reduce_path_component_refs(path_component_refs(&parent, get_root_length(&parent)));
+    let child_components =
+        reduce_path_component_refs(path_component_refs(&child, get_root_length(&child)));
     if child_components.len() < parent_components.len() {
         return false;
     }
@@ -1609,7 +1747,7 @@ pub fn contains_path(parent: &str, child: &str, options: &ComparePathsOptions) -
         } else {
             component_comparer
         };
-        if !comparer(parent_component, &child_components[i]) {
+        if !comparer(parent_component, child_components[i]) {
             return false;
         }
     }
@@ -2120,5 +2258,164 @@ mod relative_path_tests {
             relative_path_from_directory("/PROJECT/src", "/project/lib/util.ts", true).as_deref(),
             Some("../../project/lib/util.ts")
         );
+    }
+}
+
+#[cfg(test)]
+mod component_ref_tests {
+    use super::{
+        ComparePathsOptions, combine_paths, combine_with_directory, contains_path,
+        equate_string_case_insensitive, get_path_components, get_root_length,
+        normalize_slashes_cow, path_component_refs, path_components, reduce_path_component_refs,
+        reduce_path_components,
+    };
+
+    /// `contains_path` with owned parts, as before loadserial1.
+    fn contains_path_owned(parent: &str, child: &str, options: &ComparePathsOptions) -> bool {
+        let parent = combine_paths(&options.current_directory, &[parent]);
+        let child = combine_paths(&options.current_directory, &[child]);
+        if parent.is_empty() || child.is_empty() {
+            return false;
+        }
+        if parent == child {
+            return true;
+        }
+        let parent_components = reduce_path_components(get_path_components(&parent, ""));
+        let child_components = reduce_path_components(get_path_components(&child, ""));
+        if child_components.len() < parent_components.len() {
+            return false;
+        }
+        let component_comparer = options.get_equality_comparer();
+        parent_components
+            .iter()
+            .zip(&child_components)
+            .enumerate()
+            .all(|(i, (parent, child))| {
+                if i == 0 {
+                    equate_string_case_insensitive(parent, child)
+                } else {
+                    component_comparer(parent, child)
+                }
+            })
+    }
+
+    /// `contains_path` gives the answer of its owned parts for each pair of
+    /// these paths (file URL roots with ':' and "%3A", UNC, drive, rooted
+    /// and relative paths, `.` and `..`), with and without case
+    /// sensitivity and a current directory. The root compares without
+    /// case, as in Go.
+    #[test]
+    fn contains_path_matches_owned_parts() {
+        const PATHS: [&str; 30] = [
+            "",
+            ".",
+            "..",
+            "/",
+            "/a/b",
+            "/a/B",
+            "/A/b/c",
+            "/a/b/../c",
+            "/a/./b/",
+            "/a//b",
+            "a/b",
+            "A/B/c",
+            "../a",
+            "c:",
+            "C:/",
+            "c:/a",
+            "C:/A/b",
+            "c:\\a\\b",
+            "file:///a/b",
+            "FILE:///A/b/c",
+            "file:///c%3A/a",
+            "file:///C%3a/a/b",
+            "file:///c:/a/B",
+            "file://server/share/x",
+            "file://Server/share/x/y",
+            "//server/share/a",
+            "\\\\server\\share\\a\\b",
+            "http://x/a",
+            "http://X/a/b",
+            "x:/",
+        ];
+        let mut answers = [0usize; 2];
+        for use_case_sensitive_file_names in [true, false] {
+            for current_directory in ["", "/a/B"] {
+                let options = ComparePathsOptions {
+                    use_case_sensitive_file_names,
+                    current_directory: current_directory.to_string(),
+                };
+                for parent in PATHS {
+                    for child in PATHS {
+                        let answer = contains_path(parent, child, &options);
+                        assert_eq!(
+                            answer,
+                            contains_path_owned(parent, child, &options),
+                            "{parent:?} {child:?} {use_case_sensitive_file_names} {current_directory:?}"
+                        );
+                        answers[usize::from(answer)] += 1;
+                    }
+                }
+            }
+        }
+        assert!(answers[0] > 0 && answers[1] > 0, "{answers:?}");
+        let sensitive = ComparePathsOptions {
+            use_case_sensitive_file_names: true,
+            current_directory: String::new(),
+        };
+        let insensitive = ComparePathsOptions {
+            use_case_sensitive_file_names: false,
+            current_directory: String::new(),
+        };
+        assert!(!contains_path("/a/b", "/A/B/c", &sensitive));
+        assert!(contains_path("/a/b", "/A/B/c", &insensitive));
+        assert!(contains_path(
+            "file:///c%3A/a",
+            "file:///C%3a/a/b",
+            &sensitive
+        ));
+        assert!(contains_path("C:/a", "c:/a/b/../c", &sensitive));
+        assert!(!contains_path("C:/a", "c:/a/../c", &sensitive));
+    }
+
+    /// The borrowed parts of `contains_path` are the owned parts, before and
+    /// after the reduction, and its combined paths are `combine_paths`, for
+    /// every name of up to 6 bytes over '.', '/', '\\', ':', 'a' and 'B'
+    /// (rooted, drive-rooted, relative, `.` and `..`).
+    #[test]
+    fn borrowed_components_match_owned() {
+        const ALPHABET: [char; 6] = ['.', '/', '\\', ':', 'a', 'B'];
+        let mut names = vec![String::new()];
+        let mut start = 0;
+        for _ in 0..6 {
+            let end = names.len();
+            for i in start..end {
+                for c in ALPHABET {
+                    let mut name = names[i].clone();
+                    name.push(c);
+                    names.push(name);
+                }
+            }
+            start = end;
+        }
+        for name in &names {
+            for directory in ["/a/B", "c:/", "", "a\\b"] {
+                assert_eq!(
+                    combine_with_directory(directory, name),
+                    combine_paths(directory, &[name]),
+                    "{directory:?} and {name:?}"
+                );
+            }
+            let path = normalize_slashes_cow(name);
+            let root_length = get_root_length(&path);
+            let owned = path_components(&path, root_length);
+            let borrowed = path_component_refs(&path, root_length);
+            assert_eq!(owned, borrowed, "parts of {name:?}");
+            assert_eq!(
+                reduce_path_components(owned),
+                reduce_path_component_refs(borrowed),
+                "reduced parts of {name:?}"
+            );
+        }
     }
 }

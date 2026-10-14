@@ -112,16 +112,18 @@ impl AliasResolver {
     // nil only when the host gives nil (aliasresolver.go:86). A file read on
     // demand does not join the checker's files (Go `c.files`): the host's
     // parse cache key keeps it live until the clone's `dispose`.
-    // PORT: Go binds a second-pass root file only if an earlier pass bound
-    // the parse that the host gives (registry.go:1102 reads it from the
-    // host, with no bind). That is true inside one clone. A file of an
-    // ancestor bucket that this clone did not build (`resolveAmbientModuleName`,
-    // registry.go:1844) can be a new parse: the host releases its keys at the
-    // end of each clone (project/snapshot.go:722), and the parse cache drops
-    // an entry at refcount 0 (refcountcache.go:125). Go's `initializeChecker`
-    // then merges nothing from it. Here every root file is bound, and the
-    // session keeps one parse per path (`kept_files`, project/autoimport.rs
-    // `dispose`).
+    // PORT: Go reads a second-pass root file from the host with no bind
+    // (registry.go:1102), but Go's parse cache binds each new parse
+    // (project/parsecache.go:80, ts#63952). So a root file is always bound
+    // in Go, also a new parse of a file of an ancestor bucket that this
+    // clone did not build (`resolveAmbientModuleName`, registry.go:1844).
+    // The port's parse cache does not bind (`parsecache::new_parse_cache`),
+    // so every root file is bound here. That bind matters only for a new
+    // parse: the session keeps one parse per path (`kept_files`,
+    // project/autoimport.rs `dispose`), so a later clone usually reuses a
+    // parse that an earlier clone bound. Go N' and the port give the same
+    // export counts in the registry test
+    // `second_pass_reads_a_root_file_of_an_ancestor_bucket_in_a_later_clone`.
     // PORT: Go's `NewChecker` has no context. `ctx` is for
     // `should_stop_build`: a build that the caller drops on cancel stops
     // before the program, and gets `None`. For any other context the result
@@ -213,9 +215,12 @@ impl AliasResolver {
     // Go: ls/autoimport/aliasresolver.go:80 GetSourceFile
     // GetSourceFile implements checker.Program.
     pub fn get_source_file(&self, file_name: &str) -> Node {
-        let file = self
-            .host
-            .get_source_file(file_name, &(self.to_path)(file_name));
+        self.get_source_file_at(file_name, &(self.to_path)(file_name))
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:83 getSourceFile
+    fn get_source_file_at(&self, file_name: &str, path: &tspath::Path) -> Node {
+        let file = self.host.get_source_file(file_name, path);
         // file may be nil due to symlink/realpath mismatch; see TestAutoImportBuilderFS
         if file.is_nil() {
             return Node::NIL;
@@ -299,13 +304,13 @@ impl AliasResolver {
         resolved
     }
 
-    // Go: ls/autoimport/aliasresolver.go:130 GetSourceFileForResolvedModule
+    // Go: ls/autoimport/aliasresolver.go:137 GetSourceFileForResolvedModule
     // GetSourceFileForResolvedModule implements checker.Program.
-    pub fn get_source_file_for_resolved_module(&self, file_name: &str) -> Node {
-        self.get_source_file(file_name)
+    pub fn get_source_file_for_resolved_module(&self, resolved: &ResolvedModule) -> Node {
+        self.get_source_file_at(&resolved.resolved_file_name, &resolved.resolved_path)
     }
 
-    // Go: ls/autoimport/aliasresolver.go:135 GetResolvedModules
+    // Go: ls/autoimport/aliasresolver.go:142 GetResolvedModules
     // GetResolvedModules implements checker.Program.
     // PORT: the Go nil map is an empty map.
     pub fn get_resolved_modules(
@@ -439,6 +444,16 @@ impl AliasResolver {
         false
     }
 
+    // Go: ls/autoimport/aliasresolver.go:226 IsSourceFileFromExternalLibrary
+    // IsSourceFileFromExternalLibrary implements checker.Program.
+    // Effect-TS/tsgo patch 018 adds it, because patch 002 adds the method to
+    // `checker.Program`.
+    // PORT: no port path calls it on an alias resolver; the Effect caller
+    // (`rulerunner::run`) never runs on an alias resolver checker.
+    pub fn is_source_file_from_external_library(&self, _file: Node) -> bool {
+        false
+    }
+
     // Go: ls/autoimport/aliasresolver.go:228 IsSourceFromProjectReference
     // IsSourceFromProjectReference implements checker.Program.
     pub fn is_source_from_project_reference(&self, path: &tspath::Path) -> bool {
@@ -466,8 +481,8 @@ impl AliasResolverProgram for AliasResolver {
         self.get_source_file(file_name)
     }
 
-    fn source_file_for_resolved_module(&self, file_name: &str) -> Node {
-        self.get_source_file_for_resolved_module(file_name)
+    fn source_file_for_resolved_module(&self, resolved: &ResolvedModule) -> Node {
+        self.get_source_file_for_resolved_module(resolved)
     }
 
     fn resolved_module(

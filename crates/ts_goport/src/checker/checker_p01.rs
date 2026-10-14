@@ -406,15 +406,23 @@ impl Default for InferenceContext {
 // Go: checker/checker.go:290 InferenceInfo
 // PORT: Go `*InferenceInfo` is an index into `InferenceContext::inferences`.
 // PERF (infermem1): 32 bytes (asserted below), not 72. The two candidate
-// lists are in one box that the first candidate makes (typebox: about 6M
-// infos, under a third of them with candidates). `candidates()` and
-// `contra_candidates()` give Go's nil lists while it is absent.
+// lists are in one box that the second candidate makes (typebox: about 6M
+// infos, under a third of them with candidates). The first candidate is
+// kept inline in `first_candidate`, so a single candidate needs no box and
+// no list (inferfast1). `candidates()` and `contra_candidates()` give Go's
+// lists.
 #[derive(Clone, Debug, Default)]
 pub struct InferenceInfo {
     /// Type parameter for which inferences are being made
     pub type_parameter: TypeId,
-    /// Go `candidates` and `contraCandidates`, or `None` while both are nil.
-    pub candidate_lists: Option<Box<InferenceCandidates>>,
+    /// Go `candidates` and `contraCandidates` when they hold more than one
+    /// candidate, else `None`. Written only through `push_candidate`,
+    /// `clear_candidates` and a copy (`clone_inference_info`, `Clone`).
+    pub(super) candidate_lists: Option<Box<InferenceCandidates>>,
+    /// The one candidate while `candidate_lists` is `None` (NIL when there
+    /// is none). `first_is_contra` tells its list.
+    pub(super) first_candidate: TypeId,
+    pub(super) first_is_contra: bool,
     /// Cache for resolved inferred type
     pub inferred_type: TypeId,
     /// Priority of current inference set
@@ -442,22 +450,73 @@ pub struct InferenceCandidates {
 
 impl InferenceInfo {
     /// Go `info.candidates`.
+    #[inline]
     #[must_use]
     pub fn candidates(&self) -> &[TypeId] {
-        self.candidate_lists.as_ref().map_or(&[], |l| &l.candidates)
+        match &self.candidate_lists {
+            Some(l) => &l.candidates,
+            None if self.first_candidate.is_some() && !self.first_is_contra => {
+                std::slice::from_ref(&self.first_candidate)
+            }
+            None => &[],
+        }
     }
 
     /// Go `info.contraCandidates`.
+    #[inline]
     #[must_use]
     pub fn contra_candidates(&self) -> &[TypeId] {
-        self.candidate_lists
-            .as_ref()
-            .map_or(&[], |l| &l.contra_candidates)
+        match &self.candidate_lists {
+            Some(l) => &l.contra_candidates,
+            None if self.first_candidate.is_some() && self.first_is_contra => {
+                std::slice::from_ref(&self.first_candidate)
+            }
+            None => &[],
+        }
     }
 
-    /// The candidate lists for a write. Makes the box on the first write.
-    pub fn candidate_lists_mut(&mut self) -> &mut InferenceCandidates {
-        self.candidate_lists.get_or_insert_default()
+    /// Go `info.candidates = append(info.candidates, t)`, or
+    /// `info.contraCandidates` when `contra`. The first candidate goes
+    /// inline; the second moves both into the box.
+    #[inline]
+    pub fn push_candidate(&mut self, t: TypeId, contra: bool) {
+        // A nil first candidate would read as no candidate. Go appends
+        // only inferred source types, which are never nil.
+        debug_assert!(t.is_some(), "nil inference candidate");
+        if self.candidate_lists.is_none() {
+            if self.first_candidate.is_nil() {
+                self.first_candidate = t;
+                self.first_is_contra = contra;
+                return;
+            }
+            self.spill_first_candidate();
+        }
+        let lists = self.candidate_lists.as_mut().unwrap();
+        if contra {
+            lists.contra_candidates.push(t);
+        } else {
+            lists.candidates.push(t);
+        }
+    }
+
+    /// Moves the inline candidate into a new box.
+    #[cold]
+    fn spill_first_candidate(&mut self) {
+        let mut lists = Box::<InferenceCandidates>::default();
+        let first = std::mem::take(&mut self.first_candidate);
+        if self.first_is_contra {
+            lists.contra_candidates.push(first);
+        } else {
+            lists.candidates.push(first);
+        }
+        self.candidate_lists = Some(lists);
+    }
+
+    /// Go `info.candidates = nil; info.contraCandidates = nil`.
+    #[inline]
+    pub fn clear_candidates(&mut self) {
+        self.candidate_lists = None;
+        self.first_candidate = TypeId::NIL;
     }
 }
 
@@ -793,8 +852,10 @@ impl FlatKey for TypeId {
 //   which the declarations symbol tracker and declaration diagnostics use
 //   (see its note).
 // - `sync.Once` fields become `bool` "done" flags.
-// - `*T` pools and shared structs (`*Relation`, `*Relater`, `*FlowState`,
+// - `*T` pools and shared structs (`*Relation`, `*Relater`,
 //   `*InferenceState`) are `Rc<RefCell<T>>`; nil-able ones are `Option`.
+//   `*FlowState` is `&mut FlowState` on the walk's stack, with no free list
+//   (see `FlowState`).
 // - `ast.NodeId` map keys are `Node` handles.
 pub struct Checker {
     pub id: u32,
@@ -944,7 +1005,7 @@ pub struct Checker {
     /// Go `lazyMemberTables` (microsoft/TypeScript#64475, not in the pin;
     /// lazy_members.rs). Empty unless `lazy_members` is on.
     pub(crate) lazy_member_tables: crate::checker::lazy_members::LazyMemberTables,
-    /// lazymem1: `GOPORT_LAZY_MEMBERS=1` (lazy_members.rs). Not in Go. Set
+    /// lazymem1: `GOPORT_LAZY_MEMBERS=1` or fast mode (lazy_members.rs). Not in Go. Set
     /// once at creation; off, no lazy member table is made.
     pub lazy_members: bool,
     pub context_free_types: FxHashMap<Node, TypeId>,
@@ -1056,7 +1117,6 @@ pub struct Checker {
     pub last_get_combined_modifier_flags_node: Node,
     pub last_get_combined_modifier_flags_result: ModifierFlags,
     pub freeinference_state: Option<Rc<RefCell<InferenceState>>>,
-    pub free_flow_state: Option<Rc<RefCell<FlowState>>>,
     pub flow_loop_cache: FxHashMap<FlowLoopKey, TypeId>,
     pub flow_loop_stack: Vec<FlowLoopInfo>,
     pub shared_flows: Vec<SharedFlow>,
@@ -1578,7 +1638,6 @@ impl Checker {
             last_get_combined_modifier_flags_node: Node::NIL,
             last_get_combined_modifier_flags_result: ModifierFlags::default(),
             freeinference_state: None,
-            free_flow_state: None,
             flow_loop_cache: FxHashMap::default(),
             flow_loop_stack: Vec::new(),
             shared_flows: Vec::new(),

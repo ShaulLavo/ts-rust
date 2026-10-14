@@ -957,7 +957,7 @@ fn send_code(worker: Worker, code: i32) {
 // `scanner_util::GO_STRING_MARKER`). The system writer writes the Go bytes
 // of the output (`GoOutput`).
 fn run_main(start: Instant) -> i32 {
-    let args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
+    let mut args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
 
     if let Some(first) = args.first() {
         match first.as_str() {
@@ -966,6 +966,11 @@ fn run_main(start: Instant) -> i32 {
             _ => {}
         }
     }
+
+    // PORT: not in Go (fastmode1). Go has no `--fast`: where Go's parser
+    // reads it as an option name, it becomes an empty argument, which Go's
+    // option parsing skips (`take_flag`).
+    ts_goport::fast_mode::take_flag(&mut args);
 
     // Go: ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
     let (ctx, stop) = notify_context(&context::background());
@@ -1041,7 +1046,7 @@ fn install_panic_hook() {
         }
         let location = info
             .location()
-            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .map(|l| format!(" at {}:{}", go_site_file(l.file()), l.line()))
             .unwrap_or_default();
         // The output so far comes first, also in one file with stderr.
         ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();

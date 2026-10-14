@@ -46,9 +46,7 @@ impl Checker {
         }
         let exports = self.sym(module_symbol).exports;
         if local_symbol.is_some() {
-            let exported_equals_symbol = self
-                .symbols
-                .get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
+            let exported_equals_symbol = self.symbols.get(exports, &*EXPORT_EQUALS_NAME);
             if exported_equals_symbol.is_some() {
                 if self
                     .get_symbol_if_same_reference(exported_equals_symbol, local_symbol)
@@ -555,8 +553,7 @@ impl Checker {
                     diag::Module_0_was_resolved_to_1_but_jsx_is_not_set,
                 ))
         {
-            source_file =
-                get_source_file_for_resolved_module(&resolved_module.unwrap().resolved_file_name);
+            source_file = get_source_file_for_resolved_module(resolved_module.unwrap());
             // PORT: an autoimport alias resolver reads and binds the file
             // now; the checker's arena then adds its symbols.
             if source_file.is_some() {
@@ -863,16 +860,8 @@ impl Checker {
             // See if this was possibly a projectReference redirect
             if is_resolved_p17(resolved_module) {
                 let rm = resolved_module.unwrap();
-                // ts#64159 (checker.go:15713): Go reads `ResolvedModule.ResolvedPath`, the
-                // path key of the rooted resolved name; `to_path` gives the same key.
-                let redirect = get_project_reference_from_source(
-                    tspath::to_path(
-                        &rm.resolved_file_name,
-                        get_current_directory(),
-                        use_case_sensitive_file_names(),
-                    )
-                    .as_str(),
-                );
+                // ts#64159 (checker.go:15713): Go reads `ResolvedModule.ResolvedPath`.
+                let redirect = get_project_reference_from_source(rm.resolved_path.as_str());
                 if let Some(redirect) = redirect.filter(|r| !r.output_dts.is_empty()) {
                     self.error(
                         error_node,
@@ -1271,10 +1260,9 @@ impl Checker {
         dont_resolve_alias: bool,
     ) -> SymbolId {
         if module_symbol.is_some() {
-            let export_equals_symbol = self.symbols.get(
-                self.sym(module_symbol).exports,
-                INTERNAL_SYMBOL_NAME_EXPORT_EQUALS,
-            );
+            let export_equals_symbol = self
+                .symbols
+                .get(self.sym(module_symbol).exports, &*EXPORT_EQUALS_NAME);
             let export_equals = self.resolve_symbol_ex(export_equals_symbol, dont_resolve_alias);
             if export_equals.is_some() {
                 return self.get_merged_symbol(export_equals);

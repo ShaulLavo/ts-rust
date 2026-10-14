@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +14,27 @@ import { fileEntries } from "../file-map.js";
 test("persistent language services update, navigate, isolate and dispose", async () => {
     const result = await verifyLanguageService(createLanguageService);
     assert.equal(Object.values(result).every(Boolean), true);
+});
+
+test("Node workers start from module eval input", () => {
+    const entry = new URL("../node.js", import.meta.url).href;
+    const code = `
+        import { createLanguageService, tsc } from ${JSON.stringify(entry)};
+        const files = { "/a.ts": "export const value = 1;" };
+        const service = await createLanguageService({ args: ["/a.ts"], files });
+        try {
+            const hover = await service.request("textDocument/hover", {
+                textDocument: { uri: "file:///a.ts" }, position: { line: 0, character: 14 },
+            });
+            const compiled = await tsc(["--noEmit", "/a.ts"], { files });
+            console.log(JSON.stringify({ hover: Boolean(hover), exitCode: compiled.exitCode }));
+        } finally { await service.dispose(); }
+    `;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", code], {
+        encoding: "utf8", timeout: 30_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { hover: true, exitCode: 0 });
 });
 
 test("Node service checks a deep expression without JSPI", async () => {

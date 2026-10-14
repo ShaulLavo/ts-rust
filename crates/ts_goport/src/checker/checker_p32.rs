@@ -35,7 +35,7 @@ impl Checker {
     // Go: checker/checker.go:29541 getMappedTypeModifiers
     // PORT: Go package function; it reads type data, so it is a `Checker` method.
     pub fn get_mapped_type_modifiers(&self, t: TypeId) -> MappedTypeModifiers {
-        let declaration = self.ty(t).as_mapped_type().declaration;
+        let declaration = self.ty(t).as_mapped_type().declaration();
         let mut modifiers = MappedTypeModifiers::default();
         let readonly_token = declaration.readonly_token();
         if readonly_token.is_some() {
@@ -627,16 +627,19 @@ impl Checker {
     }
 
     // Go: checker/checker.go:29862 getTypeOfPropertyOrIndexSignatureOfType
-    pub fn get_type_of_property_or_index_signature_of_type(
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`). With a `Name`, the
+    // property lookup compares name ids.
+    pub fn get_type_of_property_or_index_signature_of_type<'a>(
         &mut self,
         t: TypeId,
-        name: &str,
+        name: impl Into<TableKey<'a>>,
     ) -> TypeId {
+        let name: TableKey<'a> = name.into();
         let prop_type = self.get_type_of_property_of_type(t, name);
         if prop_type.is_some() {
             return prop_type;
         }
-        let index_info = self.get_applicable_index_info_for_name(t, name);
+        let index_info = self.get_applicable_index_info_for_name(t, name.text());
         if index_info.is_some() {
             let value_type = self.index_info(index_info).value_type;
             return self.add_optionality_ex(
@@ -667,8 +670,12 @@ impl Checker {
      * @param node the expression whose contextual type will be returned.
      * @returns the contextual type of an expression.
      */
+    // PERF: deferbody1. Go reads `node.Flags`, `node.Parent` and
+    // `parent.Kind` as fields. Here each read was a registry lookup, so they
+    // are read through the node's view (`NodeRef`): one lookup.
     pub fn get_contextual_type(&mut self, node: Node, context_flags: ContextFlags) -> TypeId {
-        if node.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
+        let view = NodeRef::new(node);
+        if view.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
             // We cannot answer semantic questions within a with block, do not proceed any further
             return TypeId::NIL;
         }
@@ -681,8 +688,9 @@ impl Checker {
         if index >= 0 {
             return self.contextual_infos[index as usize].t;
         }
-        let parent = node.parent();
-        match parent.kind() {
+        let parent_view = view.parent();
+        let parent = parent_view.node();
+        match parent_view.kind() {
             SyntaxKind::VariableDeclaration
             | SyntaxKind::Parameter
             | SyntaxKind::PropertyDeclaration
@@ -722,12 +730,13 @@ impl Checker {
             }
             SyntaxKind::ArrayLiteralExpression => {
                 let t = self.get_apparent_type_of_contextual_type(parent, context_flags);
-                let element_index = index_of_node(parent.elements(), node);
+                let elements = parent.elements();
+                let element_index = index_of_node(elements, node);
                 if element_index < 0 {
                     return TypeId::NIL;
                 }
                 let (first_spread_index, last_spread_index) = self.get_spread_indices(parent);
-                let length = parent.elements().len() as i32;
+                let length = elements.len() as i32;
                 return self.get_contextual_type_for_element_expression(
                     t,
                     element_index,

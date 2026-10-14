@@ -9,10 +9,10 @@
 //! declared member is instantiated only when a lookup asks for it, and the
 //! full table (`resolve_lazy_members`) reuses it.
 //!
-//! `GOPORT_LAZY_MEMBERS=1` turns it on (`Checker::lazy_members`). Go has no
-//! switch. With the switch off, nothing here runs and the checker does what
-//! it did before. With it on, the output must equal Go at the pin with
-//! #64475 applied.
+//! `GOPORT_LAZY_MEMBERS=1` or fast mode (`crate::fast_mode`) turns it on
+//! (`Checker::lazy_members`). Go has no switch. With the switch off,
+//! nothing here runs and the checker does what it did before. With it on,
+//! the output must equal Go at the pin with #64475 applied.
 //!
 //! PERF (lazymem1 round 2): the hooks in the checker test
 //! `MEMBERS_RESOLVED` once, read a resolved type in place and take an
@@ -37,11 +37,12 @@ use smallvec::SmallVec;
 use std::cell::OnceCell;
 use std::sync::OnceLock;
 
-/// `GOPORT_LAZY_MEMBERS`, read once per process. Only `1` turns lazy member
-/// tables on. `Checker::new` stores it in `Checker::lazy_members`.
+/// `GOPORT_LAZY_MEMBERS`, read once per process. `1` turns lazy member
+/// tables on, `0` off; else they follow fast mode (`crate::fast_mode`), off
+/// by default. `Checker::new` stores it in `Checker::lazy_members`.
 pub fn lazy_members_from_env() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GOPORT_LAZY_MEMBERS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| crate::fast_mode::part("GOPORT_LAZY_MEMBERS"))
 }
 
 // Go: Checker.lazyMemberTables (#64475)
@@ -507,7 +508,7 @@ impl Checker {
         let name = name.into();
         let ty = self.ty(t);
         if ty.object_flags.intersects(ObjectFlags::MEMBERS_RESOLVED) {
-            return self.symbols.get_key(ty.as_structured_type().members, name);
+            return self.symbols.get(ty.as_structured_type().members, name);
         }
         self.get_member_of_unresolved_structured_type(t, name)
     }
@@ -523,7 +524,7 @@ impl Checker {
             Some(lm) if !is_reserved_member_key(name) => lm,
             _ => {
                 let members = self.resolve_structured_type_members(t).members;
-                return self.symbols.get_key(members, name);
+                return self.symbols.get(members, name);
             }
         };
         // The declared member, else the first base type's property (see
@@ -531,7 +532,7 @@ impl Checker {
         let mut result = SymbolId::NIL;
         let source = self.ty(t).target();
         let declared_members = self.resolve_declared_members_lazy(source).declared_members;
-        let decl = self.symbols.get_key(declared_members, name);
+        let decl = self.symbols.get(declared_members, name);
         if decl.is_some() {
             // The table holds the name, so the text is interned and `from`
             // adds nothing.
@@ -1122,14 +1123,11 @@ mod tests {
     /// `testdata/tests/cases/compiler/instantiatedReferenceLazyMembers.ts`
     /// and its `.errors.txt` baseline, which the PR made on unmodified main.
     const PR_CASE_NAME: &str = "instantiatedReferenceLazyMembers.ts";
-    const PR_CASE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lazy_members/instantiatedReferenceLazyMembers.ts"
-    ));
-    const PR_ERRORS: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lazy_members/instantiatedReferenceLazyMembers.errors.txt"
-    ));
+    const PR_CASE: &str =
+        include_str!("../../tests/fixtures/lazy_members/instantiatedReferenceLazyMembers.ts");
+    const PR_ERRORS: &str = include_str!(
+        "../../tests/fixtures/lazy_members/instantiatedReferenceLazyMembers.errors.txt"
+    );
 
     /// Loads `name` with `text` (the PR case options: strict, target
     /// esnext, noEmit), sets `lazy_members` on its checker, checks the file,

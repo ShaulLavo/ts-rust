@@ -205,9 +205,11 @@ new field that few values set goes in the box.
   first write (`rare_mut`). Their accessors (`return_mapper()` and the
   others) give Go's zero values while it is absent. `inferences` is a boxed
   slice: its length never changes.
-- `InferenceInfo` is 32 bytes. Its two candidate lists are in one box
-  (`candidate_lists`) that the first candidate makes. `candidates()` and
-  `contra_candidates()` give Go's nil lists while it is absent.
+- `InferenceInfo` is 32 bytes. Its first candidate is inline
+  (`first_candidate`), and the second moves both into one box of the two
+  candidate lists (`candidate_lists`). `candidates()` and
+  `contra_candidates()` give Go's lists from either, and Go's nil lists
+  while there is no candidate.
 
 ## AST (owned by ast/node.rs, ast/fields.rs, ast/misc.rs, ast/utilities_*)
 
@@ -272,16 +274,19 @@ methods reach the AST through it.
   `pos()`, `end()`, `loc()`, `has_trailing_comma()`, `is_nil()`.
   `ModifierList` has `.nodes()`, `.modifier_flags()`, `is_nil()`.
 - `NodeList`, `ModifierList` and `NodeSlice` are Copy handles defined in
-  `ast/node.rs`. A list of parsed data points at its astdata list (it lives
-  for the process). A list of synthetic data is an index into the thread's
-  synthetic arena (`SyntheticList`), so it is valid only on the thread
-  that made it, like a synthetic `Node`. A list of a store that owns its
-  nodes (a freeable parse, lsshells M3c) is a `StoreList` handle (file,
-  node data cell or pending list, and the id of its selector,
-  `SelectorSite`), read at each use; it is valid on any thread while its
-  file version lives, and its `list_ptr` address can repeat after the
-  version is freed, so keep that address only for keys of one request.
-  Equality is Go pointer equality.
+  `ast/node.rs`. Node data holds a list field as a 4-byte index into the
+  list table of its owner (`astdata::NodeList`, astshrink1); read it with
+  `list_of!` or `data_list`, not in place. A list of a static store points
+  at its `StaticList` (it lives for the process); the parser's list and the
+  same list read from node data are one list, like the Go pointer. A list
+  of synthetic data is an index into the thread's synthetic arena
+  (`SyntheticList`), so it is valid only on the thread that made it, like a
+  synthetic `Node`. A list of a store that owns its nodes (a freeable
+  parse, lsshells M3c) is a `StoreList` handle (file and list table entry),
+  read at each use; it is valid on any thread while its file version lives,
+  and its `list_ptr` address can repeat after the version is freed, so keep
+  that address only for keys of one request. Equality is Go pointer
+  equality.
 - Node factory (`c.factory.NewX`) is unported for now: `unported!("NewX")`.
 - Go `ast.IsX(node)` predicates -> `is_x(n)` free functions.
 - Node data reads are scoped, because a thread owns its synthetic nodes
@@ -371,20 +376,32 @@ methods reach the AST through it.
   `TEXT_IS_KEYWORD`, `NO_NODE`) are bits 29 to 31 of `flags`: Go
   `NodeFlags` ends at bit 28. `NodeRecord::flags` masks them, and a parse
   flags write checks that no Go flag is in them (`checked_flags`). The
-  node column (`FileStore::nodes`, `BlockFile`) names a leaked `NodeData`
-  (16 bytes) for each node slot, not a whole `astdata::Node` (astmem1
-  P1): the kind is in the kind column and the header in the record, so no
-  read needs the rest. The node reads (`static_ast_node`,
-  `frozen_store_ast_node`) give `&NodeData`. The words are atomics that the reads load
+  node column (`FileStore::nodes`, `BlockFile`) holds a `NodeData<'static>`
+  for each node slot, not a whole `astdata::Node` (astmem1 P1): the kind
+  is in the kind column and the header in the record, so no read needs
+  the rest. `NodeData<'a>` is a tag and a reference (16 bytes), as Go's
+  `nodeData` interface word; a static parse moves the data struct into the
+  AST arena (`alloc_store_slot`, astchunks2), as Go's typed arenas. Owned
+  versions and synthetic nodes keep the boxed form, `BoxedData` (same
+  tags and layout, so `BoxedData::view` is a copy). The node reads
+  (`static_ast_node`, `frozen_store_ast_node`) give `NodeData<'static>`.
+  The words are atomics that the reads load
   with `Relaxed`. The parse writes them through `get_mut`; after the
-  publish only `BoundFile::install` writes a record (`bind_store_records`:
-  symbol, added flags, `bind`), through a shared ref, before any other
-  thread reads its binder fields. It ORs its bits into `flags`, which
-  `NodeRecord::header` reads, and writes the high half of `up`, whose low
-  half `header` reads; `header` reads each word once, so it never mixes
-  the halves of one word. A live bind hands its builder
-  (`NodeBindBuilder`) to the install; a lib bind snapshot load hands the
-  compact form (`NodeBindParts`), which the lib bind blob keeps.
+  publish only the bind writes a record (symbol, added flags, `bind`),
+  through a shared ref, before any other thread reads its binder fields.
+  It ORs its bits into `flags`, which `NodeRecord::header` reads, and
+  writes the high half of `up`, whose low half `header` reads; `header`
+  reads each word once, so it never mixes the halves of one word. A live
+  bind writes the records while it binds, as Go writes the node
+  (`binder::NodeBindRecords`, `ast::BindRecords`, bindonce2), and keeps the
+  other fields in extras entries that the install moves into the
+  `GoFile`. A bind into a file arena writes its arena's symbol ids, and
+  `BoundFile::remap` moves the records that got a symbol. A bind that is
+  not installed (a panic, or a parallel bind that is dropped) sets the
+  records back on drop (`BindRecords::reset`), so a serial bind of the
+  file finds them as the parse left them. A lib bind snapshot load hands
+  the compact form (`NodeBindParts`), which the lib bind blob keeps, and
+  its install writes the records (`bind_store_records`).
   The kind is a plain `SyntaxKind` column, not a record word (step 4): a
   pooled block takes another file's records through a shared ref, so a
   record word must be an atomic, and safe Rust has no cheap `u16` to
@@ -394,8 +411,15 @@ methods reach the AST through it.
   +1.1%; `SyntaxKind::try_from` is a 351-case switch until late in LLVM's
   pipeline, so the inliner left it or `frozen_store_kind` out of line at
   thousands of call sites (+3% to +7.6%). The column costs 2 bytes per
-  slot, and a node shell leaks its column unless one of the last 4 shells
-  had the same kinds (`shell_kinds`). A new per-slot field of the hot reads goes into a record or kids
+  slot. A node shell has a plain column too, which it leaks
+  (`plain_kinds`): shells with equal kinds share one, and each file gets
+  one. A later version with new kinds gets one only while those of later
+  versions stay in 4 MiB (`LATER_KINDS_BUDGET`, edleak1); past that, its
+  kinds go in an atomic column of its pooled block
+  (`BlockFile::shell_kinds`), read through one cold call
+  (`FileBlock::kind`). Before the budget a long editor session leaked
+  about 0.4 columns per edit; with every shell pooled, a 400-edit
+  query-core session cost +4.2% instructions. A new per-slot field of the hot reads goes into a record or kids
   word, not a new column. Debug builds check the records and kids against
   the node data at freeze (`debug_check_kids`), and each parent write
   against its stored form.
@@ -417,7 +441,8 @@ methods reach the AST through it.
   (`check_block_owner`) in the binder field reads (`frozen_owned_record`:
   the symbol, the flags, the `bind` word with the flow node and the
   extras index, `frozen_store_bind_and_file`, `frozen_store_any_symbol`)
-  and in `bind_store_records`, the one writer of a published record.
+  and in the bind (`bind_records`, `bind_store_records`), the one writer
+  of a published record.
   The check is one load of the nil slot record, a compare and a branch:
   `goport -p` 0.0% to +0.2% instructions, the editor long sessions +0.06%
   to +0.15% (ownercheck1, R147 reviewer option 2; the flags read is about
@@ -425,9 +450,15 @@ methods reach the AST through it.
   name, modifier flags) are not checked in a release build (they are
   about 6 instructions). So a stale read of those gives the values of
   that node while its block waits, and the new owner's data after a
-  reuse, never undefined behavior. Its kind column is never reused, so a
-  stale kind read gives the old kind. Its store, `GoFile`, extras, flow,
-  node data and list reads panic. Every holder of a node of a version
+  reuse, never undefined behavior. A plain kind column is never reused,
+  so a stale kind read gives the old kind. A node shell with no leaked
+  node column and no foreign parents takes the `BlockFile` of its pooled
+  block (edleak1 part 2), and each shell that takes the block sets its
+  facts and root (`node_shell`). So after a reuse a stale read of the
+  pooled kinds (past the budget), of the facts (`block_resolve_slot`,
+  `frozen_store_facts`) or of the root (`frozen_source_file_of_node`)
+  gives the new owner's value too. Reads of the version's store,
+  `GoFile`, extras, flow, node data and lists panic. Every holder of a node of a version
   holds the version, so a correct reader never sees a reuse. No standing
   run has debug assertions: the protected tests run `--release`
   (`build-goport-tests.sh`), and the corpus, editor and oracle runs use
@@ -590,7 +621,7 @@ The batch that adds it is not accepted until Theo approves.
   default in a language server or API process since M3g,
   `GOPORT_OWNED_NODES=0` turns them off) its parse was a freeable parse
   (`enter_freeable_parse`, opened by the parse cache), so its store owns
-  its astdata nodes, pending lists, JSDoc cache and parse diagnostics
+  its astdata nodes, list table, JSDoc cache and parse diagnostics
   (`OwnedAst`), and they are freed with its store, when the version dies
   or after it on a free thread (`FileVersion::take_data`); its node data
   reads are pinned reads, and its lists are `StoreList` handles. Only with

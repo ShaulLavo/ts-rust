@@ -103,18 +103,18 @@ impl Checker {
         check_mode: CheckMode,
         write_only: bool,
     ) -> TypeId {
-        if !node.parser_flags(NodeFlags::OPTIONAL_CHAIN).is_empty() {
+        // PERF: deferbody1. Go reads `node.Flags`, `node.Expression()` and
+        // `node.Name()` as fields. Here each read was a registry lookup, so
+        // they are read through the node's view (`NodeRef`): one lookup.
+        let view = NodeRef::new(node);
+        if !view.parser_flags(NodeFlags::OPTIONAL_CHAIN).is_empty() {
             return self.check_property_access_chain(node, check_mode);
         }
-        let expr = node.expression();
+        let expr = view.expression();
+        let name = view.name();
         let left_type = self.check_non_null_expression(expr);
         self.check_property_access_expression_or_qualified_name(
-            node,
-            expr,
-            left_type,
-            node.name(),
-            check_mode,
-            write_only,
+            node, expr, left_type, name, check_mode, write_only,
         )
     }
 
@@ -588,12 +588,22 @@ impl Checker {
     }
 
     // Go: checker/checker.go:11703 isMethodAccessForCall
+    // PERF: deferbody1. Go reads `node.Parent` and its `Kind` as fields, up
+    // to four times. Here each read was a registry lookup, so the walk reads
+    // the parent's view (`NodeRef`) and kind once per step.
     pub fn is_method_access_for_call(&mut self, node: Node) -> bool {
         let mut node = node;
-        while is_parenthesized_expression(node.parent()) {
-            node = node.parent();
+        let mut parent = NodeRef::new(node).parent();
+        let mut parent_kind = parent.kind();
+        while parent_kind == SyntaxKind::ParenthesizedExpression {
+            node = parent.node();
+            parent = parent.parent();
+            parent_kind = parent.kind();
         }
-        is_call_or_new_expression(node.parent()) && node.parent().expression() == node
+        matches!(
+            parent_kind,
+            SyntaxKind::CallExpression | SyntaxKind::NewExpression
+        ) && parent.expression() == node
     }
 
     /// Go `binder.GetSymbolNameForPrivateIdentifier` in the checker: the
@@ -604,16 +614,21 @@ impl Checker {
     /// the parameter `containingClassSymbol` too. Go puts the id of the
     /// symbol in the key (`ast.GetSymbolId`), so it gives the symbol its id
     /// here.
-    // PORT: the key holds the arena index of the symbol
-    // (`get_symbol_name_for_private_identifier`); the id is only given, as
-    // Go gives it. The binder gives no id (PORTING.md, Threads).
+    // PORT: the key holds the key of the class node, or the arena index of
+    // any other symbol (`get_symbol_name_for_private_identifier_of_symbol`);
+    // the id is only given, as Go gives it. The binder gives no id
+    // (PORTING.md, Threads).
     pub fn private_identifier_symbol_name(
         &self,
         containing_class_symbol: SymbolId,
         description: &str,
     ) -> String {
         get_symbol_id(&self.symbols, containing_class_symbol);
-        get_symbol_name_for_private_identifier(&self.symbols, containing_class_symbol, description)
+        get_symbol_name_for_private_identifier_of_symbol(
+            &self.symbols,
+            containing_class_symbol,
+            description,
+        )
     }
 
     // Go: checker/checker.go:11711 lookupSymbolForPrivateIdentifierDeclaration
@@ -2000,8 +2015,8 @@ module.exports.k = k;
     // the store when some parent of the store is. Stores `a` and `c` each
     // hold `x;` in a module block; in `a` the parent of that block is a
     // node of store `b`. Both walks end at the block, but only the answer
-    // from `c` is kept. It publishes, so no other test may build or publish
-    // stores while it runs (the runner uses one thread).
+    // from `c` is kept. Its builds take the store build lock
+    // (`crate::test_lock`).
     #[test]
     fn control_flow_container_memo_keeps_only_stores_with_local_parents() {
         let a = new_file_store("/cfcache_local/a.ts", "x;");

@@ -361,7 +361,16 @@ pub fn is_in_expression_context_of(node: Node, parent: NodeRef) -> bool {
 // store.
 pub fn is_part_of_type_node(node: Node) -> bool {
     let node = NodeRef::new(node);
-    let kind = node.kind();
+    is_part_of_type_node_of(node, node.kind())
+}
+
+/// `is_part_of_type_node` of the view `node` whose kind `kind` the caller
+/// has read already.
+// PERF: deferbody1. `for_each_yield_expression` reads the kind of each node
+// it walks; Go `IsPartOfTypeNode` reads the same `node.Kind` field again,
+// which here was one more registry lookup and kind load per node.
+pub fn is_part_of_type_node_of(node: NodeRef, kind: SyntaxKind) -> bool {
+    debug_assert_eq!(kind, node.kind());
     if (kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
         && (kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
     {
@@ -471,7 +480,9 @@ fn is_part_of_type_node_in_parent_of(node: Node, parent: NodeRef) -> bool {
         SyntaxKind::CallExpression
         | SyntaxKind::NewExpression
         | SyntaxKind::TaggedTemplateExpression => {
-            return parent.node().type_arguments().to_vec().contains(&node);
+            // PERF: deferbody1. Go `slices.Contains` reads the list in place;
+            // `to_vec` made a heap copy of it for each test.
+            return parent.node().type_arguments().iter().any(|a| a == node);
         }
         _ => {}
     }
@@ -511,12 +522,22 @@ pub fn is_super_call(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:2145 IsImportCall
+// PERF: portonly1 item 5. Go reads `node.Kind`, `Expression()` and `e.Kind`
+// as fields. Here the call's kind and expression come from one view of the
+// node (`NodeRef`: the kinds and child columns), and `e`'s kind is read once:
+// `IsImportPhaseMetaProperty` is false at once unless `e` is a MetaProperty
+// (`is_import_meta_property` tests that first).
 pub fn is_import_call(node: Node) -> bool {
-    if !is_call_expression(node) {
+    let node = NodeRef::new(node);
+    if node.kind() != SyntaxKind::CallExpression {
         return false;
     }
     let e = node.expression();
-    e.kind() == SyntaxKind::ImportKeyword || is_import_phase_meta_property(e)
+    match e.kind() {
+        SyntaxKind::ImportKeyword => true,
+        SyntaxKind::MetaProperty => is_import_phase_meta_property(e),
+        _ => false,
+    }
 }
 
 // Go: ast/utilities.go:2153 IsImportPhaseMetaProperty (ts#63915)
@@ -648,7 +669,7 @@ pub fn is_whitespace_only_jsx_text(node: Node) -> bool {
     node.kind() == SyntaxKind::JsxText && node.contains_only_trivia_white_spaces()
 }
 
-// Go: ast/utilities.go:2209 GetNewTargetContainer
+// Go: ast/utilities.go:2240 GetNewTargetContainer
 pub fn get_new_target_container(node: Node) -> Node {
     let container = get_this_container(
         node, false, /*includeArrowFunctions*/
@@ -667,16 +688,37 @@ pub fn get_new_target_container(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ast/utilities.go:2220 GetEnclosingBlockScopeContainer
+// Go: ast/utilities.go:2251 GetEnclosingBlockScopeContainer
+// PERF: checkid1. Each node and its parent are read through views
+// (`find_ancestor_ref`); the parent is read only for a `Block`, the one
+// kind whose test reads it. Same tests as `is_block_scope`.
 pub fn get_enclosing_block_scope_container(node: Node) -> Node {
-    find_ancestor(node.parent(), &mut |current: Node| {
-        is_block_scope(current, current.parent())
+    find_ancestor_ref(node.parent(), |current: NodeRef| {
+        is_block_scope_kind(current.kind(), || current.parent().kind_or_unknown())
     })
 }
 
-// Go: ast/utilities.go:2226 IsBlockScope
+// Go: ast/utilities.go:2257 IsBlockScope
+// Kept as the port of the Go function. Its one Go caller at fed0bf24149f,
+// GetEnclosingBlockScopeContainer (utilities.go:2251), is ported above and
+// runs the same tests by kind (`is_block_scope_kind`), so no crate code
+// calls this form since checkid1.
 pub fn is_block_scope(node: Node, parent_node: Node) -> bool {
-    match node.kind() {
+    is_block_scope_kind(node.kind(), || {
+        if parent_node.is_nil() {
+            SyntaxKind::Unknown
+        } else {
+            parent_node.kind()
+        }
+    })
+}
+
+/// `is_block_scope` of a node of kind `kind`. `parent_kind` gives the kind
+/// of its parent (`SyntaxKind::Unknown` for nil); it is called only for a
+/// `Block`.
+#[inline]
+fn is_block_scope_kind(kind: SyntaxKind, parent_kind: impl FnOnce() -> SyntaxKind) -> bool {
+    match kind {
         SyntaxKind::SourceFile
         | SyntaxKind::CaseBlock
         | SyntaxKind::CatchClause
@@ -698,7 +740,11 @@ pub fn is_block_scope(node: Node, parent_node: Node) -> bool {
         SyntaxKind::Block => {
             // function block is not considered block-scope container
             // see comment in binder.ts: bind(...), case for SyntaxKind.Block
-            return !is_function_like_or_class_static_block_declaration(parent_node);
+            // `is_function_like_or_class_static_block_declaration(parent)`
+            // on the parent's kind: a nil parent (`Unknown`) is neither.
+            let parent_kind = parent_kind();
+            return !(is_function_like_kind(parent_kind)
+                || parent_kind == SyntaxKind::ClassStaticBlockDeclaration);
         }
         _ => {}
     }

@@ -275,7 +275,7 @@ impl Checker {
                 // Otherwise, get the declared constraint type, and if the constraint type is a type parameter,
                 // get the constraint of that type parameter. If the resulting type is an indexed type 'keyof T',
                 // the modifiers type is T. Otherwise, the modifiers type is unknown.
-                let declaration = self.ty(t).as_mapped_type().declaration;
+                let declaration = self.ty(t).as_mapped_type().declaration();
                 let declared_type = self.get_type_from_mapped_type_node(declaration);
                 let constraint = self.get_constraint_type_from_mapped_type(declared_type);
                 let mut extended_constraint = constraint;
@@ -608,20 +608,34 @@ impl Checker {
 }
 
 // Go: checker/checker.go:28885 isExportOrExportExpression
+// PERF: checkid1. The walk reads each node and its parent through views,
+// with one kind read of the parent: the walk goes to the root for most
+// locations. The tests and their order are Go's.
+// PERF: parentname1. Go's `FindAncestor` callback reads `n.Parent`, and the
+// walk then reads it again. Here the parent is read once per step and is
+// the next node.
 pub fn is_export_or_export_expression(location: Node) -> bool {
-    find_ancestor(location, |n: Node| {
+    let mut n = NodeRef::new(location);
+    while n.is_some() {
         let parent = n.parent();
-        if parent.is_some() {
-            if is_any_export_assignment(parent) {
-                return parent.expression() == n && is_entity_name_expression(n);
+        match parent.kind_or_unknown() {
+            // `is_any_export_assignment(parent)`.
+            SyntaxKind::ExportAssignment => {
+                if parent.expression() == n.node() && is_entity_name_expression(n.node()) {
+                    return true;
+                }
             }
-            if is_export_specifier(parent) {
-                return parent.name() == n || parent.property_name() == n;
+            SyntaxKind::ExportSpecifier => {
+                let parent = parent.node();
+                if parent.name() == n.node() || parent.property_name() == n.node() {
+                    return true;
+                }
             }
+            _ => {}
         }
-        false
-    })
-    .is_some()
+        n = parent;
+    }
+    false
 }
 
 // Go: checker/checker.go:28900 shouldMarkIdentifierAliasReferenced

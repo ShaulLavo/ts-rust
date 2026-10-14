@@ -198,6 +198,13 @@ pub fn new_cached_fs_compiler_host(
     content_mapper_project: Option<Rc<dyn Project>>,
 ) -> Rc<dyn CompilerHost> {
     let plain_os_fs = is_wrapped_os_fs(&fs);
+    // PERF: on the plain OS file system, the cache's calls go through the
+    // stat cache of the parse workers (`LoaderStatFs`).
+    let fs: Rc<dyn Fs> = if plain_os_fs {
+        Rc::new(super::files_parser::LoaderStatFs::new(fs))
+    } else {
+        fs
+    };
     new_compiler_host_with(
         current_directory,
         cachedvfs_from(fs),
@@ -334,7 +341,8 @@ impl CompilerHost for CompilerHostImpl {
             match take_prefetched(opts, script_kind, Some(text.as_str())) {
                 Prefetched::Parse(file) => return Some(Rc::new(file)),
                 Prefetched::Text(worker_text) => worker_text,
-                Prefetched::Nothing => FileText::new(text, freeable),
+                Prefetched::Nothing => unpacked_lib_text(&opts.file_name, &text)
+                    .unwrap_or_else(|| FileText::new(text, freeable)),
             }
         };
         // Not in Go: while `ast::free_file_versions` is on (`tsc --watch`,
@@ -389,6 +397,19 @@ impl CompilerHost for CompilerHostImpl {
     fn is_plain_os_fs(&self) -> bool {
         self.plain_os_fs
     }
+}
+
+/// wasm: the unpacked text of bundled lib `file_name` when the file system
+/// showed the same `text`. It lives as long as the process, so a parse of
+/// it leaks no copy. `None` on native, and for other files.
+// PORT: not in Go.
+fn unpacked_lib_text(file_name: &str, text: &str) -> Option<FileText> {
+    if !cfg!(target_family = "wasm") {
+        return None;
+    }
+    bundled_text(file_name)
+        .filter(|&lib| lib == text)
+        .map(FileText::from)
 }
 
 // PORT: Go passes the `*compilerHost` as a `tsoptions.ParseConfigHost`

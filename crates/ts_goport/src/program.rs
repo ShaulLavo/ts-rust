@@ -23,6 +23,7 @@ use crate::gostd::{Context, context};
 use crate::prelude::*;
 use std::borrow::Cow;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 mod go_frontend;
@@ -94,6 +95,10 @@ pub struct PackageId {
 #[derive(Clone, Default)]
 pub struct ResolvedModule {
     pub resolved_file_name: String,
+    /// ts#64159 (Go N' module/types.go:90 `ResolvedPath`): the path of
+    /// `resolved_file_name`, made by the resolver that gave the answer.
+    /// Empty when nothing resolved, as in Go: a lookup by it then misses.
+    pub resolved_path: tspath::Path,
     pub original_path: String,
     pub extension: String,
     pub resolved_using_ts_extension: bool,
@@ -330,9 +335,9 @@ struct CheckerPool {
     threads: Vec<std::thread::JoinHandle<()>>,
     /// wasm has one thread: the checkers stay on the loading thread, each
     /// with the ids of a worker, and each job runs when it is sent
-    /// (`send_thread_job`). A slot is empty while its checker runs a job.
+    /// (`send_thread_job`).
     #[cfg(target_family = "wasm")]
-    checkers: Vec<Option<(Checker, WorkerIds)>>,
+    checkers: Vec<InlineChecker>,
     /// The program's emit pool, made on its first job
     /// (`send_emit_pool_jobs`). It stops with the checkers. wasm has none.
     #[cfg(not(target_family = "wasm"))]
@@ -421,8 +426,10 @@ impl CheckerPool {
             checkers,
             carry_from: _,
         } = self;
-        for (checker, mut ids) in checkers.into_iter().flatten() {
-            ids.run(|| drop(checker));
+        for slot in checkers {
+            if let InlineChecker::Made(checker, mut ids) = slot {
+                ids.run(|| drop(checker));
+            }
         }
         Vec::new()
     }
@@ -463,11 +470,23 @@ impl CheckerPool {
         receiver.recv().ok()
     }
 
-    /// wasm: a copy of the symbol ids of the pool's first checker.
+    /// wasm: a copy of the symbol ids of the pool's first checker, made
+    /// first if no job has made it yet.
     #[cfg(target_family = "wasm")]
     fn symbol_ids(&mut self) -> Option<SymbolIdCarry> {
-        let (_, ids) = self.checkers.first_mut()?.as_mut()?;
-        Some(ids.run(copy_symbol_ids))
+        let count = self.checkers.len();
+        let slot = self.checkers.first_mut()?;
+        if matches!(slot, InlineChecker::Unmade(_)) {
+            let (checker, ids) =
+                std::mem::replace(slot, InlineChecker::Busy).into_checker(0, count);
+            *slot = InlineChecker::Made(checker, ids);
+        }
+        match slot {
+            InlineChecker::Made(_, ids) | InlineChecker::Released(ids) => {
+                Some(ids.run(copy_symbol_ids))
+            }
+            InlineChecker::Unmade(_) | InlineChecker::Busy => None,
+        }
     }
 }
 
@@ -883,8 +902,12 @@ pub(crate) struct VersionTables {
     /// file, by slot. Versions share it while it is equal.
     file_meta: Arc<Vec<FileProgramMeta>>,
     /// Checker index for each file index (Go `fileAssociations`). Set when
-    /// the checker pool is made.
-    file_associations: OnceLock<Vec<usize>>,
+    /// the checker pool is made. Only the work-stealing check pass of fast
+    /// mode changes an entry (`StealQueues`); Go never does.
+    file_associations: OnceLock<Vec<AtomicUsize>>,
+    /// fastmode1: set by the first check pass of the pool, which is the
+    /// only one that steals (`start_stealing_group_do`). Not in Go.
+    steal_pass_done: AtomicBool,
     /// Go `Program.declarationDiagnosticCache`.
     declaration_diagnostic_cache: Mutex<FxHashMap<Node, Vec<Diagnostic>>>,
     /// The file system answers of Go `p.Host().FS()`, a `cachedvfs.FS`
@@ -912,12 +935,12 @@ pub(crate) struct VersionTables {
     /// worker thread can read its program files after the frontend program
     /// is freed.
     file_versions: Vec<Arc<crate::ast::FileVersion>>,
-    /// The binder symbols of the program (`bind_all`, `bound_symbols`): a
-    /// copy of the binder lineage after the program files are bound. Each
-    /// checker copies it. It shares the lineage chunks, so it keeps the
-    /// chunks of a dead file version until the release frees it (lsshells
-    /// M2c, M3d).
-    bound_symbols: OnceLock<SymbolArena>,
+    /// The binder symbols of the program (`bind_all`, `bound_symbols`): the
+    /// binder lineage arena after the program files are bound, shared until
+    /// the lineage changes (`Lineage::symbols_mut`). Each checker copies it.
+    /// It shares the lineage chunks, so it keeps the chunks of a dead file
+    /// version until the release frees it (lsshells M2c, M3d).
+    bound_symbols: OnceLock<Arc<SymbolArena>>,
     /// Go `Program.packagesMap`, made on first use (`get_packages_map`).
     packages_map: OnceLock<Arc<FxHashMap<String, bool>>>,
 }
@@ -958,6 +981,7 @@ impl VersionTables {
             file_by_path,
             file_meta,
             file_associations: OnceLock::new(),
+            steal_pass_done: AtomicBool::new(false),
             declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
             host_fs_cache: Default::default(),
             package_json_cache: Arc::default(),
@@ -1165,6 +1189,16 @@ impl GoProgram {
     pub fn source_file_order(&'static self) -> SourceFileOrder {
         SourceFileOrder(held_tables(self))
     }
+
+    // Go: compiler/program.go:591 (*Program).SingleThreaded
+    // PORT: Go reads `opts.SingleThreaded` first, then the compiler option.
+    // Only test code sets the port's `ProgramConfig::single_threaded`, and
+    // a version keeps only the options, so this reads the option.
+    #[must_use]
+    #[inline]
+    pub fn single_threaded(&self) -> bool {
+        self.options.single_threaded.is_true()
+    }
 }
 
 /// The file ids of a program in Go order (`GoProgram::source_file_order`).
@@ -1204,8 +1238,9 @@ fn intern_program_str(text: &str) -> &'static str {
 }
 
 /// The binder symbols of a program version (Go: the symbols that the bound
-/// files of the program point to): a copy of the binder lineage after the
-/// program files are bound (`bind_all`). It derefs to the arena.
+/// files of the program point to): the binder lineage arena after the
+/// program files are bound (`bind_all`), shared until the lineage changes.
+/// It derefs to the arena.
 // PORT: Go symbols live with their files. Here they are in the program's
 // `VersionTables` (lsshells M2c), so a release frees the copy with the
 // tables, and the lineage chunks of a dead file version go when the last
@@ -1375,7 +1410,7 @@ pub trait AliasResolverProgram {
     /// Go `GetSourceFile`.
     fn source_file(&self, file_name: &str) -> Node;
     /// Go `GetSourceFileForResolvedModule`.
-    fn source_file_for_resolved_module(&self, file_name: &str) -> Node;
+    fn source_file_for_resolved_module(&self, resolved: &ResolvedModule) -> Node;
     /// Go `GetResolvedModule`.
     fn resolved_module(
         &self,
@@ -1447,7 +1482,7 @@ impl Drop for AliasResolverProgramScope {
 // PORT: Go needs no program: the resolver is the `checker.Program`. A
 // checker here reads its program version (`prog()`), and it copies the
 // binder lineage when it is made (`SymbolArena::for_checker`). So the
-// program copies the lineage after `files` are bound. A file that the
+// program takes the lineage arena after `files` are bound. A file that the
 // resolver binds later reaches a checker through its catch-up
 // (`catch_up_alias_resolver_checker`). Go `GetResolvedModules` is nil, so
 // the program has no resolved modules. The program shell stays leaked like
@@ -1492,7 +1527,7 @@ pub fn new_alias_resolver_program(
         for &file in files {
             lineage.bind(file);
         }
-        lineage.symbols.clone()
+        Arc::clone(&lineage.symbols)
     });
     assert!(
         held_tables(program)
@@ -1563,8 +1598,13 @@ pub fn try_load_timed(
 /// apisym1c: each bind and free makes a new generation
 /// (`LINEAGE_GENERATION`, `SymbolArena::lineage_seen`), so a checker can
 /// tell when its copy is older.
+///
+/// edleak3: a program's copy is the lineage arena itself, shared
+/// (`bind_all`); the next change of the lineage copies it first
+/// (`symbols_mut`, `Arc::make_mut`). So the lineage and its newest program
+/// keep one chunk list between edits, not two.
 struct Lineage {
-    symbols: SymbolArena,
+    symbols: Arc<SymbolArena>,
     /// The arena range of each freeable file version bound here, by file
     /// id, until the version dies, with its symbol indexes.
     freeable: FxHashMap<usize, (ArenaMark, ArenaMark, std::ops::Range<usize>)>,
@@ -1592,7 +1632,7 @@ static LINEAGE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 fn with_lineage<R>(f: impl FnOnce(&mut Lineage) -> R) -> R {
     let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
     let lineage = lineage.get_or_insert_with(|| Lineage {
-        symbols: SymbolArena::new(),
+        symbols: Arc::new(SymbolArena::new()),
         freeable: FxHashMap::default(),
         seen_dead: 0,
         freed: Vec::new(),
@@ -1602,6 +1642,12 @@ fn with_lineage<R>(f: impl FnOnce(&mut Lineage) -> R) -> R {
 }
 
 impl Lineage {
+    /// The lineage arena to change: a copy of it when a program still
+    /// shares it (`bind_all`).
+    fn symbols_mut(&mut self) -> &mut SymbolArena {
+        Arc::make_mut(&mut self.symbols)
+    }
+
     /// Frees the chunks of the freeable versions that died since the last
     /// call.
     // PERF: one atomic load when no version died.
@@ -1614,7 +1660,7 @@ impl Lineage {
         let freed = self.freed.len();
         for file in dead {
             if let Some((start, end, symbols)) = self.freeable.remove(&file) {
-                self.symbols.free_range(start, end);
+                self.symbols_mut().free_range(start, end);
                 self.freed.push((start, end));
                 crate::ast::free_lineage_symbol_ids(file, symbols);
             }
@@ -1628,10 +1674,9 @@ impl Lineage {
     /// catch up (`catch_up_checker`), and copies made from now on keep it.
     fn changed(&mut self) {
         let generation = self.symbols.lineage_seen().generation + 1;
-        self.symbols.set_lineage_seen(LineageSeen {
-            generation,
-            freed: self.freed.len(),
-        });
+        let freed = self.freed.len();
+        self.symbols_mut()
+            .set_lineage_seen(LineageSeen { generation, freed });
         LINEAGE_GENERATION.store(generation, std::sync::atomic::Ordering::Release);
     }
 
@@ -1649,22 +1694,22 @@ impl Lineage {
     ) -> R {
         // Checkers copy the lineage; publish what the file added, so they
         // share it (`SymbolArena::freeze_since` and `share_since`).
+        let arena = self.symbols_mut();
         if !freeable {
-            let mark = self.symbols.mark();
-            let result = add(&mut self.symbols);
-            self.symbols.freeze_since(mark);
+            let mark = arena.mark();
+            let result = add(arena);
+            arena.freeze_since(mark);
             self.changed();
             return result;
         }
-        self.symbols.end_chunk();
-        let start = self.symbols.mark();
-        let first = self.symbols.symbol_count();
-        let result = add(&mut self.symbols);
-        self.symbols.end_chunk();
-        self.symbols.share_since(start);
-        let symbols = first..self.symbols.symbol_count();
-        self.freeable
-            .insert(file, (start, self.symbols.mark(), symbols));
+        arena.end_chunk();
+        let start = arena.mark();
+        let first = arena.symbol_count();
+        let result = add(arena);
+        arena.end_chunk();
+        arena.share_since(start);
+        let entry = (start, arena.mark(), first..arena.symbol_count());
+        self.freeable.insert(file, entry);
         self.changed();
         result
     }
@@ -1737,8 +1782,8 @@ pub fn catch_up_alias_resolver_checker(symbols: &mut SymbolArena) {
 // Go: compiler/program.go:595 BindSourceFiles
 // PORT: Go binds files in parallel into per-file symbol tables. Here every
 // file binds into the shared `LINEAGE` arena, and the program's binder
-// symbols (`bound_symbols`, in its `VersionTables`) are a copy of it after
-// the program files are bound. `Checker::new` uses the same initializer,
+// symbols (`bound_symbols`, in its `VersionTables`) are that arena after
+// the program files are bound (shared until the lineage changes). `Checker::new` uses the same initializer,
 // so the first of the two to run binds. Files bind in parallel, each into
 // its own arena (`bind_files_parallel`), and join the lineage in file order
 // with the ids a serial bind gives. With `--singleThreaded` they bind
@@ -1748,7 +1793,7 @@ pub fn bind_all() {
     let program = prog();
     held_tables(program).bound_symbols.get_or_init(|| {
         with_lineage(|lineage| {
-            if single_threaded() {
+            if program.single_threaded() {
                 bind_files_last_queued_first(lineage);
             } else {
                 bind_files_parallel(lineage);
@@ -1756,15 +1801,17 @@ pub fn bind_all() {
             for file in program.source_files() {
                 // Go: program.go:601 traces the files that are not bound yet.
                 let _trace = if file.file_bind.get().is_none() {
+                    #[cfg(test)]
+                    TEST_SERIAL_BINDS.with(|files| files.borrow_mut().push(file.root));
                     trace_bind_source_file(file.root)
                 } else {
                     None
                 };
                 lineage.bind(file.root);
             }
-            // Checkers clone the copy. Each file published what it added
+            // Checkers clone the arena. Each file published what it added
             // (`Lineage::add_file`).
-            lineage.symbols.clone()
+            Arc::clone(&lineage.symbols)
         })
     });
 }
@@ -1841,6 +1888,10 @@ fn bind_thread_count(files: usize) -> usize {
     if cfg!(target_family = "wasm") {
         return 1;
     }
+    #[cfg(test)]
+    if let Some(count) = TEST_BIND_THREADS.get() {
+        return count;
+    }
     if let Some(count) = std::env::var("GOPORT_BIND_THREADS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -1849,6 +1900,21 @@ fn bind_thread_count(files: usize) -> usize {
     }
     let large = LARGE_LOAD.get() || files >= WIDE_BIND_FILES && wide_cores();
     ThreadBudget::current().bind_threads(large)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// While set, the bind thread count of the binds on this thread
+    /// (`bind_thread_count`), in place of `GOPORT_BIND_THREADS` and the
+    /// thread budget. A test sets it to compare a parallel bind with a
+    /// serial one on any machine.
+    static TEST_BIND_THREADS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// The files that `bind_all` bound serially on this thread, in order:
+    /// every file of a serial bind, and after a parallel bind the files
+    /// from the first one that it did not bind (`bind_files_parallel`).
+    static TEST_SERIAL_BINDS: std::cell::RefCell<Vec<Node>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// From this many files to bind on, a load binds as a large load on
@@ -1888,6 +1954,54 @@ pub(crate) fn note_program_load(root_tasks: usize) -> bool {
 /// and a cgroup CPU limit size the pools as they size Go's.
 pub fn available_cores() -> usize {
     crate::gostd::runtime::gomaxprocs()
+}
+
+/// Starts a scoped thread named `name` that runs `f`, for port-only work
+/// that the calling thread can do itself (not work Go runs on goroutines:
+/// use `GoThread` for that). `None` when the OS refuses the thread: the
+/// caller then does the work, and the result is the same.
+// PORT: not in Go. The same fallback as the resolve and config prefetch
+// workers (followups58: the serialgap1 threads). It is in goport_core, not
+// beside `GoThread` in goport_util, so that its test hook is `cfg(test)`:
+// its callers and their tests are all in this crate (followups60).
+pub(crate) fn helper_thread<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: &str,
+    f: F,
+) -> Option<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    #[cfg(test)]
+    if REFUSE_HELPER_THREADS.get() {
+        return None;
+    }
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn_scoped(scope, f)
+        .ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// While set, `helper_thread` on this thread starts no thread
+    /// (`refuse_helper_threads`).
+    static REFUSE_HELPER_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as if the OS refused every `helper_thread` that this thread
+/// starts, so a test reaches the fallback.
+#[cfg(test)]
+pub(crate) fn refuse_helper_threads<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSE_HELPER_THREADS.set(self.0);
+        }
+    }
+    let _restore = Restore(REFUSE_HELPER_THREADS.replace(true));
+    f()
 }
 
 /// From this many physical cores on (`wide_cores`), a large program load
@@ -2155,6 +2269,10 @@ struct BindQueue {
     state: Mutex<BindQueueState>,
     /// Signals new known offsets, a finished bind and `stop`.
     changed: std::sync::Condvar,
+    /// Test hook: the chain link that `spawn_bind_chain` starts with this
+    /// `threads` panics after its seed install, before `run`.
+    #[cfg(test)]
+    panic_before_run: Option<usize>,
 }
 
 struct BindQueueState {
@@ -2162,6 +2280,15 @@ struct BindQueueState {
     next: usize,
     /// The number of files being bound.
     binding: usize,
+    /// The bind threads that can still bind: they take the files that are
+    /// left. It starts at the bind thread count, so it counts the threads
+    /// that `spawn_bind_chain` did not start. That is right: a thread is left
+    /// out only when no file is left or the bind stopped, and then no thread
+    /// reads the count. Each thread leaves the count one time
+    /// (`LinkBinders::leave`): at its first failed bind, or when it panics
+    /// before that. A link that panics before `run` also takes out the
+    /// threads that it would start.
+    binders: usize,
     /// Set by the loading thread when it stops at a failed file.
     stop: bool,
     /// The arena counts of each bound file, by file index.
@@ -2174,15 +2301,13 @@ struct BindQueueState {
     /// it start at a chunk start (`ArenaOffsets::aligned`), as
     /// `Lineage::add_file` joins them (lsshells M3d).
     freeable: Vec<bool>,
-    /// Bound files that wait for their offsets, by file index.
-    waiting: std::collections::BTreeMap<usize, (BoundFile, SymbolArena)>,
 }
 
 impl BindQueue {
-    /// The queue of files whose freeable flags are `freeable`, the first
-    /// at the offsets `first` (or at the next chunk start when it is
-    /// freeable).
-    fn new(freeable: Vec<bool>, first: ArenaOffsets) -> Self {
+    /// The queue of files whose freeable flags are `freeable` for `threads`
+    /// bind threads, the first file at the offsets `first` (or at the next
+    /// chunk start when it is freeable).
+    fn new(freeable: Vec<bool>, first: ArenaOffsets, threads: usize) -> Self {
         let first = if freeable.first() == Some(&true) {
             first.aligned()
         } else {
@@ -2192,13 +2317,15 @@ impl BindQueue {
             state: Mutex::new(BindQueueState {
                 next: 0,
                 binding: 0,
+                binders: threads,
                 stop: false,
                 counts: vec![None; freeable.len()],
                 offsets: vec![first],
                 freeable,
-                waiting: std::collections::BTreeMap::new(),
             }),
             changed: std::sync::Condvar::new(),
+            #[cfg(test)]
+            panic_before_run: None,
         }
     }
 
@@ -2212,6 +2339,12 @@ impl BindQueue {
     fn stop(&self) {
         self.lock().stop = true;
         self.changed.notify_all();
+    }
+
+    /// Whether a file is left for a bind thread to take.
+    fn files_left(&self) -> bool {
+        let state = self.lock();
+        !state.stop && state.next < state.counts.len()
     }
 }
 
@@ -2231,14 +2364,41 @@ impl BindQueueState {
         }
         self.offsets.len() > known
     }
+}
 
-    /// The waiting file with the lowest index, when its offsets are known.
-    fn take_ready(&mut self) -> Option<(usize, BoundFile, SymbolArena, ArenaOffsets)> {
-        let (&i, _) = self.waiting.first_key_value()?;
-        let offsets = *self.offsets.get(i)?;
-        let (_, (bound, file_symbols)) = self.waiting.pop_first()?;
-        Some((i, bound, file_symbols, offsets))
-    }
+/// A file of at least this many nodes binds before the others
+/// (`bind_order`).
+// PERF (bindonce1): VS Code has 5 files of 115k to 210k nodes (lib.dom and
+// 4 test files) and 15 more of 32k to 94k; a file of 32k nodes binds in
+// about 4 ms on a bind thread. In file order, such a file would hold the
+// offsets of every later file while it binds.
+const BIG_BIND_FILE: usize = 1 << 15;
+
+/// The order in which the bind threads take the files (`bind_files_parallel`):
+/// the files of at least `BIG_BIND_FILE` nodes, largest first, then the
+/// others in file order.
+// PERF (bindonce1): the offsets of a file are known when every earlier file
+// is bound, and the thread that bound it then moves its ids and installs it.
+// In file order that is a few files after its bind, while its data is still
+// in the cache of that core. When the largest files bound first (R204), most
+// files waited for a small early file (VS Code: mean 79 ms in a schedule
+// model), and the three passes after the bind cost 630 ms of thread time on
+// VS Code, against 117 ms with `--singleThreaded`. In file order they cost
+// 186 ms, and the bind ended 52 ms earlier (testbox, 16 bind threads). A
+// large file still binds first, so it does not end the bind late: its own
+// passes run cold.
+fn bind_order(files: &[(Node, bool)]) -> Vec<usize> {
+    let nodes: Vec<usize> = files
+        .iter()
+        .map(|(file, _)| file.go_file().parser_flags.len())
+        .collect();
+    let mut order: Vec<usize> = (0..files.len())
+        .filter(|&i| nodes[i] >= BIG_BIND_FILE)
+        .collect();
+    // A stable sort: files of the same size keep file order.
+    order.sort_by_key(|&i| std::cmp::Reverse(nodes[i]));
+    order.extend((0..files.len()).filter(|&i| nodes[i] < BIG_BIND_FILE));
+    order
 }
 
 /// Binds the program files that are not bound yet on several threads, each
@@ -2247,17 +2407,23 @@ impl BindQueueState {
 /// `Lineage::add_file`). It stops at the first file that made thread-local
 /// state while binding (for example a lazy JSDoc parse) or panicked;
 /// `bind_all` binds that file and the rest serially, which gives the same
-/// result as a serial bind of every file.
+/// result as a serial bind of every file. Each bind that is dropped (that
+/// file, and the files after it that wait for its offsets) sets its node
+/// records back when it drops (`binder::NodeBindRecords`), before the scope
+/// ends.
 // PERF: a file's ids move to their program values on a bind thread, as soon
 // as every earlier file is bound, because its offsets are the sums of the
-// earlier file counts. The same thread then installs the file's binder
-// output (`BoundFile::install`: the node records and the `GoFile` cells).
-// The threads stay while files wait for offsets, so when the last large file
-// (lib.dom) is bound they move and install the waiting files in parallel.
-// The loading thread only appends chunks, in file order. The ids are the
-// ones that a join on the loading thread gives. A file is installed before
-// its chunks join the lineage, but nothing reads them in between: this
-// thread holds the lineage lock until every file is joined.
+// earlier file counts. The thread that bound the file moves them (in the
+// node records that got a symbol, bindonce2), installs the file's binder
+// output (`BoundFile::install`: the `GoFile` cells) and prepares its
+// chunks, before it binds the next file,
+// so the data is still in its core's cache (bindonce1, `bind_order`). Each
+// thread stays while a file it bound can still get its offsets, so every
+// file before the first failed one reaches the loading thread. The loading
+// thread only appends chunks, in file order. The ids are the ones that a
+// join on the loading thread gives. A file is installed before its chunks
+// join the lineage, but nothing reads them in between: this thread holds the
+// lineage lock until every file is joined.
 // PERF (progstart1): the install on the loading thread was 338 ms of the
 // 598 ms of its `bind_all` CPU over the 60 rwtime2 repos (colyseus 10.9 ms).
 fn bind_files_parallel(lineage: &mut Lineage) {
@@ -2272,92 +2438,63 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         return;
     }
     let unported = unported_report();
-    // PERF: the threads take the largest files first (by node count), so the
-    // largest file (lib.dom) starts at once and the small files fill the other
-    // threads while it binds. The join order stays the file order.
-    let mut order: Vec<usize> = (0..files.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(files[i].0.go_file().parser_flags.len()));
+    let order = bind_order(&files);
     let queue = BindQueue::new(
         files.iter().map(|&(_, freeable)| freeable).collect(),
         lineage.symbols.next_file_offsets(),
+        threads,
     );
+    // The work of one bind thread, after it installed its seed. `sender`
+    // takes its files to the loading thread.
+    let run = |sender: std::sync::mpsc::Sender<ParallelBind>, link: &mut LinkBinders<'_>| {
+        run_bind_link(
+            &queue,
+            &order,
+            link,
+            |i| {
+                let (file, _) = files[i];
+                // The fingerprints are in the catch too: nothing between the
+                // two changes of `binding` can panic, so a panic never
+                // leaves it counted.
+                let (bound, file_symbols) = std::panic::catch_unwind(|| {
+                    let before = bind_thread_fingerprint();
+                    let bound = {
+                        let _trace = trace_bind_source_file(file);
+                        let mut file_symbols = SymbolArena::new_file();
+                        let bound = bind_source_file_detached(file, &mut file_symbols);
+                        (bound, file_symbols)
+                    };
+                    (bind_thread_fingerprint() == before).then_some(bound)
+                })
+                .ok()
+                .flatten()?;
+                let counts = file_symbols.mark();
+                Some(((bound, file_symbols), counts))
+            },
+            |i, ready| {
+                let prepared = ready.map(|((mut bound, file_symbols), offsets)| {
+                    bound.remap(offsets);
+                    // A ready file is always joined: every earlier file has
+                    // its counts, so it was bound and reaches the loading
+                    // thread.
+                    bound.install();
+                    file_symbols.prepare_file_arena(offsets, files[i].1)
+                });
+                let _ = sender.send((i, prepared));
+            },
+        );
+        // The scope ends when the thread's closure returns, but thread-locals
+        // drop only at thread exit. Let go of the program tables now, so a
+        // release after the bind frees them (`WorkerSeed`).
+        drop(TABLES.with(|cache| cache.borrow_mut().take()));
+    };
     let (sender, receiver) = std::sync::mpsc::channel::<ParallelBind>();
     let complete = std::thread::scope(|scope| {
-        for _ in 0..threads {
-            let seed = WorkerSeed::take_unbuilt();
-            let (files, order, queue, sender) = (&files, &order, &queue, sender.clone());
-            // Go starts its threads on demand and fails the same way.
-            crate::core::GoThread::new()
-                .stack_size(crate::gostd::stack::max_stack_size())
-                .spawn_scoped(scope, move || {
-                    seed.install();
-                    let mut state = queue.lock();
-                    loop {
-                        if state.stop {
-                            break;
-                        }
-                        // Moving ids first: the loading thread waits for it.
-                        if let Some((i, mut bound, file_symbols, offsets)) = state.take_ready() {
-                            drop(state);
-                            bound.remap(offsets);
-                            // A ready file is always joined: every earlier
-                            // file has its counts, so it was bound here and
-                            // reaches the loading thread.
-                            bound.install();
-                            let prepared = file_symbols.prepare_file_arena(offsets, files[i].1);
-                            let _ = sender.send((i, Some(prepared)));
-                            state = queue.lock();
-                            continue;
-                        }
-                        if let Some(&i) = order.get(state.next) {
-                            let (file, _) = files[i];
-                            state.next += 1;
-                            state.binding += 1;
-                            drop(state);
-                            let before = bind_thread_fingerprint();
-                            let result = std::panic::catch_unwind(|| {
-                                let _trace = trace_bind_source_file(file);
-                                let mut file_symbols = SymbolArena::new_file();
-                                let bound = bind_source_file_detached(file, &mut file_symbols);
-                                (bound, file_symbols)
-                            })
-                            .ok()
-                            .filter(|_| bind_thread_fingerprint() == before);
-                            state = queue.lock();
-                            state.binding -= 1;
-                            let Some((bound, file_symbols)) = result else {
-                                drop(state);
-                                // Later files never get offsets now; waiting
-                                // threads check whether to stay.
-                                queue.changed.notify_all();
-                                let _ = sender.send((i, None));
-                                break;
-                            };
-                            let more = state.record(i, file_symbols.mark());
-                            state.waiting.insert(i, (bound, file_symbols));
-                            if more || state.binding == 0 {
-                                queue.changed.notify_all();
-                            }
-                            continue;
-                        }
-                        // Nothing to bind. Stay while a waiting file can
-                        // still get its offsets from a bind in progress.
-                        if state.waiting.is_empty() || state.binding == 0 {
-                            break;
-                        }
-                        state = queue
-                            .changed
-                            .wait(state)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    }
-                    // The scope ends when this closure returns, but
-                    // thread-locals drop only at thread exit. Let go of the
-                    // program tables now, so a release after the bind frees
-                    // them (`WorkerSeed`).
-                    drop(TABLES.with(|cache| cache.borrow_mut().take()));
-                });
-        }
-        drop(sender);
+        // PERF (bindonce1): a seed copies the synthetic nodes of this thread,
+        // 0.13 to 1.9 ms each on TypeORM, so 16 seeds took 3.9 ms of this
+        // thread before it built the lazy state below. This thread now takes
+        // one, and the bind threads take the others (`spawn_bind_chain`).
+        spawn_bind_chain(scope, threads, &run, &queue, sender);
         // PERF (progstart1): the bind threads do not read the shared state
         // that the program makes on first use (the symlink cache), so this
         // thread builds it while they bind, not before they start. A later
@@ -2368,12 +2505,12 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         // Join the files in order as they arrive.
         let mut pending = FxHashMap::default();
         let mut joined = 0;
-        for (i, result) in &receiver {
+        'join: for (i, result) in &receiver {
             pending.insert(i, result);
             while let Some(result) = pending.remove(&joined) {
                 let Some(prepared) = result else {
                     queue.stop();
-                    return false;
+                    break 'join;
                 };
                 let (file, freeable) = files[joined];
                 lineage.add_file(file.file_index(), freeable, |symbols| {
@@ -2382,12 +2519,188 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                 joined += 1;
             }
         }
-        true
+        // The join stops at a file that failed, or that no bind thread
+        // reached because each one failed first. No later file was
+        // installed: its offsets need the counts of that file.
+        joined == files.len()
     });
     if !complete {
-        // The serial bind counts the hits of the file that stopped here.
+        // The serial bind counts the hits of the files that it binds again.
         restore_unported(&unported);
     }
+}
+
+/// The work of one bind thread of `bind_files_parallel`, after it installed
+/// its seed. It takes the files of `order` from `queue` and binds each with
+/// `bind`, which gives the bound file and its arena counts, or None when the
+/// bind made thread-local state or panicked. It gives each file that it bound
+/// to `join` with the offsets of the file when they are known, and each file
+/// whose bind failed with None. At the first failed bind, the thread leaves
+/// `BindQueueState::binders` through `link` and binds no more files.
+fn run_bind_link<T>(
+    queue: &BindQueue,
+    order: &[usize],
+    link: &mut LinkBinders<'_>,
+    mut bind: impl FnMut(usize) -> Option<(T, ArenaMark)>,
+    mut join: impl FnMut(usize, Option<(T, ArenaOffsets)>),
+) {
+    // The files bound on this thread that wait for their offsets, by file
+    // index. Their offsets are known in index order.
+    let mut waiting = std::collections::BTreeMap::<usize, T>::new();
+    // Set when a bind here made thread-local state or panicked: this thread
+    // binds no more files, as they could read that state, but it still moves
+    // the ids of the files it bound before.
+    let mut failed = false;
+    let mut state = queue.lock();
+    loop {
+        if state.stop {
+            break;
+        }
+        // Moving ids first: the loading thread waits for it, and the data of
+        // the file is still in this core's cache.
+        if let Some(entry) = waiting.first_entry()
+            && let Some(&offsets) = state.offsets.get(*entry.key())
+        {
+            drop(state);
+            let (i, bound) = entry.remove_entry();
+            join(i, Some((bound, offsets)));
+            state = queue.lock();
+            continue;
+        }
+        if !failed && let Some(&i) = order.get(state.next) {
+            state.next += 1;
+            state.binding += 1;
+            drop(state);
+            let result = bind(i);
+            state = queue.lock();
+            state.binding -= 1;
+            let Some((bound, counts)) = result else {
+                // Later files never get offsets now; waiting threads check
+                // whether to stay.
+                failed = true;
+                link.leave(&mut state);
+                queue.changed.notify_all();
+                join(i, None);
+                continue;
+            };
+            let more = state.record(i, counts);
+            waiting.insert(i, bound);
+            if more || state.binding == 0 {
+                queue.changed.notify_all();
+            }
+            continue;
+        }
+        // Nothing to bind here. Stay while a file bound here can still get
+        // its offsets: from a bind in progress, or from a file that is left
+        // for a thread that can bind. Else a file before it failed, or no
+        // thread can bind the files before it, and the join stops there.
+        if waiting.is_empty()
+            || (state.binding == 0 && (state.next >= order.len() || state.binders == 0))
+        {
+            break;
+        }
+        state = queue
+            .changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    drop(state);
+    drop(waiting);
+}
+
+/// Starts `threads` bind threads in `scope` as a chain. Each thread runs
+/// `run` with a clone of `sender` and its `LinkBinders`. Before it runs, a thread takes the seed
+/// of the next thread from its own copy of the loading thread's state (the
+/// same state) and starts it, while `queue` has files left. So no thread
+/// copies more than one seed before it binds, and no thread starts when all
+/// the files are taken.
+// PERF (followups57): in bindonce1 the first bind thread took the seeds of
+// all the others before its first bind. On query (8 bind threads) the bind
+// time went from 2.0 to 2.6 ms (int74 timing, dbook-lan). With the chain,
+// query binds in 3.00 ms against 3.45 (R207) and 3.05 (R206): mean of 21,
+// plain release builds, dbook-lan. VS Code (105 ms) and TypeORM (15 ms)
+// keep their bindonce1 bind times.
+fn spawn_bind_chain<'scope, F>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    threads: usize,
+    run: &'scope F,
+    queue: &'scope BindQueue,
+    sender: std::sync::mpsc::Sender<ParallelBind>,
+) where
+    F: Fn(std::sync::mpsc::Sender<ParallelBind>, &mut LinkBinders<'scope>) + Sync,
+{
+    let seed = WorkerSeed::take_unbuilt();
+    spawn_bind_thread(scope, move || {
+        let mut binders = LinkBinders {
+            queue,
+            count: threads,
+        };
+        seed.install();
+        #[cfg(test)]
+        if queue.panic_before_run == Some(threads) {
+            panic!("test: a bind chain link panics before run");
+        }
+        if threads > 1 && queue.files_left() {
+            spawn_bind_chain(scope, threads - 1, run, queue, sender.clone());
+        }
+        // In `run` the link answers only for itself: the next link answers
+        // for the links after it, and a link that did not start stays in
+        // the count (`BindQueueState::binders`).
+        binders.count = 1;
+        run(sender, &mut binders);
+        binders.count = 0;
+    });
+}
+
+/// The bind threads that a chain link answers for in
+/// `BindQueueState::binders`: before `run`, the link and the links that it
+/// did not start; in `run`, the link. 0 after the link left the count
+/// (`leave`, at a failed bind in `run_bind_link`) and once `run` returns.
+/// On drop, so when the link panics, it takes the threads that it still
+/// answers for out of the count. A thread that waits for the files they
+/// would bind then does not wait forever (the scope then joins and raises
+/// the panic). A link whose bind failed and that then panics leaves the
+/// count one time only.
+// Not in Go: Go binds each file on its own goroutine.
+struct LinkBinders<'a> {
+    queue: &'a BindQueue,
+    count: usize,
+}
+
+impl LinkBinders<'_> {
+    /// Takes the threads that the link answers for out of `state.binders`
+    /// (`state` is the locked state of the link's queue). The link then
+    /// answers for none, so no thread leaves the count two times.
+    fn leave(&mut self, state: &mut BindQueueState) {
+        debug_assert!(
+            state.binders >= self.count,
+            "a bind thread leaves the binders two times"
+        );
+        state.binders = state.binders.saturating_sub(self.count);
+        self.count = 0;
+    }
+}
+
+impl Drop for LinkBinders<'_> {
+    fn drop(&mut self) {
+        if self.count > 0 {
+            let mut state = self.queue.lock();
+            self.leave(&mut state);
+            drop(state);
+            self.queue.changed.notify_all();
+        }
+    }
+}
+
+/// Starts bind thread `f` in `scope`, with the Go stack size.
+fn spawn_bind_thread<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    f: impl FnOnce() + Send + 'scope,
+) {
+    // Go starts its threads on demand and fails the same way.
+    crate::core::GoThread::new()
+        .stack_size(crate::gostd::stack::max_stack_size())
+        .spawn_scoped(scope, f);
 }
 
 // ---------------------------------------------------------------------------
@@ -2900,9 +3213,10 @@ pub fn get_config_file_parsing_diagnostics() -> Vec<Diagnostic> {
     go.get_config_file_parsing_diagnostics()
 }
 
-// Go: compiler/program.go:591 SingleThreaded
+// Go: compiler/program.go:591 SingleThreaded, of the current program. Code
+// that has a program reads `GoProgram::single_threaded` of it.
 pub fn single_threaded() -> bool {
-    prog().options.single_threaded.is_true()
+    prog().single_threaded()
 }
 
 /// A module resolution of the current program (`get_resolved_module`).
@@ -3256,17 +3570,20 @@ thread_local! {
 }
 
 // Go: compiler/program.go:2098 GetSourceFileForResolvedModule
-// PORT: the answer is memoized per thread and program. The files, their
-// paths and the redirects of a program do not change after load, so a name
+// ts#64159: a lookup by the resolution's path (`resolved_path`).
+// PORT: the answer is memoized per thread and program by file name. The
+// files, their paths and the redirects of a program do not change after
+// load, and one program's resolvers give one path for a name, so a name
 // always gives the same file. The checker asks again on each alias and
-// default-import check, and each lookup canonicalizes the path. Another
-// program version can give another file (an edited file has a new id), so
-// the memo is emptied when the current program changes.
-pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
-    // Go: ls/autoimport/aliasresolver.go:130 GetSourceFileForResolvedModule
+// default-import check. Another program version can give another file (an
+// edited file has a new id), so the memo is emptied when the current
+// program changes.
+pub fn get_source_file_for_resolved_module(resolved: &ResolvedModule) -> Node {
+    // Go: ls/autoimport/aliasresolver.go:137 GetSourceFileForResolvedModule
     if let Some(resolver) = alias_resolver() {
-        return resolver.source_file_for_resolved_module(file_name);
+        return resolver.source_file_for_resolved_module(resolved);
     }
+    let file_name = resolved.resolved_file_name.as_str();
     let program = prog().id;
     let hit = RESOLVED_MODULE_FILES.with_borrow_mut(|memo| {
         if memo.program != program {
@@ -3279,7 +3596,7 @@ pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
     if let Some(file) = hit {
         return file;
     }
-    let mut file = get_source_file(file_name);
+    let mut file = get_source_file_by_path(resolved.resolved_path.as_str());
     if file.is_nil()
         && let Some(redirect) =
             with_go(|go| go.get_parse_file_redirect(file_name).map(str::to_string))
@@ -3428,7 +3745,7 @@ thread_local! {
 /// holds the program does. The tables hold the freeable file versions of
 /// the program files (`VersionTables::file_versions`), so the thread keeps
 /// those alive too.
-pub(crate) struct WorkerSeed {
+pub struct WorkerSeed {
     program: &'static GoProgram,
     tables: Option<(u32, Arc<VersionTables>)>,
     synthetic: SyntheticSeed,
@@ -3437,7 +3754,7 @@ pub(crate) struct WorkerSeed {
 }
 
 impl WorkerSeed {
-    pub(crate) fn take() -> Self {
+    pub fn take() -> Self {
         // The new thread cannot build them: it has no frontend program.
         go_frontend::build_lazy_shared_state();
         Self::take_unbuilt()
@@ -3457,7 +3774,7 @@ impl WorkerSeed {
         }
     }
 
-    pub(crate) fn install(self) {
+    pub fn install(self) {
         crate::core::set_thread_program(Some(self.program));
         if let Some(tables) = self.tables {
             TABLES.with(|cache| *cache.borrow_mut() = Some(tables));
@@ -3486,46 +3803,118 @@ pub fn spawn_seeded_thread<R: Send + 'static>(
 // Go: compiler/checkerpool.go:309 newCheckerPoolWithTracing (the count)
 fn checker_count() -> usize {
     let program = prog();
+    let files = program.source_file_order().len();
     let mut checker_count: i64 = 4;
-    if single_threaded() {
+    if program.single_threaded() {
         checker_count = 1;
     } else if let Some(count) = program.options.checkers {
         checker_count = i64::from(count);
+    } else if crate::fast_mode::enabled() {
+        // PORT: not in Go (fastmode1): fast mode's count, from the files
+        // that are not declaration files.
+        let source_files = go_frontend_program().map_or(files, |np| {
+            np.files
+                .iter()
+                .filter(|file| !file.is_declaration_file)
+                .count()
+        });
+        checker_count = crate::fast_mode::checker_count(source_files) as i64;
     }
-    checker_count
-        .min(program.source_file_order().len() as i64)
-        .min(256)
-        .max(1) as usize
+    checker_count.min(files as i64).min(256).max(1) as usize
 }
 
 // Go: compiler/checkerpool.go:367 createCheckers
 // PORT: binding runs first on this thread, so no worker binds and every
 // worker starts from the same bound program and thread-local state.
 // The file associations (#4313) come from the Go frontend program
-// (`ls_program::get_checker_associations`), whose files are in
-// `source_file_order` order. An alias resolver program has no frontend, so
+// (`ls_program::take_checker_associations`, which a thread may have made
+// ahead), whose files are in `source_file_order` order. An alias resolver program has no frontend, so
 // it keeps the round-robin order; Go gives it no checker pool.
+// Go makes the checkers (checkerpool.go:370), then the associations
+// (:382). PERF: the checker threads make their checkers while this thread
+// makes the associations. A checker reads them only in a job, and the jobs
+// come after this returns. Making the associations reads the program and
+// changes no state that the threads copied (`WorkerSeed`).
 fn create_checkers() -> CheckerPool {
     bind_all();
     let count = checker_count();
+    let pool = start_checkers(count);
     let program = prog();
     let source_file_order = program.source_file_order();
     let associations = match go_frontend_program() {
-        Some(np) => ls_program::get_checker_associations(&np, count),
+        // PORT: not in Go (fastmode2 experiment, `GOPORT_FAST_SPLIT=cost`).
+        Some(np) if count > 1 && crate::fast_mode::cost_split_enabled() => {
+            fast_cost_split(&np, &source_file_order, count)
+        }
+        Some(np) => ls_program::take_checker_associations(&np, count),
         None => (0..source_file_order.len()).map(|i| i % count).collect(),
     };
     // One entry per file id up to the last program file.
     let len = source_file_order.iter().max().map_or(0, |&last| last + 1);
-    let mut file_associations = vec![0; len];
+    let mut file_associations: Vec<AtomicUsize> = (0..len).map(|_| AtomicUsize::new(0)).collect();
     for (i, &file_index) in source_file_order.iter().enumerate() {
-        file_associations[file_index] = associations[i];
+        file_associations[file_index] = AtomicUsize::new(associations[i]);
     }
     drop(source_file_order);
     assert!(
         with_tables(|tables| tables.file_associations.set(file_associations).is_ok()),
         "checker pool made twice"
     );
-    start_checkers(count)
+    pool
+}
+
+/// fastmode2: `crate::fast_mode::cost_split` for the files of `np` (file ids
+/// `source_file_order`, in the same order), in that order. A file's cost is
+/// Go's base weight of the split, 0 when the check skips it; its imports
+/// are its resolved imports that are program files. Not in Go.
+fn fast_cost_split(
+    np: &crate::frontend::compiler::NewProgram,
+    source_file_order: &[usize],
+    count: usize,
+) -> Vec<usize> {
+    let nodes: FxHashMap<usize, Node> = source_files()
+        .into_iter()
+        .map(|file| (file.file_index(), file))
+        .collect();
+    let positions: FxHashMap<usize, usize> = np
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| (file.store, i))
+        .collect();
+    let mut weights = Vec::with_capacity(np.files.len());
+    let mut costs = Vec::with_capacity(np.files.len());
+    let mut imports = Vec::with_capacity(np.files.len());
+    for (position, (file, file_index)) in np.files.iter().zip(source_file_order).enumerate() {
+        let weight = ls_program::get_checker_association_base_weight(
+            file.node_count as i64,
+            file.text.len() as i64,
+        ) as u64;
+        let checked = nodes
+            .get(file_index)
+            .is_some_and(|&node| !skip_type_checking(node, false));
+        weights.push(weight);
+        costs.push(if checked { weight } else { 0 });
+        let mut targets: Vec<usize> = np
+            .processed_files
+            .resolved_modules
+            .get(file.path())
+            .into_iter()
+            .flat_map(|resolved_modules| resolved_modules.values())
+            .filter(|resolved| resolved.is_resolved())
+            .filter_map(|resolved| {
+                let target = np.get_source_file_for_resolved_module(resolved)?;
+                positions
+                    .get(&target.store)
+                    .copied()
+                    .filter(|&target| target != position)
+            })
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        imports.push(targets);
+    }
+    crate::fast_mode::cost_split(&costs, &weights, &imports, count)
 }
 
 // Go: compiler/checkerpool.go:367 createCheckers (one `checker.NewChecker`)
@@ -3610,10 +3999,10 @@ fn start_checkers(count: usize) -> CheckerPool {
                     if let Some(arena) = arena {
                         set_jemalloc_thread_arena(arena);
                     }
+                    // A manual arena of fast mode goes back to the process's
+                    // list when this thread ends (`ManualArena`).
                     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
-                    if let Some(claims) = claims {
-                        claims.claim();
-                    }
+                    let _manual_arena = claims.and_then(|claims| claims.claim());
                     seed.install();
                     let checker = new_pool_checker(index, count);
                     WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
@@ -3646,24 +4035,82 @@ fn start_checkers(count: usize) -> CheckerPool {
     }
 }
 
-/// wasm has one thread: makes the `count` checkers on the loading thread,
-/// each with its own `WorkerIds`, as a worker would make it.
+/// wasm has one thread: gives each of the `count` checkers its own
+/// `WorkerIds`, as a worker would start. Each checker is made on the
+/// loading thread by its first job (`InlineChecker::into_checker`).
 #[cfg(target_family = "wasm")]
 fn start_checkers(count: usize) -> CheckerPool {
     // First, as on native: the carry of the last pool becomes this thread's
     // ids, and each checker starts from them (`id_seed`).
     let carry_from = symbol_id_carry_start(count);
     let checkers = (0..count)
-        .map(|index| {
-            let mut ids = WorkerIds(id_seed().into());
-            let checker = ids.run(|| new_pool_checker(index, count));
-            Some((checker, ids))
-        })
+        .map(|_| InlineChecker::Unmade(WorkerIds(id_seed().into())))
         .collect();
     CheckerPool {
         checkers,
         carry_from,
     }
+}
+
+/// wasm: a checker of the inline pool. Making it on its first job, and
+/// dropping it when the caller is done with it (`release_checker`), keeps
+/// only the checkers in use alive: the jobs run one after the other.
+#[cfg(target_family = "wasm")]
+enum InlineChecker {
+    /// No job has run yet: the ids the checker starts from.
+    Unmade(WorkerIds),
+    Made(Checker, WorkerIds),
+    /// A job runs with the checker.
+    Busy,
+    /// `release_checker` dropped it.
+    Released(WorkerIds),
+}
+
+#[cfg(target_family = "wasm")]
+impl InlineChecker {
+    /// The checker for a job: checker `index` of a pool of `count`, made
+    /// first with its ids, as its worker would make it. Its slot is `Busy`
+    /// until the caller puts it back.
+    fn into_checker(self, index: usize, count: usize) -> (Checker, WorkerIds) {
+        match self {
+            InlineChecker::Unmade(mut ids) => {
+                let checker = ids.run(|| new_pool_checker(index, count));
+                (checker, ids)
+            }
+            InlineChecker::Made(checker, ids) => (checker, ids),
+            InlineChecker::Busy => panic!("checker {index} in use"),
+            InlineChecker::Released(_) => panic!("checker {index} used after its release"),
+        }
+    }
+}
+
+/// wasm: drops checker `index` of the current program's pool, as its
+/// worker would when the program is released, so its tables are freed
+/// before the next checker is made. A later job for it panics. Native
+/// checkers live until the program is released.
+#[cfg(target_family = "wasm")]
+pub fn release_checker(index: usize) {
+    let id = prog().id;
+    let slot = POOLS.with(|pools| {
+        let mut pools = pools.borrow_mut();
+        let slot = pools.get_mut(&id)?.checkers.get_mut(index)?;
+        Some(std::mem::replace(slot, InlineChecker::Busy))
+    });
+    // The drop runs outside the pool borrow, with the checker's ids.
+    let ids = match slot {
+        None => return,
+        Some(InlineChecker::Made(checker, mut ids)) => {
+            ids.run(|| drop(checker));
+            ids
+        }
+        Some(InlineChecker::Unmade(ids) | InlineChecker::Released(ids)) => ids,
+        Some(InlineChecker::Busy) => panic!("checker {index} released while in use"),
+    };
+    POOLS.with(|pools| {
+        if let Some(pool) = pools.borrow_mut().get_mut(&id) {
+            pool.checkers[index] = InlineChecker::Released(ids);
+        }
+    });
 }
 
 /// wasm: the ids of one checker of the inline pool. A native checker
@@ -3815,9 +4262,16 @@ fn send_thread_job<R: Send + 'static>(
         "checker job sent from a checker job"
     );
     let id = prog().id;
-    // The pool borrow ends before the job runs: a job reads the pool
-    // (`checker_index_for_file`).
-    let (checker, mut ids) = with_pool(|pool| pool.checkers[index].take().expect("checker in use"));
+    // The pool borrow ends before the checker is made and before the job
+    // runs: a job reads the pool (`checker_index_for_file`).
+    let (slot, count) = with_pool(|pool| {
+        let count = pool.checkers.len();
+        (
+            std::mem::replace(&mut pool.checkers[index], InlineChecker::Busy),
+            count,
+        )
+    });
+    let (checker, mut ids) = slot.into_checker(index, count);
     let (result, checker) = ids.run(|| {
         WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
         WORKER_INDEX.with(|slot| slot.set(Some(index)));
@@ -3830,7 +4284,7 @@ fn send_thread_job<R: Send + 'static>(
     });
     POOLS.with(|pools| {
         if let Some(pool) = pools.borrow_mut().get_mut(&id) {
-            pool.checkers[index] = Some((checker, ids));
+            pool.checkers[index] = InlineChecker::Made(checker, ids);
         }
     });
     JobReceiver(result)
@@ -3904,7 +4358,9 @@ fn worker_index() -> Option<usize> {
 
 /// The checker index of `file` (Go `fileAssociations[file]`).
 fn checker_index_for_file(file: Node) -> usize {
-    let index = |tables: &VersionTables| Some(tables.file_associations.get()?[file.file_index()]);
+    let index = |tables: &VersionTables| {
+        Some(tables.file_associations.get()?[file.file_index()].load(Ordering::Relaxed))
+    };
     if let Some(index) = with_tables(index) {
         return index;
     }
@@ -4029,6 +4485,11 @@ fn start_checker_group_do(
 ) -> PendingCheckerGroup {
     let count = checker_count();
     let files: Arc<Vec<Node>> = Arc::new(files.to_vec());
+    if stealing_check()
+        && let Some(queues) = StealQueues::first_pass(&files, count)
+    {
+        return start_stealing_group_do(files, cb, queues);
+    }
     let receivers = (0..count)
         .map(|checker_index| {
             let files = Arc::clone(&files);
@@ -4042,12 +4503,152 @@ fn start_checker_group_do(
                         .iter()
                         .copied()
                         .enumerate()
-                        .filter(|(_, file)| associations[file.file_index()] == checker_index)
+                        .filter(|(_, file)| {
+                            associations[file.file_index()].load(Ordering::Relaxed) == checker_index
+                        })
                         .collect()
                 });
                 mine.into_iter()
                     .map(|(i, file)| (i, cb(checker, file)))
                     .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    PendingCheckerGroup { files, receivers }
+}
+
+/// True when the first check pass of the current program steals
+/// (`StealQueues`): fast mode with `GOPORT_FAST_STEAL=1`
+/// (`crate::fast_mode::steal`), more than one checker, and not `--noCheck`
+/// (that pass checks nothing). The early emit waits for the check then
+/// (`emitter::program_emit::early_emit_options_allow`): an emit job goes to
+/// the checker of its file when it is sent, and a stolen file moves to
+/// another checker. Loading thread only.
+pub(crate) fn stealing_check() -> bool {
+    crate::fast_mode::steal()
+        && !cfg!(target_family = "wasm")
+        && !options().no_check.is_true()
+        && checker_count() > 1
+}
+
+/// fastmode1: the queues of the work-stealing check pass of fast mode
+/// (`crate::fast_mode::steal`). Not in Go: Go checks each file on the
+/// checker of its static split, so a checker that ends early waits.
+// PERF (fastmode1, tsrs model): each checker starts with the files that
+// Go's split gives it, in the given order, and then takes the last file of
+// the queue with the most weight left. The stolen file moves to the taker
+// (`file_associations`), so its later work (emit, declaration diagnostics)
+// runs on the checker that has its types. Which checker checks a file then
+// depends on thread timing, and so can the output where Go's output depends
+// on the split. At 16 checkers on a 16 vCPU testbox, stealing took VS Code
+// from 2.61 to 2.20 s and Sentry from 2.68 to 2.28 s. The tsrs order (heavy
+// files first in each queue) gave the same times (fastmode1 ab2).
+struct StealQueues(Mutex<StealState>);
+
+struct StealState {
+    /// Positions in the pass's `files`, by checker, in the given order.
+    queues: Vec<std::collections::VecDeque<usize>>,
+    /// The weight of each queue.
+    left: Vec<u64>,
+    /// The weight of each file, by position.
+    weights: Vec<u64>,
+}
+
+impl StealQueues {
+    /// The queues of the first check pass of the current program's pool, or
+    /// None for any later pass: those keep the files where the first pass
+    /// put them.
+    fn first_pass(files: &[Node], count: usize) -> Option<Arc<Self>> {
+        // Makes the pool (and its split) when there is none yet.
+        let _ = checker_index_for_file(*files.first()?);
+        if with_tables(|tables| tables.steal_pass_done.swap(true, Ordering::Relaxed)) {
+            return None;
+        }
+        let file_weight = steal_file_weights();
+        let mut queues = vec![std::collections::VecDeque::new(); count];
+        let mut left = vec![0; count];
+        let mut weights = Vec::with_capacity(files.len());
+        for (i, &file) in files.iter().enumerate() {
+            let checker = checker_index_for_file(file);
+            let weight = if skip_type_checking(file, false) {
+                0
+            } else {
+                file_weight(file)
+            };
+            queues[checker].push_back(i);
+            left[checker] += weight;
+            weights.push(weight);
+        }
+        Some(Arc::new(StealQueues(Mutex::new(StealState {
+            queues,
+            left,
+            weights,
+        }))))
+    }
+
+    /// The position of the next file for checker `me`: the first of its own
+    /// queue, else the last of the queue with the most weight left, which
+    /// then moves to `me`. None when every queue is empty.
+    fn next(&self, me: usize, files: &[Node]) -> Option<usize> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state;
+        if let Some(i) = state.queues[me].pop_front() {
+            state.left[me] -= state.weights[i];
+            return Some(i);
+        }
+        let from = (0..state.queues.len())
+            .filter(|&q| !state.queues[q].is_empty())
+            .max_by_key(|&q| (state.left[q], std::cmp::Reverse(q)))?;
+        let i = state.queues[from].pop_back()?;
+        state.left[from] -= state.weights[i];
+        with_tables(|tables| {
+            tables
+                .file_associations
+                .get()
+                .expect("checker pool not made")[files[i].file_index()]
+            .store(me, Ordering::Relaxed);
+        });
+        Some(i)
+    }
+}
+
+/// fastmode1: the weight of each file for `StealQueues`, Go's base weight of
+/// the split (`ls_program::get_checker_association_base_weight`): its node
+/// count plus a part of its text length. 1 without a frontend program.
+fn steal_file_weights() -> impl Fn(Node) -> u64 {
+    let program = prog();
+    let source_file_order = program.source_file_order();
+    let len = source_file_order.iter().max().map_or(0, |&last| last + 1);
+    let mut weights = vec![1u64; len];
+    if let Some(np) = go_frontend_program() {
+        for (file, &file_index) in np.files.iter().zip(source_file_order.iter()) {
+            weights[file_index] = ls_program::get_checker_association_base_weight(
+                file.node_count as i64,
+                file.text.len() as i64,
+            ) as u64;
+        }
+    }
+    move |file: Node| weights.get(file.file_index()).copied().unwrap_or(1)
+}
+
+/// `start_checker_group_do` with `StealQueues`: each checker takes files
+/// from the queues until all are empty.
+fn start_stealing_group_do(
+    files: Arc<Vec<Node>>,
+    cb: fn(&mut Checker, Node) -> Vec<Diagnostic>,
+    queues: Arc<StealQueues>,
+) -> PendingCheckerGroup {
+    let count = checker_count();
+    let receivers = (0..count)
+        .map(|me| {
+            let files = Arc::clone(&files);
+            let queues = Arc::clone(&queues);
+            send_job(me, move |checker| {
+                let mut results = Vec::new();
+                while let Some(i) = queues.next(me, &files) {
+                    results.push((i, cb(checker, files[i])));
+                }
+                results
             })
         })
         .collect();
@@ -5577,6 +6178,8 @@ mod tests {
             }
             result
         }
+        // The parsed files stay unpublished: the test reads them to its end
+        // (this thread holds the store build lock, `crate::test_lock`).
         let parse = |name: &str| {
             let opts = SourceFileParseOptions {
                 file_name: name.to_string(),
@@ -5735,6 +6338,297 @@ mod tests {
                 "{file} outDir {out_dir:?} rootDir {root_dir:?} config {config_file_path:?}"
             );
         }
+    }
+
+    /// A program version of one empty file, for a test that needs a current
+    /// program and reads none of it.
+    fn small_program(name: &str) -> &'static GoProgram {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "export {};\n").unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "noLib": true, "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        program
+    }
+
+    /// Runs a bind chain of `threads` links (`spawn_bind_chain`) on a queue
+    /// of `threads` files, with `program` current, on a thread of its own.
+    /// The link that starts with `before_run` threads panics before `run`,
+    /// and the link that reaches `run` as number `in_run` (from 0) panics
+    /// there. Each other link that runs waits until `binders` counts only
+    /// those links, as a thread whose bind failed waits while a thread that
+    /// can bind is counted. Returns whether the chain panicked, `binders` at
+    /// the end and the number of those links. Fails when the chain does not
+    /// end.
+    fn run_bind_chain(
+        program: &'static GoProgram,
+        threads: usize,
+        before_run: Option<usize>,
+        in_run: Option<usize>,
+    ) -> (bool, usize, usize) {
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _program = crate::core::enter_program(Some(program));
+            let mut queue = BindQueue::new(
+                vec![false; threads],
+                SymbolArena::new().next_file_offsets(),
+                threads,
+            );
+            queue.panic_before_run = before_run;
+            let (arrived, ran) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let run = |_, _: &mut LinkBinders<'_>| {
+                let mut state = queue.lock();
+                if Some(arrived.fetch_add(1, Ordering::Relaxed)) == in_run {
+                    drop(state);
+                    panic!("test: a bind chain link panics in run");
+                }
+                // Under the queue lock, so no wait misses it.
+                ran.fetch_add(1, Ordering::Relaxed);
+                queue.changed.notify_all();
+                while state.binders != ran.load(Ordering::Relaxed) {
+                    state = queue
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            let (sender, _receiver) = std::sync::mpsc::channel();
+            let chain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::thread::scope(|scope| spawn_bind_chain(scope, threads, &run, &queue, sender));
+            }));
+            let _ = done.send((
+                chain.is_err(),
+                queue.lock().binders,
+                ran.load(Ordering::Relaxed),
+            ));
+        });
+        ended
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the bind chain does not end")
+    }
+
+    // followups61 (R211 reviewer items a and b): a bind chain link that
+    // panics before `run` takes itself and the links that it did not start
+    // out of `binders`, and a link that panics in `run` takes itself out
+    // (`LinkBinders`). The links that run then stop waiting for the files
+    // of those links, and the chain ends in the panic. Without the guard
+    // they wait forever.
+    #[test]
+    fn a_bind_chain_link_that_panics_leaves_the_binders() {
+        let program = small_program("goport-bind-chain");
+        // 4 links. The third (2 threads) panics, so it and the fourth leave
+        // the count, and the first two run.
+        assert_eq!(run_bind_chain(program, 4, Some(2), None), (true, 2, 2));
+        // The first link panics: no link runs.
+        assert_eq!(run_bind_chain(program, 3, Some(3), None), (true, 0, 0));
+        // 3 links. The second to reach `run` panics there.
+        assert_eq!(run_bind_chain(program, 3, None, Some(1)), (true, 2, 2));
+    }
+
+    // followups61 round 2 (R211 reviewer item b, skeptic): a link whose bind
+    // failed left `binders` already (`LinkBinders::leave`), so when it then
+    // panics in `run`, its guard takes nothing out. When the guard took it
+    // out again, `binders` came to 0 while a link could still bind. A failed
+    // bind of that link then took it to usize::MAX (release builds), and the
+    // link waited forever for a file that no link takes.
+    #[test]
+    fn a_bind_chain_link_whose_bind_failed_leaves_the_binders_once() {
+        /// Sends on drop: at the exit of its thread, as a thread-local,
+        /// after the thread's `LinkBinders` dropped.
+        struct SendAtExit(std::sync::mpsc::Sender<()>);
+        impl Drop for SendAtExit {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        thread_local! {
+            static AT_EXIT: std::cell::RefCell<Option<SendAtExit>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let program = small_program("goport-bind-chain-failed");
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _program = crate::core::enter_program(Some(program));
+            // 4 files and 2 links. The links take the files last file first,
+            // so file 0 is the last file that a link takes.
+            let order = [3, 2, 1, 0];
+            let queue = BindQueue::new(vec![false; 4], SymbolArena::new().next_file_offsets(), 2);
+            let (exited, exit) = std::sync::mpsc::channel();
+            let exit = Mutex::new(exit);
+            let returned = AtomicUsize::new(0);
+            // The link that takes file 3 binds it when the other link took
+            // file 2, failed it, panicked and ended. The first link then
+            // fails file 1 and leaves the count, and its file 3 waits for the
+            // counts of file 0, which no link can take.
+            let run = |_, link: &mut LinkBinders<'_>| {
+                run_bind_link(
+                    &queue,
+                    &order,
+                    link,
+                    |i| {
+                        if i == 3 {
+                            exit.lock().unwrap().recv().unwrap();
+                        }
+                        (i == 3).then(|| ((), SymbolArena::new_file().mark()))
+                    },
+                    |i, _| {
+                        if i == 2 {
+                            let at_exit = SendAtExit(exited.clone());
+                            AT_EXIT.with(|cell| *cell.borrow_mut() = Some(at_exit));
+                            panic!("test: a bind chain link panics after a failed bind");
+                        }
+                    },
+                );
+                returned.fetch_add(1, Ordering::Relaxed);
+            };
+            let (sender, _receiver) = std::sync::mpsc::channel();
+            let chain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::thread::scope(|scope| spawn_bind_chain(scope, 2, &run, &queue, sender));
+            }));
+            let _ = done.send((
+                chain.is_err(),
+                queue.lock().binders,
+                returned.load(Ordering::Relaxed),
+            ));
+        });
+        // The chain ends in the panic. Each link left the count one time,
+        // and the link that did not panic returned.
+        let result = ended
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the bind chain does not end");
+        assert_eq!(result, (true, 0, 1));
+    }
+
+    // followups63 (R214 reviewer item 2): a real bind that fails on a bind
+    // thread. The binder names a pattern ambient module with import
+    // attributes after the node id of the attributes (Go binder.go:311
+    // getDeclarationName, `ast.GetNodeId`). A bind thread would give that
+    // id in its own copy of the loading thread's state, where it is lost
+    // (`bind_thread_fingerprint`), so the bind of the file fails there. That
+    // file and the files after it then bind serially (`bind_all`), and the
+    // result is that of a serial bind.
+    #[test]
+    fn a_bind_that_gives_a_node_id_on_a_bind_thread_matches_the_serial_bind() {
+        let dir = std::env::temp_dir().join(format!("goport-bind-node-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two files give node ids. A bind thread that kept its ids would give
+        // a name or a next id that the serial bind does not give.
+        let files = [
+            ("a.d.ts", "declare const a: number;\n"),
+            (
+                "b.d.ts",
+                "declare module \"*.b\" with { type: \"b\" } {\n    export const b: number;\n}\n",
+            ),
+            ("c.d.ts", "declare const c: number;\n"),
+            (
+                "d.d.ts",
+                "declare module \"*.d\" with { type: \"d\" } {\n    export const d: number;\n}\n",
+            ),
+            ("e.d.ts", "declare const e: number;\n"),
+        ];
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "noLib": true, "types": [] },
+                 "files": ["a.d.ts", "b.d.ts", "c.d.ts", "d.d.ts", "e.d.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        // Loads and binds the program on `threads` bind threads. Returns the
+        // locals of each file (names, and symbol places from the first symbol
+        // of the program), the fingerprint of the loading thread after the
+        // bind and the indexes of the files that `bind_all` bound serially.
+        // Each load is on a new thread, so each starts from the same thread
+        // state (node ids).
+        let bind = |threads: usize| {
+            let config = config.clone();
+            std::thread::spawn(move || {
+                TEST_BIND_THREADS.set(Some(threads));
+                let program = try_load_version(&config.to_string_lossy(), |_| {})
+                    .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+                let _program = crate::core::enter_program(Some(program));
+                bind_all();
+                let symbols = bound_symbols();
+                let locals: Vec<Vec<(String, u32)>> = program
+                    .source_files()
+                    .map(|file| {
+                        symbols
+                            .iter(file.root.locals())
+                            .map(|(name, symbol)| (name.to_string(), symbol.0))
+                            .collect()
+                    })
+                    .collect();
+                // A bound local is a lineage symbol. The odd chunks hold a
+                // checker's own symbols (`is_own_index`), and `place` does
+                // not count them, so a local there must fail the test.
+                for (name, id) in locals.iter().flatten() {
+                    assert!(
+                        !crate::core::is_own_index(*id),
+                        "local {name} has symbol id {id} in an odd chunk"
+                    );
+                }
+                let first = locals.iter().flatten().map(|&(_, id)| id).min().unwrap();
+                // The lineage holds the symbols of earlier loads, and of the
+                // earlier tests of this process. Its ids skip the odd chunks
+                // (`is_own_index`, a checker's own symbols), so a load that
+                // crosses a chunk end has a gap of a chunk. Count the lineage
+                // ids from the first symbol: the place of a symbol in its
+                // load does not depend on where in a chunk the load starts.
+                let place = |id: u32| {
+                    (first..id)
+                        .filter(|&i| !crate::core::is_own_index(i))
+                        .count()
+                };
+                let locals: Vec<Vec<(String, usize)>> = locals
+                    .into_iter()
+                    .map(|file| file.into_iter().map(|(n, id)| (n, place(id))).collect())
+                    .collect();
+                let serial_binds: Vec<usize> = TEST_SERIAL_BINDS
+                    .take()
+                    .into_iter()
+                    .map(|root| {
+                        program
+                            .source_files()
+                            .position(|file| file.root == root)
+                            .unwrap()
+                    })
+                    .collect();
+                (locals, bind_thread_fingerprint(), serial_binds)
+            })
+            .join()
+            .unwrap()
+        };
+        let serial = bind(1);
+        let parallel = bind(4);
+        let _ = std::fs::remove_dir_all(&dir);
+        let patterns = serial.0.iter().flatten();
+        assert_eq!(
+            patterns
+                .filter(|(name, _)| name.contains("pattern@"))
+                .count(),
+            2,
+            "the pattern modules are named after node ids: {:?}",
+            serial.0
+        );
+        assert_eq!((&parallel.0, parallel.1), (&serial.0, serial.1));
+        assert_eq!(serial.2, [0, 1, 2, 3, 4], "a serial bind binds every file");
+        // The bind threads bind a.d.ts, and the bind of b.d.ts (the first
+        // pattern module) fails there. bind_all then binds b.d.ts and the
+        // files after it serially: d.d.ts, the other pattern module, too.
+        assert_eq!(
+            parallel.2,
+            [1, 2, 3, 4],
+            "the serial fallback binds both pattern modules"
+        );
     }
 
     #[test]

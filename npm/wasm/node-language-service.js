@@ -14,6 +14,7 @@ export async function createWorkerLanguageService(module, options) {
                 caseInsensitive: options.caseInsensitive,
             },
         },
+        execArgv: [],
         resourceLimits: { stackSizeMb: options.stackSizeMb ?? 256 },
     });
     const pending = new Map();
